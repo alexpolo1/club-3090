@@ -87,7 +87,7 @@ services:
     # incident). Raise these AND shm_size + LMCACHE_L1_GB together for a bigger cache.
     mem_limit: ${CLUB3090_MEM_LIMIT:-70g}
     memswap_limit: ${CLUB3090_MEM_LIMIT:-70g}
-    shm_size: "32gb"   # MUST be >= LMCACHE_L1_GB (default 30). Raise if you raise the cache.
+    shm_size: "64gb"   # MUST be >= LMCACHE_L1_GB. Raised 32→64 for LMCACHE_L1_GB=60 (this rig, 124 GB RAM).
     ipc: host
     volumes:
       - ${MODEL_DIR:-../../../../../../models-cache}:/root/.cache/huggingface
