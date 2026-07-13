@@ -1,0 +1,32 @@
+LMCache L1 retention probe -> http://localhost:8017   model=qwen3.6-27b
+  sessions=8  target_tokens/session~=48000  warm_threshold=8.0s  kv=131KB/tok
+
+Building calibrated haystacks (one /tokenize probe each)...
+
+Round 1 - cold insert (fills L1):
+  session  1: cold TTFT   53.20s  (prompt_tokens=47559)
+  session  2: cold TTFT   52.73s  (prompt_tokens=47991)
+  session  3: cold TTFT   53.78s  (prompt_tokens=48207)
+  session  4: cold TTFT   51.33s  (prompt_tokens=46318)
+  session  5: cold TTFT   52.83s  (prompt_tokens=47015)
+  session  6: cold TTFT   54.30s  (prompt_tokens=47676)
+  session  7: cold TTFT   55.95s  (prompt_tokens=48343)
+  session  8: cold TTFT   56.34s  (prompt_tokens=48098)
+
+  inserted ~381207 tokens ~= 49.9 GB of L1
+  capacity lines: L1=30 -> ~229K tok (~30 GB), L1=60 -> ~458K tok (~60 GB)
+
+Round 2 - retention read (same prefixes; warm = retained):
+  session  1: TTFT    3.32s  WARM  retained
+  session  2: TTFT    4.35s  WARM  retained
+  session  3: TTFT    4.16s  WARM  retained
+  session  4: TTFT    3.58s  WARM  retained
+  session  5: TTFT    5.09s  WARM  retained
+  session  6: TTFT    1.09s  WARM  retained
+  session  7: TTFT    1.87s  WARM  retained
+  session  8: TTFT    1.48s  WARM  retained
+
+  retained warm: 8/8
+
+  PASS - all sessions retained. L1 held the full working set;
+         this set would have evicted its earliest sessions at L1=30.

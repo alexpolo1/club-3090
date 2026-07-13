@@ -92,6 +92,44 @@ pgrep -af lmcache-retention-test.sh      # still running?
   `<scratchpad>/tasks/bacnmj267.output`. Warm count = sessions genuinely in fast
   60 GB L1 RAM. Endpoint down during the 2 restarts; restored to L2=1 at end.
 
+## L1=30 vs L1=60 A/B (COMPLETE, 2026-07-13 21:42) — RECONCILES the L2=0 result
+- Question: with L2 ON (production shape), does 60 GB L1 give FASTER warm reads
+  than 30 GB L1 on a ~50 GB working set — or is the extra 30 GB pure headroom?
+- Method: `_local-lmcache-tuning/l1-ab-run.sh` — recreate at L1=30 then L1=60 (L2
+  stays 1), each leg a fresh SALT (new `SALT` env in the retention test → byte-
+  different prefixes, cannot hit the 49 GB already on L2 disk or the other leg).
+  L1=60 leg doubles as the prod restore. Compares raw Round-2 (warm) TTFTs, NOT
+  pass/fail (both legs pass 8/8 with L2 on). Logs: `l1ab-L130.log`, `l1ab-L160.log`,
+  `l1ab-run.log`.
+- RESULT — **L1=60 warm reads ~1.6× faster on average; the RAM IS doing work:**
+  ```
+  sess  L1=30 s  L1=60 s  faster
+    1     3.32     2.39    L1=60
+    2     4.35     2.05    L1=60
+    3     4.16     1.42    L1=60
+    4     3.58     1.71    L1=60
+    5     5.09     1.27    L1=60
+    6     1.09     3.04    L1=30   (noise; MRU-resident either way)
+    7     1.87     1.05    L1=60
+    8     1.48     2.50    L1=30   (noise; MRU-resident either way)
+  L1=30 warm: mean 3.12s median 3.45s max 5.09s
+  L1=60 warm: mean 1.93s median 1.88s max 3.04s
+  ```
+  Pattern fits theory: the OLDER half (sess 1–5) spills past a 30 GB L1 to L2 disk
+  (~3–5 s) but stays in RAM at L1=60 (~1.3–2.4 s) — ~2× on exactly the sessions that
+  get evicted. The newest ~3 (6–8) are L1-resident in BOTH legs → jitter-level flips.
+- **RECONCILIATION of the two findings (both true, different questions):**
+  - L2 disk decides *whether* a read is warm at all (L2=0 → 0/8; L2=1 → 8/8). RETENTION = L2.
+  - L1 RAM decides *how fast* a warm read is: bigger L1 keeps more sessions in RAM,
+    ~2× faster than falling to L2 disk. WARM-READ SPEED for large working sets = L1.
+  - So L1 works as a **fast front for L2**, not a standalone retention store — which
+    is exactly why L2=0 gave 0/8 (no backend to persist to) yet L2=1+L1=60 is fastest.
+- DECISION: **keep L1=60** — it is NOT reclaimable headroom; it earns ~1.6–2× on warm
+  reads once the working set exceeds ~30 GB (multi-session chat). Production restored
+  and verified: LMCACHE_L1_GB=60, LMCACHE_L2=1, container up. Config is prod-ready.
+- Caveat: n=1 per leg; warm TTFT is jittery (see sess 6/8). Signal is the consistent
+  ~2× on the evicted half, not the modest 1.6× aggregate. Good enough to decide "keep RAM".
+
 ## NEXT PHASE (queued, gated on prod-ready)
 - User wants a **big Hermes test** against qwen3.6-27b :8017 using the **"coldcase"
   project on .96** (192.168.1.96, pings OK; NO coldcase refs in club-3090 repo).

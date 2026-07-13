@@ -41,6 +41,11 @@
 #                       re-prefill is ~35-45 s — 8 s cleanly separates them)
 #   KV_KB_PER_TOKEN    LMCache cache rate for the GB math. Default: 131 (measured)
 #   PROBE_MAX_TOKENS   Output cap per request (just enough to complete). Default: 8
+#   SALT               Mixes into every prefix's seed + anchor so a re-run inserts
+#                      BYTE-DIFFERENT prefixes -> fresh cache keys that cannot hit
+#                      KV left on L2 disk by a prior run. Default: "" (the original
+#                      deterministic prefixes). Give each A/B leg a distinct SALT so
+#                      the two legs never read each other's (or old) cached blocks.
 #
 # Exit 0 = all sessions retained (PASS). Exit 1 = one or more evicted.
 # ===========================================================================
@@ -54,18 +59,22 @@ SESSION_TOKENS="${SESSION_TOKENS:-48000}"
 WARM_THRESHOLD_S="${WARM_THRESHOLD_S:-8.0}"
 KV_KB_PER_TOKEN="${KV_KB_PER_TOKEN:-131}"
 PROBE_MAX_TOKENS="${PROBE_MAX_TOKENS:-8}"
+SALT="${SALT:-}"
 
 command -v python3 >/dev/null || { echo "Fix: python3 not found on PATH." >&2; exit 2; }
 
 python3 - "$URL" "$MODEL" "$NUM_SESSIONS" "$SESSION_TOKENS" \
-           "$WARM_THRESHOLD_S" "$KV_KB_PER_TOKEN" "$PROBE_MAX_TOKENS" <<'PY'
-import json, random, string, sys, time, urllib.request
+           "$WARM_THRESHOLD_S" "$KV_KB_PER_TOKEN" "$PROBE_MAX_TOKENS" "$SALT" <<'PY'
+import json, random, string, sys, time, urllib.request, zlib
 # Community rigs run non-UTF-8 locales; a piped stdout defaults to ASCII (repo
 # convention: pin utf-8 on both read and write).
 sys.stdout.reconfigure(encoding="utf-8")
 
-URL, MODEL, N, STOK, WARM, KVKB, PMAX = sys.argv[1:]
+URL, MODEL, N, STOK, WARM, KVKB, PMAX, SALT = sys.argv[1:]
 N = int(N); STOK = int(STOK); WARM = float(WARM); KVKB = float(KVKB); PMAX = int(PMAX)
+# Stable integer offset derived from SALT (crc32 is process-independent, unlike
+# builtin hash() under PYTHONHASHSEED). Empty SALT -> 0 -> original prefixes.
+SALT_OFF = (zlib.crc32(SALT.encode()) % 1_000_000) if SALT else 0
 
 
 def tokenize_count(text):
@@ -90,14 +99,16 @@ def rand_words(rng, n):
 
 
 def make_prefix(idx, target_tokens):
-    """Deterministic per idx -> byte-identical across rounds -> real cache hit.
+    """Deterministic per (idx, SALT) -> byte-identical across rounds within a run
+       (real cache hit) but byte-DIFFERENT across salts (fresh key vs prior runs).
        Calibrated against the live tokenizer so token count is ~on target."""
-    rng = random.Random(idx * 7919 + 13)
-    sample = " ".join(rand_words(random.Random(idx), 400))
+    key = idx + SALT_OFF
+    rng = random.Random(key * 7919 + 13)
+    sample = " ".join(rand_words(random.Random(key), 400))
     c = tokenize_count(sample)
     tpw = (c / 400.0) if c else 1.4          # tokens-per-word for this stream
     n_words = max(64, int(target_tokens / tpw))
-    header = f"SESSION-{idx:03d}-anchor-{idx * 7919}\n"
+    header = f"SESSION-{idx:03d}-salt-{SALT_OFF}-anchor-{key * 7919}\n"
     body = header + " ".join(rand_words(rng, n_words))
     return body + "\n\nReply with only: OK"
 
