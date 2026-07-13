@@ -58,3 +58,20 @@ Round 2 - retention read (same prefixes; warm = retained):
 ====================================================================
 STEP 3 — restore production (LMCACHE_L2=1) (07:30:37)
 ====================================================================
+ Container vllm-qwen36-27b-lmcache Starting 
+ Container vllm-qwen36-27b-lmcache Started 
+[switch] waiting for http://localhost:8017/v1/models (container=vllm-qwen36-27b-lmcache, timeout 600s)...
+[switch]   12s — Application startup complete
+[switch]   28s — Resolved architecture: Qwen3_5ForConditionalGeneration
+[switch]   36s — Resolved architecture: Qwen3_5MTP
+[switch]   60s elapsed, still waiting...
+[switch]   64s — Loading weights
+[switch]   120s elapsed, still waiting...
+[switch]   180s elapsed, still waiting...
+[switch]   204s — Capturing CUDA graphs
+[switch]   220s — Application startup complete
+[switch] ✓ ready (220s)
+[switch] ▶ API:  http://192.168.1.98:8017/v1   (model: qwen3.6-27b · OpenAI-compatible · no auth)
+[switch] done. Try:  curl -s http://localhost:8017/v1/models | jq .
+>> restored container LMCACHE_L2=1  (expect 1)
+== DONE 07:34:27 ==

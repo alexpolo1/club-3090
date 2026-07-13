@@ -75,12 +75,29 @@ pgrep -af lmcache-retention-test.sh      # still running?
   the ~52 s true-cold cost. All 8 still warm; 2.0 s cut lands inside cache-hit
   jitter. With L2 on there's no cold floor to separate L1 from L2, so no
   threshold cleanly isolates L1. DO NOT report the rerun as a real failure.
-- Clean L1-isolation experiment — IN FLIGHT (bg job bacnmj267, orchestrator
+- **L2=0 RESULT (COMPLETE, 2026-07-13 07:34) — SURPRISE, corrects earlier claim:**
+  L2 off → **0/8 retained** (all re-prefilled 45–71 s, incl. just-inserted session 8).
+  L2 on → 8/8 warm. ⇒ **The warm-cache benefit is L2 DISK, not L1 RAM.** The 60 GB
+  L1 provisioning is NOT the active lever on this rig. Earlier "L1=60 retains the
+  working set" claim was WRONG — it was L2. Also contradicts #423's L1=0.51s
+  attribution (likely L1-fronting-L2, not standalone). Likely mechanism (UNPROVEN):
+  LMCache CPU tier only persists with a disk backend attached. Production (L2=1)
+  works great regardless — 52 s→<5 s on 50 GB. Full logs: _local-lmcache-tuning/run3-L2off.log.
+  Open: (a) is L1-standalone supposed to work? (b) if L2 carries it, can we reclaim
+  RAM by lowering L1? (c) disk/L2 is load-bearing → prune lmcache-kv + disk speed matters.
+- Clean L1-isolation experiment — DONE (was bg job bacnmj267, orchestrator
   `<scratchpad>/l2off-run.sh`). NOTE: L2 is a CONTAINER-level flag (not a script
   env) — must RECREATE the container. Chain: recreate L2=0 (~4min) → run test
   (Round1 true-cold ~52s) → restore L2=1 (~4min). Verifies each flip. Output:
   `<scratchpad>/tasks/bacnmj267.output`. Warm count = sessions genuinely in fast
   60 GB L1 RAM. Endpoint down during the 2 restarts; restored to L2=1 at end.
+
+## NEXT PHASE (queued, gated on prod-ready)
+- User wants a **big Hermes test** against qwen3.6-27b :8017 using the **"coldcase"
+  project on .96** (192.168.1.96, pings OK; NO coldcase refs in club-3090 repo).
+- Gate: only after the L1=60+L2 config is validated prod-ready.
+- BLOCKED ON INFO (asked user): what coldcase is, how to reach it on .96, what the
+  test should measure/produce. See memory `planned-hermes-coldcase-test`.
 
 ## KEY FACTS
 - Endpoint: http://localhost:8017/v1 (LAN 192.168.1.98:8017), no auth, model id `qwen3.6-27b`.
