@@ -70,3 +70,15 @@ Temporarily repointed it (and Hermes) from `:8010` autoround to the `:8017` LMCa
   backups (keep the audio fix). **Hermes** config also points at `:8017` (backup `*.bak-lmtest-*`).
 - Branch `rig-local-tuning`: commits c88c1883 (shm), 99cbd81a (retention test), b03a1349
   (L1 A/B), plus this report + artifacts under `_local-lmcache-tuning/`. Master untouched.
+
+### Save-confirmation result (2026-07-14 01:09, status=done)
+
+✅ SAVE SUCCEEDED — generation reached the DB-save step with NO audio_type truncation. The audio_type fix is confirmed end-to-end on the live service. (note: a non-audio_type ERROR line appeared — worth a look, see below.)
+
+```
+Fase 1/4: Gene
+Fase 2/4: GEMMER i databasen...
+ERROR: p
+Generation complete: 2067.7s ===
+EXIT_0
+```
