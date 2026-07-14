@@ -1,0 +1,46 @@
+=== 2x2 A/B: MTP x parser — Tue Jul 14 01:03:03 PM UTC 2026 ===
+rig: 2x RTX 3090 PCIe (no NVLink) | qwen3.6-27b AutoRound INT4 | TP=2 | fp8_e5m2 KV | prefix-caching ON
+
+################ ARM: A  MTP=3 + qwen3_coder  (SHIPPED DEFAULT)   (fp8-mtp.yml)
+  booted OK
+  probe FRESH cache : 6/6 tool-calls  (arg_key-leak=0, naked-imitation=0)
+  autonomous agent  : 2/3 PASS
+      exit=0 loglines=19 backups_added=1 VERDICT=PASS (all /5)
+      exit=0 loglines=2 backups_added=0 VERDICT=NOCHANGE (still 2x /4)
+      exit=0 loglines=12 backups_added=1 VERDICT=PASS (all /5)
+  probe POST-agentic: 0/6 tool-calls  (arg_key-leak=1, naked-imitation=0)
+  decode TPS        : 36.9 tok/s (3 runs: 37.3, 36.3, 37.1)
+
+################ ARM: B  MTP=3 + qwen3_xml   (ab-mtp-xml.yml)
+  booted OK
+  probe FRESH cache : 6/6 tool-calls  (arg_key-leak=0, naked-imitation=0)
+  autonomous agent  : 2/3 PASS
+      exit=0 loglines=16 backups_added=1 VERDICT=PASS (all /5)
+      exit=0 loglines=3 backups_added=0 VERDICT=NOCHANGE (still 2x /4)
+      exit=0 loglines=18 backups_added=1 VERDICT=PASS (all /5)
+  probe POST-agentic: 0/6 tool-calls  (arg_key-leak=1, naked-imitation=2)
+  decode TPS        : 36.1 tok/s (3 runs: 35.8, 35.8, 36.7)
+
+################ ARM: C  MTP=off + qwen3_coder   (ab-mtpoff-coder.yml)
+  booted OK
+  probe FRESH cache : 6/6 tool-calls  (arg_key-leak=0, naked-imitation=0)
+  autonomous agent  : 3/3 PASS
+      exit=0 loglines=22 backups_added=1 VERDICT=PASS (all /5)
+      exit=0 loglines=19 backups_added=1 VERDICT=PASS (all /5)
+      exit=0 loglines=12 backups_added=1 VERDICT=PASS (all /5)
+  probe POST-agentic: 6/6 tool-calls  (arg_key-leak=0, naked-imitation=0)
+  decode TPS        : 65.1 tok/s (3 runs: 65.1, 65.1, 65.0)
+
+################ ARM: D  MTP=off + qwen3_xml  (mgabor3141 production)   (ab-mtpoff-xml.yml)
+  booted OK
+  probe FRESH cache : 6/6 tool-calls  (arg_key-leak=0, naked-imitation=0)
+  autonomous agent  : 3/3 PASS
+      exit=0 loglines=21 backups_added=1 VERDICT=PASS (all /5)
+      exit=0 loglines=21 backups_added=1 VERDICT=PASS (all /5)
+      exit=0 loglines=21 backups_added=1 VERDICT=PASS (all /5)
+  probe POST-agentic: 6/6 tool-calls  (arg_key-leak=0, naked-imitation=0)
+  decode TPS        : 66.0 tok/s (3 runs: 66.1, 66.1, 65.8)
+
+=== restoring shipped service ===
+service restored healthy
+=== DONE Tue Jul 14 01:45:37 PM UTC 2026 ===
