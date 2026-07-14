@@ -18,11 +18,26 @@
 #                TPS above is a single-stream probe, NOT canonical bench.sh — relative only.
 #                Trade-off: drops MTP, so single-shot workloads lose the drafter (which on this
 #                rig measured NEGATIVE anyway — low acceptance made it pure overhead).
-#   Quality:   109/150 (det 64/75 · sandbox 45/75) (--full, current harness 2026-06-07).
-#                In the 3-way fast/balanced/max A/B (same harness, same day): fast 109 ·
-#                balanced 105 · max 110 — a TIE (the 8-pack doesn't separate the quants).
-#                ⚠️ Earlier 129/150 (--full, 2026-05-09 harness) is NOT comparable — benchlocal-cli
-#                verifier fixes since then tightened scoring (mostly the agentic HA/CLI packs).
+#   Quality:   toolcall-15 10/15 (67%) · instructfollow-15 13/15 (87%) · structoutput-15 13/15 (87%)
+#                · dataextract-15 15/15 (100%) · reasonmath-15 6/15 (40%)  = det 57/75
+#                (--medium, 2026-07-15)
+#                MTP-OFF IS QUALITY-NEUTRAL: a same-day, same-harness MTP-ON control scored
+#                det 57/75 — IDENTICAL pack-for-pack (verified two independent runs: 0/75
+#                byte-identical responses). So removing MTP costs nothing here while fixing the
+#                agentic tool-call corruption and adding ~79% decode TPS.
+#                ⚠️ Do NOT compare either number to fp8-mtp.yml's banked "det 64/75 (--full,
+#                2026-06-07 harness)" — today BOTH configs score 57/75, so that 7-point gap is
+#                harness/time drift, not MTP. Cross-time scores on this suite are not an A/B.
+#                ⚠️ These 5 packs are all SINGLE-SHOT, so they CANNOT see the #710 corruption
+#                (which needs chained agent calls building a stable prefix). That is exactly why
+#                the existing quality gate stayed green while real agents failed.
+#              hermesagent-20 (the agentic pack, same day): MTP-off 10/20 (50%) vs MTP-on 11/20
+#                (55%) — 1 scenario flipped (HA-05, favouring MTP-ON), 9 failed in BOTH arms.
+#                i.e. NO measurable MTP effect on this pack; its ~50% is capability-bound, not
+#                config-bound. The pack runs 20 DIFFERENT scenarios, so it barely reuses any one
+#                poisoned prefix — the #710 damage scales with PREFIX REUSE (a long-lived agent
+#                session on one stable system prompt), which a diverse sweep washes out.
+#                => the case for MTP-off here rests on TPS + the targeted repro, NOT on the packs.
 #   Best for:  Chained-tool AGENT workloads (hermes-agent / opencode / IDE agents)
 # ---------------------------------------------------------------------------
 # Dual RTX 3090 — fp8-mtp.yml with the MTP drafter REMOVED. Qwen3.6-27B + fp8 KV + vision.
