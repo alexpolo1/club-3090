@@ -1,0 +1,57 @@
+=== Pi vs Hermes — same model (qwen3.6-27b @ :8010, MTP-off), Wed Jul 15 04:08:08 AM UTC 2026 ===
+tasks: t1-phase t2-stringids t3-import t4-truncate   runs/task: 2
+
+  pi      t1-phase       run1  PASS  (ok)
+  pi      t1-phase       run2  PASS  (ok)
+  pi      t2-stringids   run1  PASS  (ok)
+  pi      t2-stringids   run2  PASS  (ok)
+  pi      t3-import      run1  PASS  (ok)
+  pi      t3-import      run2  FAIL  (expected 2x /await import\('util'\)/, got 1)
+  pi      t4-truncate    run1  PASS  (ok)
+  pi      t4-truncate    run2  PASS  (ok)
+  hermes  t1-phase       run1  PASS  (ok)
+  hermes  t1-phase       run2  PASS  (ok)
+  hermes  t2-stringids   run1  PASS  (ok)
+  hermes  t2-stringids   run2  FAIL  Traceback (most recent call last):
+ File "/tmp/agentbench/grade.py", line 41, in <module>
+   ok, why = grade(sys.argv[1], sys.argv[2])
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ File "/tmp/agentbench/grade.py", line 35, in grade
+   if not any(re.search(p, t) for p in g["want_any"]):
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ File "/tmp/agentbench/grade.py", line 35, in <genexpr>
+   if not any(re.search(p, t) for p in g["want_any"]):
+              ^^^^^^^^^^^^^^^
+ File "/usr/lib/python3.12/re/__init__.py", line 177, in search
+   return _compile(pattern, flags).search(string)
+          ^^^^^^^^^^^^^^^^^^^^^^^^
+ File "/usr/lib/python3.12/re/__init__.py", line 307, in _compile
+   p = _compiler.compile(pattern, flags)
+       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ File "/usr/lib/python3.12/re/_compiler.py", line 745, in compile
+   p = _parser.parse(p, flags)
+       ^^^^^^^^^^^^^^^^^^^^^^^
+ File "/usr/lib/python3.12/re/_parser.py", line 979, in parse
+   p = _parse_sub(source, state, flags & SRE_FLAG_VERBOSE, 0)
+       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ File "/usr/lib/python3.12/re/_parser.py", line 460, in _parse_sub
+   itemsappend(_parse(source, state, verbose, nested + 1,
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ File "/usr/lib/python3.12/re/_parser.py", line 864, in _parse
+   raise source.error("missing ), unterminated subpattern",
+re.error: missing ), unterminated subpattern at position 6
+  hermes  t3-import      run1  FAIL  (expected 2x /await import\('util'\)/, got 1)
+  hermes  t3-import      run2  PASS  (ok)
+  hermes  t4-truncate    run1  PASS  (ok)
+  hermes  t4-truncate    run2  PASS  (ok)
+
+=== SUMMARY (per task, 2 runs each) ===
+  TASK           PI         HERMES
+  t1-phase       ✅✅     ✅✅
+  t2-stringids   ✅✅     ✅❌
+  t3-import      ✅❌     ❌✅
+  t4-truncate    ✅✅     ✅✅
+
+  PI     total: 7/8
+  HERMES total: 6/8
+=== DONE Wed Jul 15 04:17:51 AM UTC 2026 ===

@@ -1,0 +1,46 @@
+{
+  "t1-phase": {
+    "file": "generator.ts",
+    "want_count": [
+      "Fase [0-9]/5",
+      5
+    ],
+    "forbid": "Fase [0-9]/4"
+  },
+  "t2-stringids": {
+    "file": "clue_graph.ts",
+    "want_any": [
+      "parseInt",
+      "Number\\(",
+      "parseFloat",
+      "\\+id",
+      "String\\(id\\)",
+      "toString\\(\\)",
+      "Number\\.parse"
+    ],
+    "forbid": "\\.filter\\(\\(id: number\\) => typeof id === 'number'\\)"
+  },
+  "t3-import": {
+    "file": "generator.ts",
+    "want_counts": [
+      [
+        "await import\\('util'\\)",
+        2
+      ],
+      [
+        "await import\\('child_process'\\)",
+        2
+      ]
+    ],
+    "forbid": null
+  },
+  "t4-truncate": {
+    "file": "clue_graph.ts",
+    "want_any": [
+      "substring\\(0, 120\\)",
+      "slice\\(0, 120\\)",
+      "substring\\(0,120\\)"
+    ],
+    "forbid": "substring\\(0, 12\\)"
+  }
+}
