@@ -111,3 +111,11 @@ model_list:
       rpm: 110
       tpm: 480000
       extra_body: {"thinking_budget": 1}
+
+  # ThinkingCap 27B — Qwen3.6-derived W4A16 agentic model.
+  # Running vLLM endpoint: vllm-thinkingcap-27b-dual-w4a8 at :8099.
+  - model_name: thinkingcap-27b
+    litellm_params:
+      model: openai/thinkingcap-27b
+      api_base: http://host.docker.internal:8099/v1
+      api_key: EMPTY
