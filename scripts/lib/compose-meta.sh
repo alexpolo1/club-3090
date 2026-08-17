@@ -352,3 +352,325 @@ compose_hw_model_status() {
   printf 'no|%s (your rig: %s)' "$friendly_need" "$(compose_hw_summary)"
   return 1
 }
+
+# ---------------------------------------------------------------------------
+# resolve_offload_residency <compose_file>
+#
+# Sizes CPU-offload RESIDENCY from DETECTED per-device VRAM and exports OT_G0..N,
+# which the offload composes expand into their leading `-ot` slots.
+#
+# Division of labour (matches how VLLM_IMAGE is handled): profiles hold policy,
+# LAUNCHERS resolve and inject, preflight gates. Nothing is hardcoded in a compose,
+# because the right count is card-dependent — a 24 GB-tuned regex either wastes VRAM
+# on a 32 GB card or OOMs a smaller one.
+#
+# ⚠️ THE FIT MODEL IS ADDITIVE, CALIBRATED FROM FIELD FAILURES — NOT a fraction.
+#    fit = (FREE_i − reserve − first_card_extra[i==0] − margin) / bundle
+#    An earlier ×0.55 multiplicative guard was correct on the 24 GB cards it was
+#    calibrated on and left ~6 GB/card idle on 32 GB cards (community-measured:
+#    worth +19% decode — #931). The overhead it absorbed is ADDITIVE (dense split
+#    + drafter half + compute buffers + KV don't scale with card size), so the
+#    model now subtracts it explicitly:
+#      reserve           per-compose header (true per-card engine cost, DRAFTER-FREE)
+#      draft_reserve     per-card VRAM the DRAFT MODEL will take (default 0 — see below)
+#      first_card_extra  card 0 carries the larger drafter half + compute buffer
+#                        (measured 660 MiB on 2x5090; default 768)
+#
+#    ⚠️ WHY draft_reserve IS ITS OWN TERM (#953). `reserve` is a STATIC per-compose
+#    constant, and it used to be documented as already covering the "drafter half".
+#    It cannot: the drafter loads AFTER this resolves, so FREE_i is read before the
+#    draft model allocates, and a static number set before that cost was measured
+#    silently understates it. On DeepSeek-Flash-Q8 (2x24 GB) the constant said
+#    18000 MiB while the true per-card cost measured 19586-20028 — which is exactly
+#    enough to flip fit from 0 to 1 on card 0. The sizer then granted a bundle the
+#    engine could not place, and the experts silently stayed on CPU while the RAM
+#    gate priced a bundle that never landed.
+#    Defaults to 0, so every compose WITHOUT the header is bit-identical to before
+#    and the #931 calibration points keep reproducing untouched.
+#      margin            deep-prefill spike headroom. #931 brackets it: a card at
+#                        556 MiB free DIED on a ~90K prefill; 896 MiB survived a
+#                        full 188K NIAH ladder. Default 1024 (RESIDENCY_MARGIN_MB).
+#    Sizing from FREE (not total) makes desktops / other consumers fall out
+#    automatically and yields per-card asymmetric counts (7+8 on #931's rig) with
+#    zero special-casing. Calibration points this must keep reproducing:
+#    Q8-dual 1/card + IQ2-dual 3/card on 2x24 GB · IQ2 7 (desktop) + 8 (bare) on
+#    2x32 GB (#931) · Q8-multi4 2/card on 4x24 GB (milano) · 0 on 16 GB cards.
+#    The grant is floor-conservative: a borderline card may get one bundle fewer
+#    than a hand-tuned pin — OT_G<i> overrides exist for exactly that.
+#
+# ⚠️ A LAYER'S EXPERTS MUST SIT ON THE CARD OWNING ITS DENSE TENSORS, or every token
+#    pays a cross-PCIe hop. With `-sm layer` over N cards, layer i lives on card
+#    floor(i*N/L) — so each card draws its resident layers from its OWN range.
+#
+# Emits nothing (leaving the composes' no-op defaults in place) when VRAM cannot be
+# read or the header is absent. Degrading to all-experts-CPU is always safe; it is
+# the config that runs anywhere.
+# ---------------------------------------------------------------------------
+
+# _offload_fit_count <free_mib> <reserve_mib> <bundle_mib> <per_card_cap>
+#
+# The per-card fit arithmetic, extracted so the residency INJECTOR and the RAM
+# GATE (offload_residency_grant_mib → preflight_cpu_offload_ram) can never
+# disagree about how many bundles a card holds. The additive model lives HERE
+# and nowhere else. <free_mib> is the card's DETECTED free VRAM; <reserve_mib>
+# is the caller-adjusted per-card engine cost (first-card extra already added).
+# RESIDENCY_MARGIN_MB (default 1024) is the deep-prefill spike headroom — #931
+# measured the bracket: 556 MiB free died at ~90K, 896 MiB survived 188K.
+_offload_fit_count() {
+  local free="$1" reserve="$2" bundle="$3" per_card="$4"
+  local margin="${RESIDENCY_MARGIN_MB:-1024}"
+  [[ "$margin" =~ ^[0-9]+$ ]] || margin=1024
+  local avail=$(( free - reserve - margin ))
+  (( avail < 0 )) && avail=0
+  local fit=$(( avail / bundle ))
+  (( fit > per_card )) && fit=$per_card
+  printf '%s' "$fit"
+}
+
+# _offload_layers_for_card <card_i> <n_cards> <first_moe_layer> <moe_layers> <fit>
+#
+# ⭐ OUTER-EDGE SELECTION. Card 0 counts UP from the first MoE layer; the last card
+# counts DOWN from the last. Middle cards work outward from their range centre.
+#
+# Why not "first layer of this card's nominal range": that lands exactly ON the
+# -sm layer split point, which we do NOT know (the engine reports buffer sizes, not
+# per-layer device assignment). Land on the wrong side and the bundle sits on a card
+# that does not own the layer's dense tensors -- every token then pays a cross-PCIe
+# hop, the precise pathology explicit device pinning exists to avoid. Working from
+# the outer edges is correct for ANY split.
+#
+# Prints the pipe-separated layer list for the -ot regex. Shared with the RAM gate
+# so the gate subtracts EXACTLY the bundles that will be pinned — count the entries
+# here rather than trusting `fit` (out-of-range layers are dropped, never emitted).
+_offload_layers_for_card() {
+  local i="$1" n="$2" first="$3" layers="$4" fit="$5"
+  local last=$(( first + layers - 1 ))
+  local rule="" count lay
+  for (( count=0; count<fit; count++ )); do
+    if (( i == 0 )); then                       # first card: up from the bottom
+      lay=$(( first + count ))
+    elif (( i == n - 1 )); then                 # last card: down from the top
+      lay=$(( last - count ))
+    else                                        # middle: outward from the centre
+      lay=$(( first + (2*i + 1) * layers / (2*n) + (count % 2 == 0 ? count/2 : -(count/2 + 1)) ))
+    fi
+    (( lay < first || lay > last )) && continue
+    rule="${rule}${rule:+|}${lay}"
+  done
+  printf '%s' "$rule"
+}
+
+# _offload_rule_layer_count <ot_rule>
+#
+# Prints the number of layers named in an OT_G-style rule's `blk\.(a|b|c)\.`
+# group; 0 if the rule doesn't have that shape. 0-on-unparseable is the safe
+# direction: a malformed user rule most likely matches nothing at boot, so the
+# RAM gate should price that card at worst case, not at what the user intended.
+_offload_rule_layer_count() {
+  local rule="$1" group
+  case "$rule" in
+    *'blk\.('*')'*) ;;
+    *) printf '0'; return 0 ;;
+  esac
+  group="${rule#*'blk\.('}"
+  group="${group%%')'*}"
+  [[ -z "$group" ]] && { printf '0'; return 0; }
+  local -a lays
+  IFS='|' read -ra lays <<<"$group"
+  printf '%s' "${#lays[@]}"
+}
+
+resolve_offload_residency() {
+  local compose_file="$1"
+  [[ -f "$compose_file" ]] || return 0
+  command -v nvidia-smi >/dev/null 2>&1 || return 0
+
+  local bundle; bundle="$(compose_meta_get "$compose_file" cpu-offload-bundle-mib || true)"
+  [[ "$bundle" =~ ^[0-9]+$ ]] || return 0          # not a residency-capable compose
+  local layers; layers="$(compose_meta_get "$compose_file" cpu-offload-moe-layers || true)"
+  [[ "$layers" =~ ^[0-9]+$ ]] || return 0
+  local reserve; reserve="$(compose_meta_get "$compose_file" cpu-offload-gpu-reserve-mib || true)"
+  [[ "$reserve" =~ ^[0-9]+$ ]] || reserve=18000
+  # First MoE layer. Models with a DENSE PREFIX (Laguna=1, Inkling=2) have no experts
+  # in their leading layers; a rule naming one silently matches NOTHING, so the user
+  # gets fewer resident layers than we think we granted and host RAM errs UNSAFE.
+  local first; first="$(compose_meta_get "$compose_file" cpu-offload-first-moe-layer || true)"
+  [[ "$first" =~ ^[0-9]+$ ]] || first=0
+  local extra; extra="$(compose_meta_get "$compose_file" cpu-offload-first-card-extra-mib || true)"
+  [[ "$extra" =~ ^[0-9]+$ ]] || extra=768
+  # Per-card DRAFT-MODEL VRAM (#953). 0 when absent => no behaviour change for any
+  # compose that does not declare it. Overridable for A/B via RESIDENCY_DRAFT_MB.
+  local draft; draft="$(compose_meta_get "$compose_file" cpu-offload-draft-reserve-mib || true)"
+  [[ "$draft" =~ ^[0-9]+$ ]] || draft=0
+  # ⚠️ plain `if`, NOT `[[ ]] && assign`: the latter returns non-zero when the
+  # condition is false, and every caller runs under `set -e` — that aborts the
+  # launcher mid-resolve. Same trap documented in preflight.sh.
+  if [[ "${RESIDENCY_DRAFT_MB:-}" =~ ^[0-9]+$ ]]; then draft="$RESIDENCY_DRAFT_MB"; fi
+
+  local -a frees=()
+  while read -r m; do [[ "$m" =~ ^[0-9]+$ ]] && frees+=("$m"); done \
+    < <(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null)
+  local n="${#frees[@]}"
+  (( n >= 2 )) || return 0
+
+  local per_card=$(( layers / n ))
+  local i fit rule var applied="" res_i
+  for (( i=0; i<n; i++ )); do
+    res_i=$(( reserve + draft + (i == 0 ? extra : 0) ))
+    # An explicit OT_G<i> from the user/env ALWAYS WINS and is never clobbered —
+    # same contract as THREADS (resolve_offload_threads). This is the supported
+    # way to pin more residency than the sizer grants (the grant is deliberately
+    # floor-conservative — club-3090 #931). The RAM gate prices the user's
+    # ACTUAL pin (offload_residency_grant_mib counts the rule's layers), so the
+    # two stay coherent.
+    var="OT_G${i}"
+    if [[ -n "${!var:-}" ]]; then
+      # Sanity: a pin that exceeds the card's free space beyond the engine
+      # reserve is a certain boot OOM. Warn loudly, don't block: the override
+      # exists to out-judge us. First community hit: 8/card of Q8's 3264 MiB
+      # bundles — an IQ2-sized recipe applied to the fat quant (#931).
+      local ucount upin_mib
+      ucount="$(_offload_rule_layer_count "${!var}")"
+      upin_mib=$(( ucount * bundle ))
+      if (( upin_mib > frees[i] - res_i )); then
+        echo "[residency] WARN: OT_G${i} pins ${ucount} bundles = ~$(( upin_mib / 1024 )) GiB of experts, but card ${i}" >&2
+        echo "            has only ~$(( (frees[i] > res_i ? frees[i] - res_i : 0) / 1024 )) GiB free beyond the reserve (bundle=${bundle} MiB on THIS quant —" >&2
+        echo "            bundle sizes differ per quant tier; a layer count sized for one tier over-pins another)." >&2
+        echo "            Expect a boot OOM; reduce the pin." >&2
+      fi
+      applied="${applied}${applied:+ · }card${i}: USER pin, ${ucount} bundles"
+      continue
+    fi
+    fit="$(_offload_fit_count "${frees[i]}" "$res_i" "$bundle" "$per_card")"
+    if (( fit < 1 )); then                        # leave this card's no-op default
+      applied="${applied}${applied:+ · }card${i}: none (0 fit)"
+      continue
+    fi
+    rule="$(_offload_layers_for_card "$i" "$n" "$first" "$layers" "$fit")"
+    if [[ -z "$rule" ]]; then
+      applied="${applied}${applied:+ · }card${i}: none (0 fit)"
+      continue
+    fi
+    export "OT_G${i}=blk\.(${rule})\.ffn_(gate|up|down)_exps\.weight=CUDA${i}"
+    applied="${applied}${applied:+ · }card${i}: auto ${fit} bundles (blk ${rule})"
+  done
+  # Say what will actually be pinned and WHO decided it. Three community
+  # debugging rounds in two days (#931 twice, milano's multi4 boot) needed
+  # docker-inspect forensics to answer exactly this — one boot line ends that.
+  [[ -n "$applied" ]] && echo "[residency] ${applied}" >&2
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# offload_residency_grant_mib <compose_file>
+#
+# Prints the TOTAL MiB of expert bundles resolve_offload_residency will pin onto
+# THIS rig's GPUs — same headers, same detection, same calibrated fit, same layer
+# selection — so preflight's RAM gate can subtract bytes that will NOT be in host
+# RAM. The compose's CPU-Offload-Host-RAM-GB header MUST therefore stay the
+# ALL-experts-on-CPU worst case: the gate does the subtraction itself, and a
+# header with residency pre-baked would double-count it and under-gate (a 4x16 GB
+# rig fits ZERO bundles and truly needs the full worst case — the exact shape the
+# multi4 header briefly shipped before this function existed).
+#
+# Prints 0 whenever the injector would emit nothing (no VRAM readable, <2 cards,
+# not a residency-capable compose): "assume nothing resident" keeps the gate at
+# the worst case, which is the safe direction.
+# ---------------------------------------------------------------------------
+offload_residency_grant_mib() {
+  local compose_file="$1"
+  [[ -f "$compose_file" ]] || { printf '0'; return 0; }
+  command -v nvidia-smi >/dev/null 2>&1 || { printf '0'; return 0; }
+
+  local bundle; bundle="$(compose_meta_get "$compose_file" cpu-offload-bundle-mib || true)"
+  [[ "$bundle" =~ ^[0-9]+$ ]] || { printf '0'; return 0; }
+  local layers; layers="$(compose_meta_get "$compose_file" cpu-offload-moe-layers || true)"
+  [[ "$layers" =~ ^[0-9]+$ ]] || { printf '0'; return 0; }
+  local reserve; reserve="$(compose_meta_get "$compose_file" cpu-offload-gpu-reserve-mib || true)"
+  [[ "$reserve" =~ ^[0-9]+$ ]] || reserve=18000
+  local first; first="$(compose_meta_get "$compose_file" cpu-offload-first-moe-layer || true)"
+  [[ "$first" =~ ^[0-9]+$ ]] || first=0
+  local extra; extra="$(compose_meta_get "$compose_file" cpu-offload-first-card-extra-mib || true)"
+  [[ "$extra" =~ ^[0-9]+$ ]] || extra=768
+  # Per-card DRAFT-MODEL VRAM (#953). 0 when absent => no behaviour change for any
+  # compose that does not declare it. Overridable for A/B via RESIDENCY_DRAFT_MB.
+  local draft; draft="$(compose_meta_get "$compose_file" cpu-offload-draft-reserve-mib || true)"
+  [[ "$draft" =~ ^[0-9]+$ ]] || draft=0
+  # ⚠️ plain `if`, NOT `[[ ]] && assign`: the latter returns non-zero when the
+  # condition is false, and every caller runs under `set -e` — that aborts the
+  # launcher mid-resolve. Same trap documented in preflight.sh.
+  if [[ "${RESIDENCY_DRAFT_MB:-}" =~ ^[0-9]+$ ]]; then draft="$RESIDENCY_DRAFT_MB"; fi
+
+  local -a frees=()
+  local m
+  while read -r m; do [[ "$m" =~ ^[0-9]+$ ]] && frees+=("$m"); done \
+    < <(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null)
+  local n="${#frees[@]}"
+  (( n >= 2 )) || { printf '0'; return 0; }
+
+  local per_card=$(( layers / n ))
+  local i fit rule total_mib=0 var ucount res_i
+  local -a lays
+  for (( i=0; i<n; i++ )); do
+    res_i=$(( reserve + draft + (i == 0 ? extra : 0) ))
+    # A user-set OT_G<i> is what will ACTUALLY be pinned (the injector never
+    # clobbers it) — price ITS layer count, not the auto fit, so the gate and
+    # the boot describe the same config. First hit in the wild: a 123 GB box
+    # gated on the auto grant (~12 GB) while the user was pinning 4x that
+    # (#931). Unparseable user rule counts 0 = worst case, the safe direction.
+    var="OT_G${i}"
+    if [[ -n "${!var:-}" ]]; then
+      ucount="$(_offload_rule_layer_count "${!var}")"
+      total_mib=$(( total_mib + ucount * bundle ))
+      continue
+    fi
+    fit="$(_offload_fit_count "${frees[i]}" "$res_i" "$bundle" "$per_card")"
+    (( fit < 1 )) && continue
+    rule="$(_offload_layers_for_card "$i" "$n" "$first" "$layers" "$fit")"
+    [[ -z "$rule" ]] && continue
+    IFS='|' read -ra lays <<<"$rule"
+    total_mib=$(( total_mib + ${#lays[@]} * bundle ))
+  done
+  printf '%s' "$total_mib"
+}
+
+# ---------------------------------------------------------------------------
+# resolve_offload_threads <compose_file>
+#
+# Exports THREADS = nproc/2 for CPU-offload composes, so `-t` tracks the RIG
+# instead of a number that happened to suit the reference box.
+#
+# ⚠️ WHY nproc/2 AND NOT nproc: the offloaded decode path is SYNCHRONIZATION-bound,
+#    not compute-bound — ~40 sequential GPU<->CPU handoffs per token with a thread
+#    barrier at each. Past the knee, extra threads add barrier contention faster
+#    than they add streaming, so throughput INVERTS rather than plateauing:
+#    measured on 35B-A3B, -t 48 burned 94% CPU to deliver 31% of peak (-69% vs
+#    -t 16). llama.cpp's own default is worse still (-31%, stack finding).
+#
+# ⚠️ HONEST SCOPE: on DeepSeek-V4-Flash the knee is FLAT — 16 / 24 measured
+#    10.18 / 10.67, i.e. indistinguishable (tuning matrix A0/A1, 2026-08-06). So
+#    this is shipped for ROBUSTNESS, not for a measured speedup on this model: a
+#    hardcoded 24 oversubscribes a 4-core box and under-uses a 64-core one. Do not
+#    quote a TPS gain for it.
+#
+# Why the launcher and not the compose: these composes carry NO entrypoint, so
+# there is no shell to run `nproc` in. Adding `bash -c` would pull them into the
+# `$$`-escaping regime that test-compose-nvlink-escape polices. Same division of
+# labour as OT_G*: profiles hold policy, launchers resolve, preflight gates.
+#
+# An explicit THREADS from the user/env always wins and is never clobbered.
+# ---------------------------------------------------------------------------
+resolve_offload_threads() {
+  local compose_file="$1"
+  [[ -f "$compose_file" ]] || return 0
+  [[ -n "${THREADS:-}" ]] && return 0            # user override wins
+  declare -F is_cpu_offload_compose >/dev/null 2>&1 || return 0
+  is_cpu_offload_compose "$compose_file" || return 0
+
+  local n; n="$(nproc 2>/dev/null || echo 0)"
+  [[ "$n" =~ ^[0-9]+$ ]] && (( n > 0 )) || return 0
+  local t=$(( n / 2 ))
+  (( t < 1 )) && t=1                             # single-core boxes still get 1
+  export THREADS="$t"
+  echo "[preflight] cpu-offload: threads=${t} (nproc/2 of ${n}) — offloaded decode is sync-bound; more threads invert"
+}

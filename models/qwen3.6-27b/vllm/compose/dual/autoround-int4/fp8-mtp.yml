@@ -86,7 +86,7 @@ services:
     # means no patch overlays are anchored here, so we ride stable releases.
     # Bump the tag to a newer stable after a verify-stress + soak gate.
     # Override with VLLM_IMAGE=... if you need a specific build.
-    image: ${VLLM_IMAGE:-vllm/vllm-openai:v0.25.1}
+    image: ${VLLM_IMAGE:-vllm/vllm-openai:v0.27.1}
     container_name: "${ESTATE_CONTAINER:-vllm-qwen36-27b-dual}"
     restart: ${CLUB3090_RESTART:-unless-stopped}
     ports:
@@ -134,6 +134,10 @@ services:
       - TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE:-${OFFLINE:-0}}
       - VLLM_WORKER_MULTIPROC_METHOD=spawn
       - NVLINK_MODE=${NVLINK_MODE:-auto}
+      # Opt-in transfer check: VLLM_SKIP_P2P_CHECK=0 makes vLLM PROVE peer access by
+      # moving bytes (report.sh reads the cache). Bare passthrough — absent unless set.
+      # docs/PCIE_P2P.md §7.
+      - VLLM_SKIP_P2P_CHECK
       - NCCL_CUMEM_ENABLE=0
       - NCCL_P2P_DISABLE=1
       - VLLM_NO_USAGE_STATS=1

@@ -68,6 +68,24 @@ def _entry(
     # PCIe); "prefetch" = vLLM bulk layer prefetch. Surfaced as the c3 catalog
     # "offload" column. First used by the Laguna 118B-MoE offload slugs.
     offload=None,
+    # True when the compose runs an adaptive expert cache (llama.cpp `--moe-cache`):
+    # hot CPU-resident experts are held in spare VRAM and served from there instead
+    # of over PCIe. Only meaningful alongside an `offload` backend — the cache exists
+    # to soften the miss path that offload creates.
+    #
+    # Load-bearing, not documentation: the launch-compat layer gates its
+    # MOE_RESERVE_MB injection on this flag (`_moe_cache_env`), so a compose that
+    # runs the cache without declaring it silently keeps a reserve derived on a
+    # 24 GB card no matter what the detected hardware is. `--moe-cache auto` grants
+    # free-minus-reserve, and on the reference rig a reserve 512 MiB too small cost
+    # ~11% throughput while REPORTING a bigger pool and a higher hit rate.
+    moe_cache=False,
+    # Minimum HOST RAM in GB for a weight-offload slug — the worst case (all experts
+    # on CPU). This is a HARD GATE, not a recommendation: below it the box thrashes or
+    # OOMs, and preflight_cpu_offload_ram() REFUSES. Surfaced as the c3 catalog
+    # "host RAM" column so a user sees it BEFORE selecting a slug, rather than
+    # discovering it at launch refusal. None = fully VRAM-resident, nothing to warn about.
+    host_ram_gb=None,
     chat_template="native",
     tp,
     max_ctx,
@@ -123,6 +141,8 @@ def _entry(
         "act_format": act_format,
         "act8_capable": act8_capable,
         "offload": offload,
+        "moe_cache": bool(moe_cache),
+        "host_ram_gb": host_ram_gb,
         "chat_template": chat_template,
         "tp": tp,
         "pp": 1,
@@ -345,6 +365,8 @@ COMPOSE_REGISTRY = {
         compose_path="models/qwen3.6-27b/llama-cpp/compose/single/unsloth-q4km/mtp.yml",
         default_port=8020,
         kvcalc_key="SKIP",
+        status="deprecated",
+        status_note="Retired 2026-08-12 (maintainer decision): consolidating the single-card qwen3.6-27b surface onto vLLM. NOT a regression report -- this slug's measured results stand. WARNING this retirement REMOVES capability: with all llama.cpp + ik-llama single-card qwen slugs gone, single-card qwen3.6-27b drops from 200K ctx (and 150K vision via llamacpp/mtp-vision) to vllm/minimal at 32K with NO vision, ~32/33 TPS vs ~60/72. Both DEFAULTS rows (llamacpp/single, ik-llama/single) are REMOVED, not repointed -- no functional sibling remains in either engine -- and qwen3.6-27b is dropped from RECOMMENDED_DEFAULT_MODELS so a bare launch.sh no longer auto-lands single-card users on a debugging baseline. Entry KEPT (deprecated != deleted). Launchable with --force; c3 --all.",
     ),
     "llamacpp/mtp": _entry(
         model="qwen3.6-27b", weights_variant="unsloth-q4km", workload="fast-chat", chat_template="froggeric",
@@ -353,6 +375,8 @@ COMPOSE_REGISTRY = {
         compose_path="models/qwen3.6-27b/llama-cpp/compose/single/unsloth-q4km/mtp.yml",
         default_port=8020,
         kvcalc_key="SKIP",
+        status="deprecated",
+        status_note="Retired 2026-08-12 (maintainer decision): consolidating the single-card qwen3.6-27b surface onto vLLM. NOT a regression report -- this slug's measured results stand. WARNING this retirement REMOVES capability: with all llama.cpp + ik-llama single-card qwen slugs gone, single-card qwen3.6-27b drops from 200K ctx (and 150K vision via llamacpp/mtp-vision) to vllm/minimal at 32K with NO vision, ~32/33 TPS vs ~60/72. Both DEFAULTS rows (llamacpp/single, ik-llama/single) are REMOVED, not repointed -- no functional sibling remains in either engine -- and qwen3.6-27b is dropped from RECOMMENDED_DEFAULT_MODELS so a bare launch.sh no longer auto-lands single-card users on a debugging baseline. Entry KEPT (deprecated != deleted). Launchable with --force; c3 --all.",
     ),
     "llamacpp/bounded-thinking": _entry(
         model="qwen3.6-27b", weights_variant="unsloth-q4km", workload="tool-heavy",
@@ -361,8 +385,8 @@ COMPOSE_REGISTRY = {
         compose_path="models/qwen3.6-27b/llama-cpp/compose/single/unsloth-q4km/bounded-thinking.yml",
         default_port=8020,
         kvcalc_key="SKIP",
-        status="experimental",
-        status_note="New structured-CoT port; live grammar + MTP validation pending.",
+        status="deprecated",
+        status_note="Retired 2026-08-12 (maintainer decision): consolidating the single-card qwen3.6-27b surface onto vLLM. NOT a regression report -- this slug's measured results stand. WARNING this retirement REMOVES capability: with all llama.cpp + ik-llama single-card qwen slugs gone, single-card qwen3.6-27b drops from 200K ctx (and 150K vision via llamacpp/mtp-vision) to vllm/minimal at 32K with NO vision, ~32/33 TPS vs ~60/72. Both DEFAULTS rows (llamacpp/single, ik-llama/single) are REMOVED, not repointed -- no functional sibling remains in either engine -- and qwen3.6-27b is dropped from RECOMMENDED_DEFAULT_MODELS so a bare launch.sh no longer auto-lands single-card users on a debugging baseline. Entry KEPT (deprecated != deleted). Launchable with --force; c3 --all.",
     ),
     "llamacpp/mtp-vision": _entry(
         model="qwen3.6-27b", weights_variant="unsloth-q4km", workload="vision-coding", chat_template="froggeric",
@@ -374,6 +398,8 @@ COMPOSE_REGISTRY = {
         weights_companions=("gguf_mmproj_f16",),  # mmproj vision projector the compose mounts
         default_port=8020,
         kvcalc_key="SKIP",
+        status="deprecated",
+        status_note="Retired 2026-08-12 (maintainer decision): consolidating the single-card qwen3.6-27b surface onto vLLM. NOT a regression report -- this slug's measured results stand. WARNING this retirement REMOVES capability: with all llama.cpp + ik-llama single-card qwen slugs gone, single-card qwen3.6-27b drops from 200K ctx (and 150K vision via llamacpp/mtp-vision) to vllm/minimal at 32K with NO vision, ~32/33 TPS vs ~60/72. Both DEFAULTS rows (llamacpp/single, ik-llama/single) are REMOVED, not repointed -- no functional sibling remains in either engine -- and qwen3.6-27b is dropped from RECOMMENDED_DEFAULT_MODELS so a bare launch.sh no longer auto-lands single-card users on a debugging baseline. Entry KEPT (deprecated != deleted). Launchable with --force; c3 --all.",
     ),
 
     # ik_llama.cpp — IQ4_KS (ubergarm). Same engine family as llamacpp, but the
@@ -387,8 +413,12 @@ COMPOSE_REGISTRY = {
         compose_path="models/qwen3.6-27b/ik-llama/compose/single/ubergarm-iq4ks/mtp.yml",
         default_port=8020,
         kvcalc_key="SKIP",
+        status="deprecated",
+        status_note="Retired 2026-08-12 (maintainer decision): consolidating the single-card qwen3.6-27b surface onto vLLM. NOT a regression report -- this slug's measured results stand. WARNING this retirement REMOVES capability: with all llama.cpp + ik-llama single-card qwen slugs gone, single-card qwen3.6-27b drops from 200K ctx (and 150K vision via llamacpp/mtp-vision) to vllm/minimal at 32K with NO vision, ~32/33 TPS vs ~60/72. Both DEFAULTS rows (llamacpp/single, ik-llama/single) are REMOVED, not repointed -- no functional sibling remains in either engine -- and qwen3.6-27b is dropped from RECOMMENDED_DEFAULT_MODELS so a bare launch.sh no longer auto-lands single-card users on a debugging baseline. Entry KEPT (deprecated != deleted). Launchable with --force; c3 --all.",
     ),
     "ik-llama/iq4ks-mtp-vision": _entry(
+        status="deprecated",
+        status_note="Retired 2026-08-12: consolidating the single-card ik-llama surface onto ik-llama/iq4ks-mtp, which STAYS production and remains the shipped single-card default (~18-20% faster decode than llamacpp/mtp at matched 370 W, verified by a set-and-readback power-cap A/B -- discussions/184). This variant was validated and is not broken; it is retired to keep the variant set lean per the compose conventions. NOTE: NO disk is reclaimed -- all three ubergarm-iq4ks slugs share ONE weights file, still in use by ik-llama/iq4ks-mtp. Entry KEPT (deprecated != deleted) so the slug resolves and the launch-compat tests keep asserting on its hardware fields. Launchable with --force; c3 --all.",
         model="qwen3.6-27b", weights_variant="ubergarm-iq4ks", workload="vision-coding", chat_template="froggeric",
         engine="llama-cpp-local", drafter="qwen-mtp-builtin", kv_format="q4_0",
         tp=1, max_ctx=163840, max_num_seqs=1, mem_util=None,
@@ -398,6 +428,8 @@ COMPOSE_REGISTRY = {
         kvcalc_key="SKIP",
     ),
     "ik-llama/iq4ks-two-stage": _entry(
+        status="deprecated",
+        status_note="Retired 2026-08-12: consolidating the single-card ik-llama surface onto ik-llama/iq4ks-mtp, which STAYS production and remains the shipped single-card default (~18-20% faster decode than llamacpp/mtp at matched 370 W, verified by a set-and-readback power-cap A/B -- discussions/184). This variant was validated and is not broken; it is retired to keep the variant set lean per the compose conventions. NOTE: NO disk is reclaimed -- all three ubergarm-iq4ks slugs share ONE weights file, still in use by ik-llama/iq4ks-mtp. Entry KEPT (deprecated != deleted) so the slug resolves and the launch-compat tests keep asserting on its hardware fields. Launchable with --force; c3 --all.",
         model="qwen3.6-27b", weights_variant="ubergarm-iq4ks", workload="fast-chat",
         engine="llama-cpp-local", drafter="qwen-mtp-builtin", kv_format="q4_0",
         tp=1, max_ctx=200000, max_num_seqs=1, mem_util=None,
@@ -477,7 +509,7 @@ COMPOSE_REGISTRY = {
         compose_path="models/qwen3.6-27b/llama-cpp/compose/single/pi-reasoning-q4km/mtp.yml",
         default_port=8063,
         kvcalc_key="SKIP",
-        status="experimental",
+        status="deprecated",
         status_note="Qwen3.6-27B-MTP-pi-reasoning (bytkim — 'Pi-style' reasoning-supervised CODING/terminal-agent fine-tune of Qwen3.6-27B) Q4_K_M GGUF + EMBEDDED MTP head (--spec-type draft-mtp, n=2) + q4_0/q4_0 KV, single 3090, reasoning-ON, on MAINLINE llama.cpp (server-cuda-b9246, PR #22673). Launch with --force (experimental). CONFIG FOLLOWS THE MODEL CARD: temp 1.0 / top-p 0.95 / top-k 0 / min-p 0 (NOT the stack's 0.6/20), reasoning ON, q4_0/q4_0 KV. Card recommends MTP n=3; on-rig A/B found n=2 marginally faster (within noise) — kept n=2, MTP_DRAFT_N_MAX=3 matches the card. Card notes presence-penalty 1.5 for DIRECT/instruct (REASONING=off) mode. CONTEXT (measured 2026-06-17): 200K-alloc fills ~188K usable with correct needle recall (22.7 GB / ~1.8 GB free); decode ~23 t/s at ~188K depth. Do NOT alloc 262K — FA scratch grows with alloc, so 262K OOMs at ~176K (LESS usable than 200K); full 262K usable is beellama-only. Author TESTED only 128K, so 128-188K is engine-proven but past the card's validated window (CTX_SIZE=131072 for strict compliance). FULL REBENCH-FULL VALIDATED 2026-06-18 (--with-8pack-thinking=both): bench @370W NARRATIVE 47.4/47.9, CODE 54.2/55.3 wall/decode, PP 1030 tok/s (n=5, CV<2%); @230W cap 28.5/32.9 (mainline -42% 370->230W — power-sensitive). verify-stress 8/8 (NIAH recall to 183K @ 91% of the 200K pool). 8-pack 104/150 think-off / 106/150 think-on (cohort: carnice 110, ik 107, qwopus 103). soak PASS (0 MiB growth, 0/100 silent-empty, p50 54.5, 102% retention). The MTP head is NOT weaker than base: a matched-power A/B (230W) put it DEAD-EVEN with base Qwen3.6-27B MTP (73% vs 72% accept, identical decode), and 47.9/55.3 @370W is ~on par with base 50.3/58.9 (within ~5% on canonical prompts). Verbose even thinking-off (a few deterministic-pack misses were finish_reason=length truncations — give it generous max_tokens). MTP gives ~+43% over no-MTP. Mainline llama.cpp = no patches, follows upstream.",
     ),
 
@@ -489,7 +521,7 @@ COMPOSE_REGISTRY = {
         compose_path="models/qwen3.6-27b/ik-llama/compose/single/ex0bit-prism-pro-dq/mtp.yml",
         default_port=8020,
         kvcalc_key="SKIP",
-        status="experimental",
+        status="deprecated",
         status_note="PRISM-PRO-DQ community dynamic-quant GGUF — eval-only, not yet validated.",
     ),
     "ik-llama/prism-pro-dq-long": _entry(
@@ -499,7 +531,7 @@ COMPOSE_REGISTRY = {
         compose_path="models/qwen3.6-27b/ik-llama/compose/single/ex0bit-prism-pro-dq/long.yml",
         default_port=8052,
         kvcalc_key="SKIP",
-        status="experimental",
+        status="deprecated",
         status_note="PRISM-PRO-DQ community dynamic-quant GGUF — eval-only, not yet validated.",
     ),
     "ik-llama/prism-pro-dq-two-stage": _entry(
@@ -509,7 +541,7 @@ COMPOSE_REGISTRY = {
         compose_path="models/qwen3.6-27b/ik-llama/compose/single/ex0bit-prism-pro-dq/two-stage.yml",
         default_port=8020,
         kvcalc_key="SKIP",
-        status="experimental",
+        status="deprecated",
         status_note="PRISM-PRO-DQ community dynamic-quant GGUF — eval-only, not yet validated.",
     ),
     "ik-llama/prism-pro-dq-dual": _entry(
@@ -519,7 +551,7 @@ COMPOSE_REGISTRY = {
         compose_path="models/qwen3.6-27b/ik-llama/compose/dual/ex0bit-prism-pro-dq/mtp.yml",
         default_port=8053,
         kvcalc_key="SKIP",
-        status="experimental",
+        status="deprecated",
         status_note="PRISM-PRO-DQ community dynamic-quant GGUF — eval-only, not yet validated.",
     ),
     "ik-llama/prism-pro-dq-dual-vision": _entry(
@@ -530,7 +562,7 @@ COMPOSE_REGISTRY = {
         weights_companions=("gguf_mmproj_f16",),  # mmproj vision projector the compose mounts
         default_port=8010,
         kvcalc_key="SKIP",
-        status="experimental",
+        status="deprecated",
         status_note="PRISM-PRO-DQ community dynamic-quant GGUF — eval-only, not yet validated.",
     ),
     # Qwen3.6-35B-A3B APEX-MTP (mudler MoE GGUF — Compact + Quality) — community-experimental, ik-llama.
@@ -541,8 +573,8 @@ COMPOSE_REGISTRY = {
         compose_path="models/qwen3.6-35b-a3b/ik-llama/compose/single/mudler-apex-compact/mtp.yml",
         default_port=8054,
         kvcalc_key="SKIP",
-        status="experimental",
-        status_note="APEX-MTP community MoE GGUF — eval-only bring-up lane, not yet validated.",
+        status="deprecated",
+        status_note="Retired 2026-08-12: superseded by later quants, no production role; was already 'experimental' (hidden from --list, --force to launch), so this is a status change with no new user-visible restriction. Weights reclaimed (17 GB). WARNING: mudler-apex-compact and mudler-apex-quality resolve to the SAME path (qwen3.6-35b-a3b-gguf/mudler-apex-mtp), so neither was independently deletable -- all three slugs retire together. Entry KEPT (deprecated != deleted). Launchable with --force; c3 --all.",
     ),
     "ik-llama/byteshape-iq4xs-mtp": _entry(
         model="qwen3.6-35b-a3b", weights_variant="byteshape-iq4xs", workload="fast-chat",
@@ -551,7 +583,7 @@ COMPOSE_REGISTRY = {
         compose_path="models/qwen3.6-35b-a3b/ik-llama/compose/single/byteshape-iq4xs/mtp.yml",
         default_port=8058,
         kvcalc_key="SKIP",
-        status="caveats",
+        status="deprecated",
         status_note="byteshape IQ4_XS 4.19bpw MoE GGUF (embedded MTP head) — community intake from PR #293 (@Rhonstin). Single-card 35B-A3B, q4_0 KV + --fit → 262K. First-party validated 2026-06-02 on 1× 3090: verify-full all-pass, verify-stress 8/8 (NIAH→240K, no Cliff), bench n=5 (narrative 113/116 · code 129/137 wall/decode TPS, CV<2.3%), 8-pack 110/150 (≈ author's 111/150), soak-continuous PASS (0 err, 0 VRAM growth, 0/25 silent-empty). Caveat: single-rig; agent packs modest (hermes 55%, cli 42%) as typical for the class. Intake fixes vs #293: image cu13, port 8058.",
     ),
     "ik-llama/apex-mtp-compact-long": _entry(
@@ -561,8 +593,8 @@ COMPOSE_REGISTRY = {
         compose_path="models/qwen3.6-35b-a3b/ik-llama/compose/single/mudler-apex-compact/long.yml",
         default_port=8056,
         kvcalc_key="SKIP",
-        status="experimental",
-        status_note="APEX-MTP community MoE GGUF — eval-only bring-up lane, not yet validated.",
+        status="deprecated",
+        status_note="Retired 2026-08-12: superseded by later quants, no production role; was already 'experimental' (hidden from --list, --force to launch), so this is a status change with no new user-visible restriction. Weights reclaimed (17 GB). WARNING: mudler-apex-compact and mudler-apex-quality resolve to the SAME path (qwen3.6-35b-a3b-gguf/mudler-apex-mtp), so neither was independently deletable -- all three slugs retire together. Entry KEPT (deprecated != deleted). Launchable with --force; c3 --all.",
     ),
     # @laurimyllari's --fit + asymmetric q8_0(K)/q5_0(V) KV config from
     # discussion #241, retuned + measured on 1× 3090. +7% narr / +4% code
@@ -575,6 +607,8 @@ COMPOSE_REGISTRY = {
         compose_path="models/qwen3.6-35b-a3b/ik-llama/compose/single/mudler-apex-compact/fit-mtp.yml",
         default_port=8057,
         kvcalc_key="SKIP",
+        status="deprecated",
+        status_note="Retired 2026-08-12: consolidating the mudler-apex surface. ATTENTION this slug was PRODUCTION (not experimental like its three siblings), so this IS a user-visible change: it leaves --list and now needs --force. It is not a DEFAULTS target, and no functional mudler slug remains. Superseded by later quants. WARNING all four mudler slugs resolve to the SAME weights path (qwen3.6-35b-a3b-gguf/mudler-apex-mtp) -- none was independently deletable, which is why they retire together and why the 17 GB is only reclaimable now. Entry KEPT (deprecated != deleted). Launchable with --force; c3 --all.",
     ),
     "ik-llama/apex-mtp-quality-dual": _entry(
         model="qwen3.6-35b-a3b", weights_variant="mudler-apex-quality", workload="long-ctx-single",
@@ -583,8 +617,8 @@ COMPOSE_REGISTRY = {
         compose_path="models/qwen3.6-35b-a3b/ik-llama/compose/dual/mudler-apex-quality/mtp.yml",
         default_port=8055,
         kvcalc_key="SKIP",
-        status="experimental",
-        status_note="APEX-MTP community MoE GGUF — eval-only bring-up lane, not yet validated.",
+        status="deprecated",
+        status_note="Retired 2026-08-12: superseded by later quants, no production role; was already 'experimental' (hidden from --list, --force to launch), so this is a status change with no new user-visible restriction. Weights reclaimed (17 GB). WARNING: mudler-apex-compact and mudler-apex-quality resolve to the SAME path (qwen3.6-35b-a3b-gguf/mudler-apex-mtp), so neither was independently deletable -- all three slugs retire together. Entry KEPT (deprecated != deleted). Launchable with --force; c3 --all.",
     ),
     "llamacpp/hauhaucs-35ba3b-dual": _entry(
         model="qwen3.6-35b-a3b", weights_variant="morikomorizz-q6kp", workload="fast-chat",
@@ -857,8 +891,8 @@ COMPOSE_REGISTRY = {
         compose_path="models/diffusiongemma-26b-a4b/vllm/compose/dual/fp8/base.yml",
         default_port=8042,
         kvcalc_key="SKIP",
-        status="experimental",
-        status_note="DiffusionGemma dLLM (vLLM's first) on Ampere via the OFFICIAL vllm/vllm-openai:gemma image (digest-pinned; dgemma arch baked in) + 3 bind-mounted Ampere/TP fixes (marlin-K-pad x2 + diffusion_gemma TP-vocab/dtype) — NOT in :gemma since vLLM tests H100/TP=1. Eager-only, gemma4 tool+reasoning parsers. 262K (NIAH->250K), 8-pack 100/150 (5-pack 84%), ~177/180 TPS typical (peak ~1100 low-entropy). max_new_tokens lifted 256->16384 (the model self-terminates ~1.2-1.8K words; no one-shot 10K). Experimental: visible in --list (NA), launch needs --force. Supersedes the 123-file sideload (PR #358); re-pin+rebase the 3 fixes if :gemma is re-pushed. 2026-06-11.",
+        status="deprecated",
+        status_note="Retired 2026-08-12 (maintainer decision): superseded, no production role. Was already 'experimental' (hidden from --list, --force to launch), so no new user-visible restriction. Sole slug for model diffusiongemma-26b-a4b, no DEFAULTS row, and its fp8 weights resolve to their OWN path (diffusiongemma-26b-a4b-it-fp8-dynamic, 25.3 GB) -- the shared 'fp8' variant NAME is not a shared path, so those weights are independently reclaimable. Entry KEPT (deprecated != deleted). Launchable with --force; c3 --all.",
     ),
     # DEFAULTS: intentionally NOT added — 'experimental' is non-functional, so it
     # degrades out of the curated <model>/default walk; reachable only by explicit
@@ -925,6 +959,23 @@ COMPOSE_REGISTRY = {
         status_note="Qwen3.6-35B-A3B NVFP4-Fast (unsloth compressed-tensors MIXED: true W4A4 NVFP4 expert FFNs + FP8-dynamic attention; quant auto-detects — NOT modelopt), TP=2 @262K. THE AMPERE-VALIDATED NVFP4 PATH — inverse of dual-nvfp4: FIRST-PARTY VALIDATED on the reference 2x3090 2026-07-11 (first MoE-FP4 fallback boot anywhere, MARLIN NvFp4 MoE backend): decode 179.5/179.4 (n=5, CV<=0.8%) + 8-pack think-off 103/150 = DOUBLE STATISTICAL TIE with the AutoRound tier (182.3/182.3, 104-equiv) at full 262K, 22.46 GB/card; cli-40 20/40 = best measured on this MoE. See BENCHMARKS 2026-07-11. PROMOTED to Production w/ caveats 2026-07-11 on the full gate: verify-stress 8/8 (NIAH to 240,635 = 91%, ceiling margin 1,801 MB) + soak-continuous PASS (0 err, 0 growth, 100% retention) + bench + 8-pack. CAVEATS: streaming-toolcall+thinking-on finish=length (known family class, verify-full check 6; non-streaming unaffected); native-FP4 quality unvalidated (numbers = Ampere W4A16 bound). NATIVE FP4 (sm_90+) UNVALIDATED — there the silicon quantizes activations too (true W4A4; family is activation-quant-sensitive), so the native quality number is the arc's missing datapoint. Ships real calibrated k/v scale tensors (nvidia's export ships none) and they LOAD (in-worker verified 2026-07-11 on the 27B sibling); measured effect vs scale=1.0 on this family: none (27B A/B quality/NIAH tie). mtp.* head shipped unquantized but OFF (net-negative on this MoE at TP=2). On Ampere, pick the AutoRound tier unless you specifically want the NVFP4 artifact. No DEFAULTS row (opt-in only).",
     ),
 
+    # Qwen-AgentWorld-35B-A3B — Qwen's specialized language world model for
+    # predicting environment state after an agent action. Same Qwen3-Next MoE
+    # geometry as qwen3.6-35b-a3b, but language-only and MTP-stripped despite
+    # inherited multimodal/MTP config fields. FP8-E4M3 KV production path with
+    # four full-context serving slots; full operational + behavioral gates passed.
+    "vllm/qwen-agentworld-35b-a3b-dual-awq-int4": _entry(
+        model="qwen-agentworld-35b-a3b", weights_variant="cyankiwi-awq-int4",
+        workload="multi-stream-tenant",
+        engine="vllm-stable", drafter=None, kv_format="fp8_e4m3",
+        tp=2, max_ctx=262144, max_num_seqs=4, mem_util=0.92,
+        compose_path="models/qwen-agentworld-35b-a3b/vllm/compose/dual/cyankiwi-awq-int4/fp8.yml",
+        default_port=8080,
+        kvcalc_key="qwen-agentworld-35b-a3b:dual",
+        status="production",
+        status_note="Qwen-AgentWorld-35B-A3B language world model, cyankiwi AWQ INT4 compressed-tensors, dual TP=2 at 262K with FP8-E4M3 KV and four serving slots. PRODUCTION gate on 2x3090, stock vLLM v0.25.1: verify-full PASS; verify-stress 8/8 with exact recall through 240,634 tokens (91%); canonical decode 147.12 narrative / 147.24 code TPS, prefill 5,116 @10K / 3,788 @90K; 100-turn soak PASS with 0 errors, 0 silent outputs, 0 MiB growth, p50 147.61 TPS, and 100% retention. The 1,795,289-token KV pool projects 6.85 full-length sequences; C=4 was exercised for six rounds with four simultaneous ~261,529-token prompts: 24/24 completed, 0 errors, 0 silent outputs, 0 MiB growth, 100% retention. FP8 quick quality scored ToolCall 14/15 and InstructFollow 15/15 thinking ON; the matched BF16 baseline full 8-pack scored 125/150 ON vs 101/150 OFF. Checkpoint is language-only (--language-model-only) and has zero mtp.* tensors, so vision and speculation stay off. No DEFAULTS or recommended-model promotion.",
+    ),
+
     # Agents-A1 — InternScience's 35B agentic MoE (Qwen3-Next MoE arch, OWN model
     # per its card's base_model; NOT a qwen fine-tune slug). Official FP8-dynamic
     # compressed-tensors checkpoint; on Ampere sm_86 vLLM serves it Marlin FP8-MoE
@@ -963,6 +1014,185 @@ COMPOSE_REGISTRY = {
     # First EXTERNAL-MTP compose in the catalog: the nextn head ships as a SEPARATE
     # GGUF (mtp-Tess-*.gguf), engaged via --spec-draft-model + --spec-type draft-mtp
     # (contrast Deckard's embedded head). kv_format q4_0 (K+V). kvcalc SKIP.
+    # ── DeepSeek-V4-Flash-0731 (284B MoE) — the catalog's first CPU-OFFLOAD slugs.
+    # 137 GiB of routed experts live in HOST RAM; a few bundles are pinned back onto
+    # the GPUs (residency) and the rules are INJECTED by the launcher from detected
+    # free VRAM, never hardcoded. kvcalc SKIP (hybrid MoE + MLA — the calculator has
+    # no model for it). required_sm 8.6 so 3090/4090/5090 all qualify; the 4090/5090
+    # paths are INFERRED from the image's arch list, never booted here.
+    # No DEFAULTS row on purpose: incubating is excluded from the curated walk.
+    "llamacpp-club3090/inkling-small-dual-iq4xs-moecache": _entry(
+        model="inkling-small", weights_variant="unsloth-ud-iq4xs", workload="long-ctx-single",
+        engine="llamacpp-club3090-v1.1", drafter=None, kv_format="fp16",
+        tp=2, max_ctx=262144, max_num_seqs=1, mem_util=None,
+        compose_path="models/inkling-small/llamacpp-club3090/compose/dual/unsloth-ud-iq4xs/moecache.yml",
+        default_port=8084,
+        kvcalc_key="SKIP",
+        offload="n-cpu-moe",
+        # Load-bearing: gates the launch-compat MOE_RESERVE_MB injection.
+        moe_cache=True,
+        # Nominal == the compose header's worst case (121). There is no residency
+        # to subtract on this slug: the `-ot` is an unconditional all-experts->CPU
+        # catch-all with no OT_G* slots, so host RAM does NOT fall with card count
+        # or card size -- the expert cache is a VRAM-side COPY and the CPU master
+        # buffer stays whole. MEASURED CUDA_Host model buffer 116354.33 MiB
+        # (= 115520.00 experts + 834.33 token_embd) = 113.63 GiB, +8 overhead.
+        # The `-residency` sibling is the slug whose need falls with VRAM.
+        host_ram_gb=121,
+        required_sm=8.6,
+        status="experimental",
+        status_note="Validated 2026-08-12 on the fork branch at 262K: verify-full 9/9, soak-continuous PASS (0 MiB growth, 0/25 silent-empty), decode 32.01 narrative / 31.15 code, prefill FLAT 401.6@10K -> 385.7@90K, agentic context 31.4x -> TTFT 4.8x (sub-linear). Expert cache 76-78% hits on ~6,908 resident slots (67.5% of 10,240 routed experts) -- a HIGHER rate than DeepSeek's ~57%, because inkling's resident non-expert weights are only 5.1 GB, leaving more VRAM for the pool. iSWA (7 full-attention + 35 windowed layers) keeps KV to 7.5 GB even at 262K. ⚠️ TTFT at depth is the real cost: 225 s for an 87K prompt -- 262K is a CAPACITY number, not a serving latency. 1M does not fit: KV allocates, but the prefill compute buffer wants 9,450 MiB on device 0. ⏸️ UPSTREAM-GATED on ggml-org#25731: the `inkling` arch is not in mainline, so the published llamacpp-club3090 digest CANNOT load this model (`unknown model architecture: 'inkling'`). Runs only on a self-built fork of stack/club3090-moecachev1.1 until the PR merges and the engine is rebuilt. ⚠️ ATTRIBUTION: the expert cache is leloch's (RFC ggml-org#24528); the arch is @danielhanchen's PR, vendored — we maintain neither. ⚠️ REASONING IS ON BY DEFAULT at effort 0.9: this model reads `reasoning_effort`, NOT `enable_thinking`, and ignores the latter silently — a client sending a small max_tokens without setting effort gets an empty answer and no error. ⚠️ Sampling should be Unsloth's temp 1.0/top_p 1.0/min_p 0.0, not the canonical Qwen values, for any quality work. ⚠️ QUALITY UNTESTED -- no 8-pack. ⚠️ Decode figures are a LOWER BOUND: the expert cache was still filling after 25 soak turns (+49% session 1->5), so short runs understate steady state.",
+        category="frontier",
+    ),
+    # ── The STATIC-RESIDENCY sibling of the dual moe-cache slug (#978). Same
+    # weights, same engine, opposite memory mechanism: `-ot ...=CUDA*` rules MIGRATE
+    # expert bundles into VRAM instead of COPYING them there, so host RAM falls with
+    # card size where the cache slug's never does. Ships because a 128 GB / 2x32 GB
+    # owner cannot run the cache slug at all -- it OOM-killed during load and froze
+    # his desktop. It is a MEMORY trade, not a speed win: prefer the cache slug on
+    # any rig that can feed it.
+    "llamacpp-club3090/inkling-small-dual-iq4xs-residency": _entry(
+        model="inkling-small", weights_variant="unsloth-ud-iq4xs", workload="long-ctx-single",
+        engine="llamacpp-club3090-v1.1", drafter=None, kv_format="fp16",
+        tp=2, max_ctx=262144, max_num_seqs=1, mem_util=None,
+        compose_path="models/inkling-small/llamacpp-club3090/compose/dual/unsloth-ud-iq4xs/residency.yml",
+        default_port=8086,
+        kvcalc_key="SKIP",
+        offload="n-cpu-moe",
+        # Load-bearing: gates the launch-compat MOE_RESERVE_MB injection. The cache
+        # is still ON here, but as a REMAINDER consumer -- residency allocates first.
+        moe_cache=True,
+        # NOMINAL, not worst case: the compose header's 121 is the all-experts-on-CPU
+        # figure the gate starts from, and 99 is what it computes after subtracting
+        # the residency grant on 2x24 GB -- the smallest topology this slug supports,
+        # hence the HIGHEST realistic need. Bigger cards go lower (2x32 GB -> ~83,
+        # derived). Do NOT raise this to 121: that would hide the entire point of the
+        # slug in the catalog. Do NOT lower it to the 32 GB figure either -- nominal
+        # must not undershoot what a supported rig actually needs.
+        host_ram_gb=99,
+        required_sm=8.6,
+        status="experimental",
+        status_note="⭐ THE HOST-RAM-BOUND OPTION for Inkling: `-ot ...=CUDA*` residency rules MIGRATE expert bundles into VRAM (the moe-cache slug only COPIES them, so its 121 GB host bill is fixed no matter how much VRAM you own). Host need falls with card size: 99 GB on 2x24 GB (BOOTED on the reference rig -- CUDA_Host model buffer 116354.33 -> 93570.33 MiB, exactly the 4+4 bundles the sizer granted; verify-full not yet run), ~83 GB on 2x32 GB (DERIVED, not booted -- the reference rig has 2x24 GB permanently). ⚠️ THIS IS A MEMORY TRADE, NOT A SPEED WIN, and that is MEASURED: a same-session probe (2x24 GB, 3 warm-up + 3 measured, one 300-token prompt, canonical sampling) put this config at a FLAT 20.35 t/s against 25.25 t/s for the cache sibling, which was STILL CLIMBING on its last run (23.80 -> 25.36 -> 26.60) toward its published canonical 32.01 t/s -- so >=+24% and understated. Residency converges instantly (nothing to warm) but makes only a handful of layers local; the cache follows expert popularity across ALL 40 layers and reaches 76-78% hits at 67.5% coverage. ⚠️ That is a PROBE (N=3/arm, one prompt, one leg) -- it settles direction and a lower bound, not a benchmark row. On a rig that can feed the cache slug, use the cache slug. ⭐ The pin is TUNABLE and the sizer is a maximiser: OT_G0/OT_G1 overrides are never clobbered and the RAM gate prices your ACTUAL pin, so pin the MINIMUM that clears your host RAM and leave the rest to the cache. With both overrides set to a no-match rule this degrades to exactly the moe-cache slug. ⚠️ The residency constants are MEASURED on 2x24 GB (reserve 9758 MiB from a zero-residency cache-off boot; bundle 2848 MiB from the GGUF tensor table) -- every >24 GB projection is ARITHMETIC from those, not a boot. ⚠️ CPU-Offload-MoE-Layers is 38, not the model's 40, ON PURPOSE: blk.40/41 carry oversized mixed-precision bundles (3440/3856 MiB vs 2848) and the last card's outer-edge selection would pick exactly those two first, over-pinning it by 1600 MiB while the gate priced them at 2848. Do not 'fix' it to 40 -- see the compose header. ⏸️ UPSTREAM-GATED on ggml-org#25731 exactly like its sibling: the `inkling` arch is not in mainline, so the published llamacpp-club3090 digest CANNOT load this model. ⚠️ ATTRIBUTION: the expert cache is leloch's (RFC ggml-org#24528); the arch is @danielhanchen's PR, vendored -- we maintain neither. ⚠️ REASONING IS ON BY DEFAULT at effort 0.9: this model reads `reasoning_effort`, NOT `enable_thinking`, and ignores the latter silently. ⚠️ QUALITY UNTESTED on this placement -- the weights are identical to the moe-cache slug but no 8-pack has been run against this config, so do not quote its scores as this slug's.",
+        category="frontier",
+    ),
+    "llamacpp-club3090/inkling-small-multi4-iq4xs-moecache": _entry(
+        model="inkling-small", weights_variant="unsloth-ud-iq4xs", workload="long-ctx-single",
+        engine="llamacpp-club3090-v1.1", drafter=None, kv_format="fp16",
+        tp=4, max_ctx=262144, max_num_seqs=1, mem_util=None,
+        compose_path="models/inkling-small/llamacpp-club3090/compose/multi4/unsloth-ud-iq4xs/moecache.yml",
+        default_port=8085,
+        kvcalc_key="SKIP",
+        offload="n-cpu-moe",
+        moe_cache=True,
+        # Same 121 as the dual sibling, deliberately: the all-experts->CPU `-ot`
+        # is card-count-independent, so 4 cards do NOT lower the host need (they
+        # only buy cache pool slots, which are copies). Do not "scale" this down.
+        host_ram_gb=121,
+        required_sm=8.6,
+        status="experimental",
+        status_note="⚠️⚠️ NEVER BOOTED -- every constant is INHERITED from the validated dual slug (same precedent as the DeepSeek multi4 sibling), and RESERVE_MB/ADMIT_AFTER were derived from a measured compute-buffer swing on 2x24 GB, so they are topology-specific and probably wrong here. Re-derive before trusting any number. HYPOTHESIS worth testing: on this model hit rate tracks spatial coverage (dual = 67.5% of 10,240 routed experts at 76-78% hits), so doubling the pool budget could approach saturation -- but compute buffers and the layer split also change, and this rig has no NVLink. ⏸️ UPSTREAM-GATED on ggml-org#25731: the `inkling` arch is not in mainline, so the published llamacpp-club3090 digest CANNOT load this model (`unknown model architecture: 'inkling'`). Runs only on a self-built fork of stack/club3090-moecachev1.1 until the PR merges and the engine is rebuilt. ⚠️ ATTRIBUTION: the expert cache is leloch's (RFC ggml-org#24528); the arch is @danielhanchen's PR, vendored — we maintain neither. ⚠️ REASONING IS ON BY DEFAULT at effort 0.9: this model reads `reasoning_effort`, NOT `enable_thinking`, and ignores the latter silently — a client sending a small max_tokens without setting effort gets an empty answer and no error. ⚠️ Sampling should be Unsloth's temp 1.0/top_p 1.0/min_p 0.0, not the canonical Qwen values, for any quality work. ⚠️ QUALITY UNTESTED -- no 8-pack. ⚠️ Decode figures are a LOWER BOUND: the expert cache was still filling after 25 soak turns (+49% session 1->5), so short runs understate steady state.",
+        category="frontier",
+    ),
+    "llamacpp-club3090/deepseek-flash-multi4-q8-moecache": _entry(
+        model="deepseek-v4-flash-0731", weights_variant="unsloth-q8-kxl", workload="long-ctx-single",
+        engine="llamacpp-club3090", drafter="dspark", kv_format="fp16",
+        tp=4, max_ctx=204800, max_num_seqs=1, mem_util=None,
+        compose_path="models/deepseek-v4-flash-0731/llamacpp-club3090/compose/multi4/unsloth-q8-kxl/moecache.yml",
+        weights_companions=("dspark",),
+        default_port=8032,
+        kvcalc_key="SKIP",
+        offload="n-cpu-moe",
+        moe_cache=True,
+        # Nominal == the compose header's worst case (156), unlike the stock
+        # multi4 slug where nominal (120) is below the header (146). There is no
+        # residency to subtract here: the `-ot` is an unconditional
+        # all-experts->CPU catch-all with no OT_G* slots, so host RAM does NOT
+        # fall with card count. +10 over the stock sibling is the `-devd none`
+        # drafter (10386.28 MiB) living in host memory instead of VRAM.
+        host_ram_gb=156,
+        required_sm=8.6,
+        status="experimental",
+        status_note="4-card sibling of the dual moe-cache slug. ⚠️ NOT VALIDATED ON ANY RIG — the reference rig has 2 cards, so nothing here has been booted; it ships on the same basis as the stock multi4 slug (off-rig provenance). ⚠️⚠️ THE TUNING IS INHERITED, NOT DERIVED: RESERVE_MB=1536 and -ub 2048 were measured on 2x24 GB against a MEASURED 1,128 MiB compute-buffer swing. On 4 cards the per-card free VRAM, the swing, and the pool/compute balance all differ, and the knee is SHARP (on 2x24 GB the neighbouring reserve value was ~11% slower). Re-derive before trusting: boot with -lv 4 + GGML_CUDA_MOE_CACHE_STATS=50, read the compute-buffer swing, set RESERVE above it, then sweep on WALL-CLOCK (never on hit rate — three times on this stack a config improved every cache counter and got slower). The launch-compat layer raises MOE_RESERVE_MB on cards >24 GB via _moe_cache_env, which covers capacity but not topology. ⚠️ ATTRIBUTION: the expert cache is leloch's work (RFC ggml-org#24528), unmerged in mainline. ⚠️ QUALITY UNTESTED on any topology. Do NOT set GGML_OP_OFFLOAD_MIN_BATCH — at 2 it silently stops the cache allocating (4.2x throughput loss, measured).",
+        category="frontier",
+    ),
+    "llamacpp-club3090/deepseek-flash-dual-q8-moecache": _entry(
+        model="deepseek-v4-flash-0731", weights_variant="unsloth-q8-kxl", workload="long-ctx-single",
+        engine="llamacpp-club3090", drafter="dspark", kv_format="fp16",
+        tp=2, max_ctx=204800, max_num_seqs=1, mem_util=None,
+        compose_path="models/deepseek-v4-flash-0731/llamacpp-club3090/compose/dual/unsloth-q8-kxl/moecache.yml",
+        # Same hard requirement as the stock sibling: the compose passes -md and
+        # will not boot without the drafter, so readiness must gate on it (#912).
+        weights_companions=("dspark",),
+        default_port=8030,
+        kvcalc_key="SKIP",
+        offload="n-cpu-moe",
+        # Load-bearing: gates the launch-compat MOE_RESERVE_MB injection
+        # (_moe_cache_env). Without it a 96 GB card inherits a 24 GB reserve.
+        moe_cache=True,
+        # 156, NOT the stock sibling's 146: `-devd none` moves the 10386.28 MiB
+        # DSpark drafter off the GPU and into host memory, and this compose pins
+        # no expert bundles back (no OT_G* slots), so nominal == worst case.
+        host_ram_gb=156,
+        required_sm=8.6,
+        status="experimental",
+        status_note="The stock Q8 slug keeps a 10.4 GiB DSpark drafter on the GPU and caches nothing, idling ~9.3 GB of VRAM. This reallocates that: drafter to host (-devd none), ~5,159 experts (~47% of 11,008) resident in VRAM via leloch's expert cache. Measured 2026-08-10, same session vs the stock slug, canonical prompts at temp 0: decode 18.34 -> 23.64 narrative and 23.51 -> 27.01 code (~+29%/+15%), prefill 436 -> ~355 @10K (~-19%), cache hit rate ~56%. The published IMAGE runs ~4% under the local binary (CUDA 12.8 vs 13.2) -- image numbers are the honest ones. ⚠️ ATTRIBUTION: the expert cache is leloch's work (RFC ggml-org#24528), unmerged in mainline; this slug packages it. ⚠️ EXPERIMENTAL: QUALITY IS UNTESTED -- no 8-pack has been run, and both the cache and the CPU drafter sit on the generation path; no soak, no 3-boot. ⚠️ COLD-START TAX: the first request after boot is slow (~50-75 s for 900 tok) while the pool fills -- never benchmark request 1. ⚠️ Tuning is 2x24 GB specific (RESERVE_MB=1536 from a measured 1,128 MiB compute-buffer swing; 1024 was ~11% SLOWER despite a bigger pool and higher hit rate). Do NOT set GGML_OP_OFFLOAD_MIN_BATCH: at 2 it silently stops the cache allocating and costs 4.2x throughput.",
+        category="frontier",
+    ),
+    "llamacpp/deepseek-flash-dual-q8": _entry(
+        model="deepseek-v4-flash-0731", weights_variant="unsloth-q8-kxl", workload="long-ctx-single",
+        engine="llama-cpp-local", drafter="dspark", kv_format="fp16",
+        tp=2, max_ctx=204800, max_num_seqs=1, mem_util=None,
+        compose_path="models/deepseek-v4-flash-0731/llama-cpp/compose/dual/unsloth-q8-kxl/offload.yml",
+        # DSpark is REQUIRED, not optional -- the compose passes -md and will not
+        # boot without it, so readiness must gate on it (c3 Start would serve-fail).
+        weights_companions=("dspark",),  # DSpark draft GGUF the compose mounts
+        default_port=8030,
+        kvcalc_key="SKIP",
+        offload="n-cpu-moe",
+        host_ram_gb=146,
+        required_sm=8.6,
+        status="incubating",
+        status_note="A 284B MoE on 2x24 GB. QUALITY TIER of the two DeepSeek-Flash offload slugs. Stock upstream b10236, zero patches. Three levers compose: CPU expert offload (137 GiB of routed experts in host RAM) + partial residency (bundles pinned back onto the GPUs, sized by the launcher from DETECTED free VRAM) + the DSpark drafter. HARD GATE: ~146 GB host RAM worst case -- preflight REFUSES below it. Ships 200K, NOT 262K: at 262K with the drafter it boots READY at 97.4% VRAM, passes a trivial decode, then dies on a ~15.7K-token prefill (CUDA OOM in cuMemCreate, reproduced 2026-08-06). CANONICAL BENCH PUBLISHED 2026-08-09 (BENCHMARKS.md row 2, reference 2x3090, 3-boot medians): decode 17.1 narrative / 26.9 code at canonical sampling, prefill 369 @10K / 287 @90K, TTFT 169 ms; greedy-replay 35.2. The 8-pack is still owed -- stays incubating until quality lands.",
+        category="frontier",
+    ),
+
+    "llamacpp/deepseek-flash-dual-iq2": _entry(
+        model="deepseek-v4-flash-0731", weights_variant="unsloth-iq2-xxs", workload="long-ctx-single",
+        engine="llama-cpp-local", drafter="dspark", kv_format="fp16",
+        tp=2, max_ctx=204800, max_num_seqs=1, mem_util=None,
+        compose_path="models/deepseek-v4-flash-0731/llama-cpp/compose/dual/unsloth-iq2-xxs/offload.yml",
+        # DSpark is REQUIRED, not optional -- the compose passes -md and will not
+        # boot without it, so readiness must gate on it (c3 Start would serve-fail).
+        weights_companions=("dspark",),  # DSpark draft GGUF the compose mounts
+        default_port=8031,
+        kvcalc_key="SKIP",
+        offload="n-cpu-moe",
+        host_ram_gb=86,
+        required_sm=8.6,
+        status="incubating",
+        status_note="REACH TIER of the two DeepSeek-Flash offload slugs: ~86 GB host RAM worst case vs the Q8 tier's ~146 GB, which is what makes a 284B model fit a constrained box. Stock upstream b10236, zero patches; same three levers (offload + launcher-sized residency + DSpark). ~2.6-bit experts. Scoped to dual 24 GB by design. CANONICAL BENCH PUBLISHED 2026-08-09 (BENCHMARKS.md row 3, reference 2x3090): decode 15.4 narrative / 24.3 code at canonical sampling, prefill 436 @10K / 311 @90K -- decode ~10% SLOWER than Q8 (lower draft acceptance on 2.6-bit experts); this tier's case is the RAM gate and prefill, not decode. The 8-pack is still owed, and quality is the open question on a quant this low -- stays incubating. FIRST COMMUNITY VALIDATION: 2x5090 + 123 GB (#931) -- asymmetric 7+8 residency, prefill-90K x3 clean, NIAH ladder to 188K, soak-stable VRAM; that pair of runs is the calibration source for the additive auto-sizer.",
+        category="frontier",
+    ),
+
+    # multi4: AUTHORED HERE, VALIDATED ELSEWHERE. We have 2 cards.
+    "llamacpp/deepseek-flash-multi4-q8": _entry(
+        model="deepseek-v4-flash-0731", weights_variant="unsloth-q8-kxl", workload="long-ctx-single",
+        engine="llama-cpp-local", drafter="dspark", kv_format="fp16",
+        tp=4, max_ctx=204800, max_num_seqs=1, mem_util=None,
+        compose_path="models/deepseek-v4-flash-0731/llama-cpp/compose/multi4/unsloth-q8-kxl/offload.yml",
+        # DSpark is REQUIRED, not optional -- the compose passes -md and will not
+        # boot without it, so readiness must gate on it (c3 Start would serve-fail).
+        weights_companions=("dspark",),  # DSpark draft GGUF the compose mounts
+        default_port=8032,
+        kvcalc_key="SKIP",
+        offload="n-cpu-moe",
+        host_ram_gb=120,
+        required_sm=8.6,
+        status="incubating",
+        status_note="4-card QUALITY tier. NEVER BOOTED BY US. 2026-08-07: a 4x3090 + 128 GB owner (@milano, Discord) BOOTED it after correcting two constants this compose had COPIED from the dual file and never re-derived for four cards -- reserve 18000 (a 2-way dense split) granted 1 bundle/card where 2 fit, and the 146 GB gate then REFUSED the 128 GB box this slug exists to serve. Reserve now 14500 (additive #931 recalibration; the interim x0.55-era value was 12000); host_ram_gb=120 HERE is the nominal 4x24 figure (what the catalog displays -- @milano measured it), while the COMPOSE HEADER carries the 146 all-experts-on-CPU worst case and preflight computes the rig-specific need by subtracting detected residency (~121 at 4x24; 4x16 GB fits zero bundles and correctly gates at ~146). The mismatch is deliberate -- do not 'fix' either number to match the other. STILL UNVALIDATED BEYOND BOOT: no real prefill probe yet, and on this model boot is NOT sufficient -- the 262K config booted, passed a trivial decode, then died on the first ~15.7K prefill. Prefill probe requested. The argument is NOT throughput: every layer pinned to a GPU is a layer NOT in host RAM, so host RAM FALLS with card count -- **120 GB MEASURED** at 4x24 GB (was ~113 est.) vs ~146 at 2x24 -- first 4-card boot by @milano 2026-08-07. 128 GB is a very common host config, which the 2-card Q8 slug EXCLUDES and this one FITS, so multi4 is what puts the quality tier inside a mainstream RAM budget. Residency should also be at its best here (~23% of expert traffic on GPU vs 4.7% on two cards). No IQ2 multi slug: on four cards Q8 itself drops into a 128 GB budget, so a low-bit tier is not needed to fit.",
+        category="frontier",
+    ),
+
     "llamacpp/tess-dual-mtp": _entry(
         model="tess-4-27b", weights_variant="migtissera-q4km", workload="fast-chat",
         engine="llama-cpp-local", drafter="tess-mtp-gguf", kv_format="q4_0",
@@ -1095,7 +1325,7 @@ COMPOSE_REGISTRY = {
         compose_path="models/vibethinker-3b/vllm/compose/single/bf16/fp8.yml",
         default_port=8074,
         kvcalc_key="SKIP",
-        status="incubating",
+        status="deprecated",
         status_note="VibeThinker-3B (WeiboAI) — bf16 Qwen2 dense verifiable-reasoning model (SFT+RL fine-tune of Qwen2.5-Coder-3B) on a single 3090, vLLM v0.22.0 (vllm-stable). bf16 weights (~5.8 GB) + fp8_e5m2 KV (storage-only A/B'd 2026-06-16 — math/code answers identical to bf16 KV; halves cache, quality-neutral). full 131072 ctx, ~110 TPS. Single-concurrency sized: max_num_seqs=1 + mem_util 0.40 → ~9.8 GB total (174K-token / 1.33x KV pool, full 131K kept), freeing ~14 GB to co-reside with a 27B; ~9.8 GB is near the floor (5.8 GB bf16 weights immovable). Output quality is temp-governed not mem-governed: temp 0.6 coherent, the card's temp 1.0 is unstable on short prompts (degenerate loops) — overridable via TEMP. fp8 WEIGHTS rejected (break this quant-sensitive 3B: non-terminating empty output). Sampling per the tech report: temp 1.0 / top_p 0.95 / top_k -1. Live-validated 2026-06-16: serves clean, correct reasoning + code (verify-full output-quality + thinking-mode PASS); --reasoning-parser qwen3 splits <think> blocks correctly. ⚠️ ALWAYS-REASONING: it emits a <think> trace before every answer with NO way to disable it (system prompt / /no_think ignored; authors document no controls). Omit max_tokens (vLLM's large default → reasons briefly then answers) or set generously (8K-40K; authors use up to 40960); a small explicit max_tokens truncates mid-reason with no answer. NO tool-calling (emits bare JSON not <tool_call>; authors don't support it — intentionally unwired). Consequence: FAILS verify-full's fixed-small-budget checks (basic 30 / streaming 120 / tool 200-256 tok) → 5/9 — a harness-vs-always-reasoning mismatch, NOT a serving defect. Stays 🐣 incubating: does not pass the standard functional gate; math/code/STEM reasoning only, not general/agentic.",
     ),
     "llamacpp/vibethinker-3b-single": _entry(
@@ -1105,8 +1335,163 @@ COMPOSE_REGISTRY = {
         compose_path="models/vibethinker-3b/llama-cpp/compose/single/prithivmlmods-q8/q8kv.yml",
         default_port=8075,
         kvcalc_key="SKIP",
-        status="incubating",
+        status="deprecated",
         status_note="VibeThinker-3B (WeiboAI) — prithivMLmods Q8_0 GGUF on a single 3090, mainline llama.cpp (server-cuda). Q8 weights + q8_0/q8_0 KV, full 131072 ctx, -b 4096 -ub 2048. The PERFORMANCE-MAX VibeThinker path: live-validated 2026-06-16 ~166 TPS decode (vs ~110 vLLM bf16), prefill ~6,630 tok/s (-b 4096/-ub 2048 = +20% over 2048/512; -ub is the lever, -b 8192 adds nothing), ~6.2 GB at full 131K (3.3 GB Q8 + ~2.6 GB q8_0 KV), CV 0.1%, stable at temp 0.6 AND 1.0. KEY: llama.cpp Q8_0 is near-lossless → quality INTACT, where vLLM's fp8 weight-quant broke this quant-sensitive 3B (non-terminating empty output) — so on llama.cpp you get the quantization win with no quality cost. NO MTP head in this GGUF (plain qwen2 conversion) → no self-spec-dec (not needed at this speed). Reasoning: emits <think>...</think> but llama.cpp's deepseek parser does NOT split it (Qwen2.5 template doesn't declare reasoning) → trace stays inline in content (answer after </think> clean). ⚠️ ALWAYS-REASONING + NO tool-calling → FAILS verify-full's fixed-small-budget + tool checks (5/9, same as the vLLM sibling) — by design, not a serving defect. 🐣 incubating: math/code/STEM reasoning specialist, not general/agentic. Better-performing sibling to vllm/vibethinker-3b-single. Tool-free quality (benchlocal, temp 0.6, 2026-06-16, thinking-ON): gsm-symbolic-30 30/30 (100%), reasonmath-15 12/15 (80%); one-shot coding (sandbox executes, no tool-calls) humaneval-plus-30 29/30 (97%) + lcb-v6-30 25/30 (83%, 2 losses=token_limit on hardest); instructfollow-15 15/15 (100%), structoutput-15 12/15 (80%), dataextract-15 6/15 (40%). The packs' thinking-OFF defaults had zeroed dataextract / capped structoutput at 60% via token_limit truncation (always-reasoning vs bounded budget); --enable-thinking restores them. dataextract's residual 40% is genuine — full config sweep {temp 0/0.6/1.0 x budget 16K/32K} all land 27-40% (0.6 is the sweet spot; greedy and 1.0 both = 27%), same value-mismatch + type-coercion failures → config can NOT recover it; valid JSON, field-level extraction errors (reasoning specialist, not an extractor). Sweep also validates the compose default temp 0.6 (beats 0 and 1.0). toolcall/hermes/cli N/A (no tool-calling).",
+    ),
+
+    # ── Qwen3.8-27B — NEW MODEL, both slugs 🐣 Incubating (authored 2026-08-14).
+    # Arch: Qwen3_5ForConditionalGeneration / model_type qwen3_5 → the qwen35-dense
+    # family ("dense" = non-MoE here; the ATTENTION is hybrid). 64 layers with
+    # full_attention_interval=4 ⇒ 16 full-attention (KV-growing) + 48 linear-attention
+    # (DeltaNet-style) layers — the SAME growing-attention geometry as qwen3.6-27b and
+    # tess-4-27b (16 layers × 4 KV heads × head_dim 256), so KV math transfers but
+    # 64-layer dense math would overestimate the pool ~4×.
+    # kvcalc SKIP: llama.cpp family AND a hybrid kv-calc has no model for (mirrors
+    # tess-4-27b's kv_calc_supported:false). drafter=qwen-mtp-builtin: the nextn head is
+    # EMBEDDED in both unsloth GGUFs — verified 2026-08-14 by reading the tensor table
+    # (blk.64.nextn.*, qwen35.nextn_predict_layers=1, block_count=65 = 64 layers + nextn),
+    # and confirmed live: 'creating MTP draft context', acceptance 0.689 at n=2.
+    # ⚠️ The repo NAME is not evidence: unsloth ships a separate -MTP-GGUF for 3.6, so the
+    # absent suffix here reads as 'no head' and is WRONG. Only the tensor table decides.
+    # No weights_companions: text-only — the repo's mmproj-{BF16,F16}.gguf projectors
+    # were deliberately NOT fetched, so neither compose mounts one.
+    # kv_format q8_0 on both: stack policy is a q8_0-grade KV for serving configs.
+    # NO DEFAULTS rows and NOT in RECOMMENDED_DEFAULT_MODELS — incubating is excluded
+    # from the curated walk by design, and a `<engine>/default` row would hand users an
+    # unbooted config through the non-status-filtering direct lookup.
+    "llamacpp/qwen38-27b-single-iq4nl": _entry(
+        model="qwen3.8-27b", weights_variant="unsloth-iq4nl", workload="long-ctx-single",
+        engine="llama-cpp-local", drafter="qwen-mtp-builtin", kv_format="q8_0",
+        tp=1, max_ctx=131072, max_num_seqs=1, mem_util=None,
+        compose_path="models/qwen3.8-27b/llama-cpp/compose/single/unsloth-iq4nl/q8kv.yml",
+        default_port=8086,
+        kvcalc_key="SKIP",
+        status="incubating",
+        status_note="Qwen3.8-27B (Unsloth imatrix IQ4_NL GGUF, 16.3 GB) on a single 3090, mainline llama.cpp (llama-cpp-local pin, server-cuda-b10236). q8_0/q8_0 KV @131072, -b 4096 -ub 512, built-in MTP n=2 (--spec-type draft-mtp), text-only. ✅ FIRST BOOT 2026-08-14: launches via switch.sh --force, serves coherently, verify-full EXIT=0. ⭐ The embedded MTP head ENGAGES — 'creating MTP draft context against the target model', draft acceptance 0.68919 (51/74), mean len 2.38 at n=2 — so the b10236 pin loads this qwen35 GGUF AND drives its nextn head; engine compatibility is now OBSERVED, not inferred. ⚠️ MEASURED VRAM 20,322 / 23,850 MiB: the 32/32 layer split is NOT even — the cards sit 3.5 GB apart and card 1 is at 97% of 24,576 MiB. The even-split assumption below is therefore DISPROVEN, and the thin margin bears directly on fill depth. STILL UNVALIDATED: no bench (NO TPS number is claimed), no verify-stress / NIAH ladder, no soak, no 8-pack. The 131072 ceiling is COMPUTED, not measured: per docs/KV_MATH.md the 16 growing layers cost 16x4x256x2 = 32,768 elements/token, which at q8_0 (1.0625 B/elem) is 34,816 B/token = 4.25 GiB at 131K; against 23.40 GiB usable that leaves 15.22 (weights — the ONE measured term: 16,337,628,128 bytes landed on disk 2026-08-14) + 4.25 (KV) + ~1.60 (buffers, back-solved from the qwen3.6-27b single-card config at -ub 512, identical growing geometry) = 21.07 GiB used, ~2.33 GiB headroom. ⚠️ UNIT TRAP: the HF page's '16.3 GB' is DECIMAL — 15.22 GiB in VRAM terms; weights_variant size_gb keeps the decimal 16.3 because the setup.sh disk gate wants the larger number, while this budget uses the GiB one. Solving the same budget for ctx gives ~203,066 tokens (163840 still leaves ~1.27 GiB), and we deliberately ship the lower 131072 anyway: the buffer term is borrowed from a sibling model and this family has a documented alloc-vs-fill gap (qwen3.6-27b allocates 262144 and walls ~125K on the FA scratch), so an allocation that boots is not a fill depth. 163840+ is the obvious first step up once a NIAH ladder proves fill depth. ALSO UNPROVEN: that this GGUF loads on the b10236 pin at all — the pin predates the model, and while the qwen35 arch it should convert to is served here (Tess-4-27B, Deckard-40B), that is an inference, not an observation. q8_0 KV rather than q4_0 is deliberate (stack serving-KV floor); q4_0 would double the ctx and is available via KV_TYPE as a speed exhibit, not a default. Vision is OFF because the mmproj projectors in the same HF repo were not downloaded — enabling it needs a third pull plus a kind:mmproj weights entry and a -vision.yml sibling. Promote to 🧪 on a clean boot + verify-full; to ⚠️/✅ only after the full gate.",
+    ),
+    "llamacpp/qwen38-27b-dual-q8kxl": _entry(
+        model="qwen3.8-27b", weights_variant="unsloth-q8kxl", workload="long-ctx-single",
+        engine="llama-cpp-local", drafter="qwen-mtp-builtin", kv_format="q8_0",
+        tp=2, max_ctx=262144, max_num_seqs=1, mem_util=None,
+        compose_path="models/qwen3.8-27b/llama-cpp/compose/dual/unsloth-q8kxl/q8kv.yml",
+        default_port=8087,
+        kvcalc_key="SKIP",
+        status="incubating",
+        status_note="Qwen3.8-27B (Unsloth Dynamic UD-Q8_K_XL GGUF, 31.5 GB) on dual 3090 layer-split (-sm layer -ts 1,1 — PCIe-only, no NVLink, no cross-GPU all-reduce), mainline llama.cpp (llama-cpp-local pin, server-cuda-b10236). q8_0/q8_0 KV @262144 (the model's architectural max_position_embeddings, i.e. genuinely max context), -b 4096 -ub 512, built-in MTP n=2 (--spec-type draft-mtp), text-only. Dual is mandatory, not a preference: 31.5 GB of weights does not fit a 24 GB card. ⚠️ NOTHING HAS BOOTED — authored 2026-08-14 before the weights landed; the weights are now down and sha256-verified, but this slug has still never been launched. Unvalidated: never launched, verify-full 0/8 (not run), no verify-stress / NIAH / soak / bench / 8-pack, and NO TPS number is claimed. The 262144 ceiling is COMPUTED, not measured: 16 growing layers x 4 KV heads x 256 head_dim x 2 tensors = 32,768 elements/token, at q8_0 = 34,816 B/token = 8.50 GiB at 262K; against 47.40 GiB usable across both cards that is 31.50 (weights — the HF page figure, taken while the file was STILL DOWNLOADING and unconfirmed on this rig; almost certainly decimal GB, so the real GiB footprint is likely ~29.3 and the true headroom LARGER, since the IQ4_NL sibling's page '16.3 GB' landed as 15.22 GiB) + 8.50 (KV) + ~2.50 (buffers) = 42.50 GiB, ~4.90 GiB headroom (~21.25 of ~23.40 GiB per card under an even 32/32 layer split, which puts 8 of the 16 full-attention layers on each — evenness ASSUMED, not read off a boot). Allocating 262144 is NOT filling it: the Tess-4-27B dual, which has identical growing-attention geometry, allocates 262144 and NIAH-fills to ~240K (~91%) — expect a comparable or worse gap here until a ladder proves otherwise. ALSO UNPROVEN: that this GGUF loads on the b10236 pin at all — the pin predates the model. q8_0 KV is free here (q4_0 would save 4.25 GiB but buys no context, since 262144 is already the architectural ceiling) and pairing near-lossless UD-Q8_K_XL weights with a lossy KV would be an odd trade. Vision is OFF because the mmproj projectors in the same HF repo were not downloaded. Promote to 🧪 on a clean boot + verify-full; to ⚠️/✅ only after the full gate.",
+    ),
+
+    # ── Qwen3.8-27B official FP8 — the vLLM "max" tier (authored 2026-08-14).
+    # Modelled directly on the qwen3.6-27b fp8 pair (vllm/qwen-27b-{dual,multi}-max):
+    # same engine, same TP shapes, same fp8/e4m3 KV, same built-in MTP n=3, same
+    # 262144 ceiling. That analogy is licensed by fact, not by resemblance — every
+    # architecture field matches qwen3.6-27b-FP8 on-disk (64 layers, 16 full-attn /
+    # 48 linear, 4 KV heads, head_dim 256, vocab 248320, max_position 262144,
+    # mtp_num_hidden_layers 1), the quantization_config shape matches (fp8 / e4m3 /
+    # dynamic / weight_block_size [128,128]), and the checkpoints are the same size
+    # to within 0.1% (30.87 GB vs 30.9 GB decimal). What does NOT carry over is every
+    # MEASUREMENT: no TPS, no accept-length, no 8-pack, no NIAH fill depth is claimed
+    # here, and neither compose ships a `Quality:` field.
+    # chat_template="native" — the ONE deliberate break from the 3.6 templates. The
+    # qwen3.6/Tess composes pin the vendored froggeric template; Qwen3.8 ships its own
+    # and it is a materially different program (adds a reasoning_effort xhigh/medium/low
+    # knob that injects a system preamble, flips the preserve_thinking default, drops
+    # the <think>-split fallback). Mounting froggeric here would silently delete all of
+    # that. The tool-call XML and <think> markers ARE unchanged, so qwen3_coder +
+    # qwen3 parsers still apply.
+    # drafter="qwen-mtp-builtin": the FP8 checkpoint ships mtp.safetensors and declares
+    # text_config.mtp_num_hidden_layers=1 — read from the repo manifest and config, not
+    # inferred from the repo name. No weights_companions: the head is INSIDE the main
+    # checkpoint, so there is no second artifact to fetch or mount.
+    # kvcalc_key="SKIP": hybrid attention, kv_calc_supported:false — same as the
+    # qwen3.6-27b fp8 tier and tess-4-27b. A prediction row here would be fiction.
+    # act_format left at the "16bit" default: Ampere sm_86 has NO native FP8 compute,
+    # so these weights serve weight-only through Marlin FP8 (W8A16) — a memory and
+    # fidelity win, NOT a decode win. Do not read "FP8" as "faster" on this rig.
+    # NO DEFAULTS rows and NOT added to RECOMMENDED_DEFAULT_MODELS — incubating is
+    # excluded from the curated walk by design, and an `<engine>/default` row would
+    # hand users a never-booted config through the non-status-filtering direct lookup.
+    "vllm/qwen38-27b-dual-max": _entry(
+        model="qwen3.8-27b", weights_variant="fp8", workload="long-ctx-single", chat_template="native",
+        engine="vllm-stable", drafter="qwen-mtp-builtin", kv_format="fp8_e4m3",
+        tp=2, max_ctx=262144, max_num_seqs=2, mem_util=0.92,
+        compose_path="models/qwen3.8-27b/vllm/compose/dual/fp8/mtp.yml",
+        default_port=8091,
+        kvcalc_key="SKIP",
+        status="incubating",
+        status_note="Qwen3.8-27B 'max accuracy' tier, 2-card: official Qwen/Qwen3.8-27B-FP8 weights (e4m3, dynamic act scale, weight_block_size [128,128], embedded mtp.safetensors head) + fp8/e4m3 KV + MTP n=3, TP=2 @262144, vLLM stable pin. ⚠️ NOTHING HAS BOOTED — authored 2026-08-14. The weights have since landed and been measured (66 safetensors = 30,866,866,928 bytes = 30.87 GB decimal / 28.75 GiB, repo revision 017b9c7a == current HEAD, all 66 CRC32-clean against the repo's crc32.txt; three non-weight files — chat_template.jinja, generation_config.json, tokenizer_config.json — do NOT match that manifest but parse fine, almost certainly a stale publisher manifest given its sibling safetensors-md5sum.txt shipped empty). No engine has ever loaded them. Unvalidated: never launched, verify-full 0/8 (not run), no verify-stress / NIAH / soak / bench / 8-pack. NO TPS, TTFT, accept-length or quality number is claimed anywhere, and the compose deliberately carries no `Quality:` field — the qwen3.6-27b tier's 109/150 is ITS number. What IS verified, from the checkpoint on disk: the architecture matches qwen3.6-27b-FP8 field for field (64 layers, layer_types = 16 full_attention + 48 linear_attention, 4 KV heads, head_dim 256, vocab 248320, max_position 262144, mtp_num_hidden_layers 1, linear k/v head_dim 128, conv_kernel 4), the FFN is DENSE (layer-0 tensor table shows mlp.gate_proj/up_proj/down_proj at 17408, no experts — the mlp.gate / shared_expert_gate names in modules_to_not_convert are export-template artifacts), the vision tower is present and explicitly EXCLUDED from the FP8 quant (preprocessor_config.json + video_preprocessor_config.json ship in-repo, so vision needs no separate projector — but no image request has ever been served), and quantization_config is the same shape as the 3.6 FP8 checkpoint that already loads on this exact pin. The 262144 ceiling is COMPUTED plus a sibling analogy, never filled: KV over the 16 GROWING layers only = 16 x 4 x 256 x 2 = 32,768 elem/token, at fp8 = 32,768 B/token = 8.00 GiB @262K (4.00 GiB/card at TP=2); weights measured at 30.87 GB decimal = 28.75 GiB (~14.4 GiB/card) — and qwen3.6-27b-FP8 measures 30,866,866,928 bytes, the SAME total to the byte (66 files, distinct md5s, so identical arch + quant layout rather than a duplicate dir), with identical KV geometry, and boots 262144 at TP=2 / util 0.92 / 2 seqs on this rig, reporting ~21.4 GB/card and a KV pool only ~1.13x the addressable context, i.e. TIGHT. Allocating is not filling: that 3.6 tier NIAH-fills to ~240K of its 262K; expect the same or worse here. If the first boot OOMs at KV init the levers in order are MAX_MODEL_LEN=196608, then GPU_MEMORY_UTILIZATION, then MAX_NUM_BATCHED_TOKENS=4096. ALSO UNPROVEN: that this checkpoint loads on the v0.25.1 pin at all — the pin predates the model, though it serves the same Qwen3_5ForConditionalGeneration arch (qwen3.6-27b FP8, Tess-4-27B). And a present MTP head is not a working one: accept rate is unmeasured, and on the 35B-A3B MoE sibling the BUILT-IN head is net-negative (-51%) where an external drafter is +49%. KV is fp8 (= e4m3) at scale=1.0 — the checkpoint is weight-only and vLLM disables calculate_kv_scales on Qwen3-Next hybrids; ⚠️ fp8_e5m2 is HARD-REJECTED against an fp8 checkpoint, do not 'simplify' to it. int8-PTH deliberately not offered (TRITON_ATTN-only; decode craters with depth on this family). Chat template is NATIVE, not froggeric — see the block comment above. SAMPLER follows the MODEL CARD, not the stack's Qwen3.6 defaults: the card publishes one row per reasoning mode, and since this compose ships thinking OFF it ships the Instruct row (temp 0.7 / top_p 0.80 / top_k 20 / min_p 0.0 / presence_penalty 1.5 / repetition_penalty 1.0) rather than the usual 0.6/0.95. ⚠️ The sampler does NOT follow the reasoning flag — enabling thinking without also setting TEMP=1.0 TOP_P=0.95 PRESENCE_PENALTY=0.0 is a silent mismatch. Serving defaults only; bench.sh sends its own canonical sampler, so BENCHMARKS rows stay comparable. ⚠️ MTP drafter exposed to OPEN vllm#50021 (GDN spec-decode wild write, quant/topology/depth-independent, live in this pin; v0.26.0 predates the fix). This model has never run so it has never been observed to crash — absence of evidence, not evidence of absence; the exposure is structural. Mitigate with SPEC=off (the compose reads it). Detail + re-test trigger: docs/UPSTREAM.md. Launch requires --force (incubating); hidden from switch.sh --list (reveal with --list --all). Promote to 🧪 on a clean boot + verify-full; to ⚠️/✅ only after the full gate. Also the on-rig proxy for vllm/qwen38-27b-multi4-max (@ TP=4) — ⚠️ but no longer a clean one: since 2026-08-15 both multi slugs run bf16 KV while this stays fp8 e4m3, so KV-sensitive results (pool size, concurrency) do not transfer in either direction.",
+    ),
+    "vllm/qwen38-27b-multi4-max": _entry(
+        model="qwen3.8-27b", weights_variant="fp8", workload="long-ctx-single", chat_template="native",
+        engine="vllm-stable", drafter="qwen-mtp-builtin", kv_format="bf16",
+        tp=4, max_ctx=262144, max_num_seqs=2, mem_util=0.92,
+        compose_path="models/qwen3.8-27b/vllm/compose/multi4/fp8/mtp.yml",
+        default_port=8092,
+        kvcalc_key="SKIP",
+        status="incubating",
+        status_note="Qwen3.8-27B 'max accuracy' tier, 4-card (TP=4): official Qwen/Qwen3.8-27B-FP8 weights + bf16 KV + MTP n=3 @262144. Identical to vllm/qwen38-27b-dual-max apart from --tensor-parallel-size, the required gpu-count, and --kv-cache-dtype; keep the first two in lockstep. ⚠️ KV DELIBERATELY DIVERGES from the dual (2026-08-15): this runs bf16 (--kv-cache-dtype auto over the pinned --dtype bfloat16) where the dual runs fp8 e4m3, because only TP>=4 has the per-card headroom — weights fall to ~7.2 GiB/card here vs ~14.4 on the dual, so a 16.00 GiB bf16 pool fits (~4.00 GiB/card) where it would not on 2 cards. Do not 'restore lockstep' by reverting it, and do not propagate it to the dual. TWO independent reasons this is incubating, and only the first is closable. (1) NOTHING HAS BOOTED on any card count — authored 2026-08-14; the weights have since landed and verified (30.87 GB / 28.75 GiB, all 66 safetensors CRC32-clean) but no engine has ever loaded them; no verify-full (0/8), no verify-stress / NIAH / soak / bench / 8-pack, NO TPS number claimed, no `Quality:` field, and the 262144 ceiling is arithmetic plus a qwen3.6-27b analogy rather than a measured fill depth. Engine compatibility is likewise inferred: the v0.25.1 pin predates this model. (2) ⛔ 4-CARD IS COMMUNITY-VALIDATED BY DESIGN and that is PERMANENT, not a TODO: the maintainer rig has exactly two 3090s, so TP=4 can never boot here and should never be filed as pending work. The on-rig proxy is vllm/qwen38-27b-dual-max, which is the same serving config at TP=2 EXCEPT for KV (it runs fp8 e4m3, this runs bf16) — so its numbers transfer on topology but NOT on pool size, concurrency, or any KV-sensitive quality result — and everything TP=4-specific (NCCL across 4 PCIe cards, the 4-way shard, the larger KV pool) is validated by whoever first runs it on 4 cards; that first community boot IS the validation. num_kv_heads=4 divides evenly by 4, so the shard is valid on paper. What TP=4 buys is headroom, not context: 262144 is already the architectural ceiling and the dual is projected to reach it, so the 4 cards convert ~14.4 GiB/card of weights into ~7.2, leaving far more room for KV pool and concurrency — on the qwen3.6-27b equivalent, single-stream decode was ~flat from 2 to 4 cards and the pool is what grew. Expect that shape, expect nothing quantitative. PCIe-only with no NVLink means more ranks = more all-reduce on a slow bus; custom all-reduce stays disabled in the entrypoint. Everything else (dense-not-MoE confirmation, the 16-growing-layer KV math — but DOUBLED for bf16: 65,536 B/token = 16.00 GiB @262K, ~4.00 GiB/card at TP=4, where the dual's note states the fp8 figure of 32,768 B/token, the 30.9 GB decimal / 28.8 GiB unit trap, why fp8_e5m2 is rejected, why the chat template is NATIVE and not froggeric, the MODEL-CARD sampler — Instruct row, temp 0.7 / top_p 0.80 / presence_penalty 1.5, because thinking ships off — and the built-in-MTP caveat) matches the dual sibling's note verbatim. ⚠️ MTP drafter exposed to OPEN vllm#50021 (GDN spec-decode wild write, live in this pin; v0.26.0 predates the fix) — structural exposure inherited from the hybrid-GDN family, never observed here because nothing has run. Mitigate with SPEC=off. Detail + re-test trigger: docs/UPSTREAM.md. Launch requires --force (incubating); hidden from switch.sh --list. Promote to 🧪 only after a clean boot + verify-full on a real 4-card host.",
+    ),
+    "vllm/qwen38-27b-multi8-max": _entry(
+        model="qwen3.8-27b", weights_variant="fp8", workload="long-ctx-single", chat_template="native",
+        engine="vllm-stable", drafter="qwen-mtp-builtin", kv_format="bf16",
+        tp=8, max_ctx=262144, max_num_seqs=2, mem_util=0.92,
+        compose_path="models/qwen3.8-27b/vllm/compose/multi8/fp8/mtp.yml",
+        default_port=8093,
+        kvcalc_key="SKIP",
+        status="incubating",
+        status_note="Qwen3.8-27B 'max accuracy' tier, 8-card (TP=8): same serving config as vllm/qwen38-27b-multi4-max with three lines changed — --tensor-parallel-size, the Requires-min-gpu-count header, and the port. ⚠️⚠️ TP=8 IS NOT THE SAME SHARD SHAPE AS TP=2/TP=4 AND DOES NOT SCALE THE SAME WAY: this model has num_kv_heads=4, which divides cleanly by 2 and by 4 but NOT by 8. At TP=8 vLLM REPLICATES KV heads across rank pairs rather than splitting them, so per-card KV stays at roughly the TP=4 figure (~4.00 GiB @262K at this compose's bf16 KV), NOT half of it. Only the WEIGHTS take the full 8-way split (~3.6 GiB/card vs ~7.2 at TP=4). So the 8-card gain over 4 is weight headroom only, bought with more all-reduce traffic on a PCIe bus with no NVLink — and on the qwen3.6-27b equivalent single-stream decode was ALREADY ~flat from 2 cards to 4. Expect flat-or-worse decode; expect nothing quantitative until measured. (1) NOTHING HAS BOOTED on any card count — the weights are on disk and CRC32-verified (66 safetensors, 30.87 GB decimal / 28.75 GiB, revision 017b9c7a) but no engine has loaded them; no verify-full, no bench, no 8-pack, no Quality: field, and 262144 is arithmetic plus a sibling analogy rather than a measured fill. (2) ⛔ 8-CARD IS COMMUNITY-VALIDATED BY DESIGN and that is PERMANENT, not a TODO: the maintainer rig has exactly two 3090s, so TP=8 can never boot here and must never be filed as pending work. The on-rig proxy is vllm/qwen38-27b-dual-max (TP=2, which HAS booted and passed verify-full 2026-08-15) — but it runs fp8 e4m3 KV where this runs bf16 (--kv-cache-dtype auto), a deliberate 2026-08-15 divergence on headroom grounds, so its pool/concurrency numbers do NOT transfer. Everything TP=8-specific — NCCL across 8 PCIe cards, the 8-way weight shard, KV-head replication — is validated by whoever first runs it on 8 cards; that first community boot IS the validation. Report via numbers-from-your-rig. P2P is NOT hardcoded: scripts/detect_nvlink.sh (NVLINK_MODE=auto) probes the interconnect and, when it finds a fast one, exports NCCL_P2P_LEVEL and UNSETS the compose's NCCL_P2P_DISABLE default — so an 8-card host with working P2P picks it up automatically. ⚠️ A 'topo -p2p OK' line reports a grant, not a working transfer; prove it with a real transfer check. ⚠️ MTP drafter exposed to OPEN vllm#50021 (GDN spec-decode wild write, live in this pin); mitigate with SPEC=off. Detail: docs/UPSTREAM.md. Launch requires --force (incubating); hidden from switch.sh --list. Promote to 🧪 only after a clean boot + verify-full on a real 8-card host. Everything else (dense-not-MoE, the 16-growing-layer KV math, the decimal/GiB unit trap, why fp8_e5m2 is rejected, the NATIVE chat template, the MODEL-CARD sampler) matches the multi4 sibling verbatim.",
+    ),
+    "vllm/qwen38-27b-dual-fast": _entry(
+        model="qwen3.8-27b", weights_variant="autoround-int4", workload="long-ctx-single", chat_template="native",
+        engine="vllm-stable", drafter="qwen-mtp-builtin", kv_format="fp8_e4m3",
+        tp=2, max_ctx=262144, max_num_seqs=1, mem_util=0.90,
+        compose_path="models/qwen3.8-27b/vllm/compose/dual/autoround-int4/mtp.yml",
+        default_port=8095,
+        kvcalc_key="SKIP",
+        act_format="int8", act8_capable=True,
+        status="experimental",
+        status_note="Qwen3.8-27B FAST tier, 2-card (TP=2), MTP n=4, fp8 KV @262144. MEASURED on this checkpoint at TP=2 (2026-08-15/16, vLLM v0.25.1, 3 warm + 5 measured, one boot per arm): W4A16 no-MTP 65.87 narrative / 61.05 code / 1219.51 prefill@10K; W4A8 no-MTP 60.54 / 56.29 / 1728.92 (+41.8% prefill, -28.6% TTFT@10K, but -8% decode BOTH shapes); verify-full 9/9 on both arms; KV pool 652,346 tok @262K (2.49x). MTP depth swept under W4A8 -> knee at n=4: narrative 62.59(n=0)->76.40(n=4) +22.1%, code 57.45->105.60 +83.8%, accept length 1.94->3.90. n=1 is WORSE than no drafter (-15.9% narrative). Acceptance length rises monotonically to 4.70 at n=6 while throughput flattens, so it CANNOT be used to pick depth. No instability at n=4/5/6 (restarts=0) -- the 3.6 family's n>=4 warning did NOT reproduce. ⭐ THE SHIPPED DEFAULT IS NOW THE MEASURED PATH: int8 activations became the default 2026-08-16, and since the depth sweep ran under W4A8, W4A8 + n=4 is the combination that was actually benched (76.40 narrative / 105.60 code). ⚠️ The int8-vs-16bit delta UNDER MTP is still unmeasured -- the -8% decode figure is MTP-off and must not be quoted for this config. ⚠️⚠️ MTP n=4 IS SINGLE-STREAM ON 24 GB CARDS: at MAX_NUM_SEQS=2 with 16K prompts the drafter pushed peak VRAM to 23,872 MiB/card -- 1.75 GB OVER the 0.90 budget -- and requests failed while ~535K KV tokens sat free; SPEC_N=0 at the same concurrency runs clean. The drafter also costs ~13% of the KV pool (652,346 -> 567,737). max_num_seqs therefore ships at 1, and since W4A8 is now the DEFAULT rather than an opt-in, that cap is mandatory rather than advisory. For concurrent serving set SPEC_N=0 and raise it: measured ceiling ~49 tok/s aggregate at 10K ctx, usable to N=8 by a 10 tok/s per-stream floor or N=4 end-to-end; beyond that the engine queues rather than serves (logged Running:9 / Waiting:55 at a rung launched with max_num_seqs=64). Community AutoRound INT4 (auto-round, 4-bit, g128, sym, 18.23 GiB) -- the FAST tier opposite the official-FP8 MAX tier; ~9.1 GiB/card at TP=2 vs FP8's ~14.4, which is where the larger KV pool comes from. W4A8 (int8 activations) IS THE SHIPPED DEFAULT since 2026-08-16 (W4A8=0 restores W4A16); the vendored patches are wired at boot -- it works only because the checkpoint is auto-round-packed [k/8,n], which is what the vendored negscale fold assumes; a compressed-tensors sibling hard-fails it. VISION untested (tower present, unquantized). MTP head ships UNQUANTIZED at bf16. ⚠️ MTP exposed to OPEN vllm#50021 -- mitigate with SPEC_N=0. Launch requires --force (experimental). Detail: learnings/qwen3.8-27b.md + BENCHMARKS.md.",
+    ),
+    "vllm/qwen38-27b-multi4-fast": _entry(
+        model="qwen3.8-27b", weights_variant="autoround-int4", workload="long-ctx-single", chat_template="native",
+        engine="vllm-stable", drafter="qwen-mtp-builtin", kv_format="fp8_e4m3",
+        tp=4, max_ctx=262144, max_num_seqs=2, mem_util=0.95,
+        compose_path="models/qwen3.8-27b/vllm/compose/multi4/autoround-int4/mtp.yml",
+        default_port=8096,
+        kvcalc_key="SKIP",
+        act_format="int8", act8_capable=True,
+        status="experimental",
+        status_note="Qwen3.8-27B FAST tier, 4-card (TP=4), MTP n=4, fp8 KV @262144. ⛔ 4-CARD IS COMMUNITY-VALIDATED BY DESIGN and that is PERMANENT: the maintainer rig has exactly two 3090s, so TP=4 can never boot here and must never be filed as pending work. NOTHING on this slug has booted. The on-rig proxy is vllm/qwen38-27b-dual-fast (same config at TP=2), whose numbers are in its status_note -- but they transfer on topology only. num_kv_heads=4 divides evenly by 4; ⚠️ at TP=8 it does NOT divide, so KV heads REPLICATE and per-card KV stays at roughly the TP=4 figure while only the weights take the full split (~4.6 GiB/card). ⚠️ max_num_seqs ships at 2 here rather than the dual's 1: the dual is capped because MTP n=4 OOM'd at N=2 on 24 GB UNDER W4A8, which is now the default, and at TP=4 weights fall far enough that the headroom should be ample -- but THAT IS UNTESTED. If you hit the same OOM, lower max_num_seqs or set SPEC_N=0 and report it. Community AutoRound INT4 (auto-round, 4-bit, g128, sym, 18.23 GiB) -- the FAST tier opposite the official-FP8 MAX tier; ~9.1 GiB/card at TP=2 vs FP8's ~14.4, which is where the larger KV pool comes from. W4A8 (int8 activations) IS THE SHIPPED DEFAULT since 2026-08-16 (W4A8=0 restores W4A16); the vendored patches are wired at boot -- it works only because the checkpoint is auto-round-packed [k/8,n], which is what the vendored negscale fold assumes; a compressed-tensors sibling hard-fails it. VISION untested (tower present, unquantized). MTP head ships UNQUANTIZED at bf16. ⚠️ MTP exposed to OPEN vllm#50021 -- mitigate with SPEC_N=0. Launch requires --force (experimental). Detail: learnings/qwen3.8-27b.md + BENCHMARKS.md.",
+    ),
+    "vllm/qwen38-27b-multi8-fast": _entry(
+        model="qwen3.8-27b", weights_variant="autoround-int4", workload="long-ctx-single", chat_template="native",
+        engine="vllm-stable", drafter="qwen-mtp-builtin", kv_format="fp8_e4m3",
+        tp=8, max_ctx=262144, max_num_seqs=2, mem_util=0.95,
+        compose_path="models/qwen3.8-27b/vllm/compose/multi8/autoround-int4/mtp.yml",
+        default_port=8097,
+        kvcalc_key="SKIP",
+        act_format="int8", act8_capable=True,
+        status="experimental",
+        status_note="Qwen3.8-27B FAST tier, 8-card (TP=8), MTP n=4, fp8 KV @262144. ⛔ 8-CARD IS COMMUNITY-VALIDATED BY DESIGN and that is PERMANENT: the maintainer rig has exactly two 3090s, so TP=8 can never boot here and must never be filed as pending work. NOTHING on this slug has booted. The on-rig proxy is vllm/qwen38-27b-dual-fast (same config at TP=2), whose numbers are in its status_note -- but they transfer on topology only. num_kv_heads=4 divides evenly by 4; ⚠️ at TP=8 it does NOT divide, so KV heads REPLICATE and per-card KV stays at roughly the TP=4 figure while only the weights take the full split (~2.3 GiB/card). ⚠️ max_num_seqs ships at 2 here rather than the dual's 1: the dual is capped because MTP n=4 OOM'd at N=2 on 24 GB UNDER W4A8, which is now the default, and at TP=8 weights fall far enough that the headroom should be ample -- but THAT IS UNTESTED. If you hit the same OOM, lower max_num_seqs or set SPEC_N=0 and report it. Community AutoRound INT4 (auto-round, 4-bit, g128, sym, 18.23 GiB) -- the FAST tier opposite the official-FP8 MAX tier; ~9.1 GiB/card at TP=2 vs FP8's ~14.4, which is where the larger KV pool comes from. W4A8 (int8 activations) IS THE SHIPPED DEFAULT since 2026-08-16 (W4A8=0 restores W4A16); the vendored patches are wired at boot -- it works only because the checkpoint is auto-round-packed [k/8,n], which is what the vendored negscale fold assumes; a compressed-tensors sibling hard-fails it. VISION untested (tower present, unquantized). MTP head ships UNQUANTIZED at bf16. ⚠️ MTP exposed to OPEN vllm#50021 -- mitigate with SPEC_N=0. Launch requires --force (experimental). Detail: learnings/qwen3.8-27b.md + BENCHMARKS.md.",
+    ),
+    "vllm/qwen38-27b-single-nvfp4": _entry(
+        model="qwen3.8-27b", weights_variant="nvfp4", workload="long-ctx-single", chat_template="native",
+        engine="vllm-stable", drafter="qwen-mtp-builtin", kv_format="fp8_e4m3",
+        tp=1, max_ctx=65536, max_num_seqs=1, mem_util=0.85,
+        compose_path="models/qwen3.8-27b/vllm/compose/single/nvfp4/mtp.yml",
+        default_port=8098,
+        kvcalc_key="SKIP",
+        status="experimental",
+        status_note="Qwen3.8-27B NVFP4, SINGLE card. ⚠️⚠️ DOES NOT FIT 24 GB: 20.44 GiB of weights leaves ~3 GB for KV pool + cudagraphs + GDN prefill scratch, and the 3.6 sibling records the same shape needing >24 GB REGARDLESS. Defaults mirror that resolution -- MAX_MODEL_LEN 65536 and mem_util 0.85, NOT the dual's 262144/0.90. Target class is a 32 GB+ card (5090 / RTX 6000 Pro / H100); on a 3090 expect an OOM at KV init, which is the config being honest rather than broken. RadixArk NVFP4 (modelopt MIXED: 193 module groups at W4-float/A4-float + 208 at W8-float/A8-float, ignore=2; 20.44 GiB, 22 files). ⚠️⚠️ THE 4-BIT ACTIVATIONS CANNOT EXECUTE ON AMPERE -- sm_86 has no FP4 tensor cores, so vLLM serves this weight-only via the Marlin W4A16 fallback and upcasts activations to 16-bit whatever the checkpoint declares. The 3.6 NVFP4 sibling records 'no speed edge vs AutoRound' and 'on Ampere the AutoRound tier serves this model faster', so on 2x 3090 this is a COMPATIBILITY path; for throughput on Ampere use vllm/qwen38-27b-dual-fast (AutoRound INT4, verify-full 9/9, MTP accept 3.12). Its real case is Blackwell (sm_120+) where the A4 groups execute. ⭐ Kernel selection is AUTOMATIC per card -- one compose gives FP4 compute on Blackwell and Marlin W4A16 on Ampere; nothing selects or overrides it. ⚠️ NVFP4 *KV* is NOT available and has NO fallback: it routes to a trtllm-gen FP4 FMHA kernel built only for datacenter Blackwell (sm_100/103) and crashes on consumer sm_120 (vLLM #43562 / TRT-LLM #10241); no hardware class lists nvfp4 KV and launch_compat C5 REFUSES rather than downgrading -- fp8_e4m3 is the FP4-era KV here, as on all six 3.6/Tess nvfp4 slugs. ⚠️ MTP exposed to OPEN vllm#50021; mitigate with SPEC_N=0. On the 3.6 sibling the original OOM root-caused to MTP (draft head + cudagraphs + GDN prefill scratch), NOT context. ⚠️ NOTHING HAS BOOTED: authored on a 2x sm_86 rig where even a green boot would exercise only the fallback, not the FP4 path this quant exists for. First Blackwell boot IS the validation. Launch requires --force (experimental). Detail: learnings/qwen3.8-27b.md.",
+    ),
+    "vllm/qwen38-27b-dual-nvfp4": _entry(
+        model="qwen3.8-27b", weights_variant="nvfp4", workload="long-ctx-single", chat_template="native",
+        engine="vllm-stable", drafter="qwen-mtp-builtin", kv_format="fp8_e4m3",
+        tp=2, max_ctx=262144, max_num_seqs=2, mem_util=0.90,
+        compose_path="models/qwen3.8-27b/vllm/compose/dual/nvfp4/mtp.yml",
+        default_port=8100,
+        kvcalc_key="SKIP",
+        status="experimental",
+        status_note="Qwen3.8-27B NVFP4, dual card (TP=2) @262144. Weights halve to ~10.2 GiB/card, which is what makes the full context reachable where the single-card config caps at 65536. RadixArk NVFP4 (modelopt MIXED: 193 module groups at W4-float/A4-float + 208 at W8-float/A8-float, ignore=2; 20.44 GiB, 22 files). ⚠️⚠️ THE 4-BIT ACTIVATIONS CANNOT EXECUTE ON AMPERE -- sm_86 has no FP4 tensor cores, so vLLM serves this weight-only via the Marlin W4A16 fallback and upcasts activations to 16-bit whatever the checkpoint declares. The 3.6 NVFP4 sibling records 'no speed edge vs AutoRound' and 'on Ampere the AutoRound tier serves this model faster', so on 2x 3090 this is a COMPATIBILITY path; for throughput on Ampere use vllm/qwen38-27b-dual-fast (AutoRound INT4, verify-full 9/9, MTP accept 3.12). Its real case is Blackwell (sm_120+) where the A4 groups execute. ⭐ Kernel selection is AUTOMATIC per card -- one compose gives FP4 compute on Blackwell and Marlin W4A16 on Ampere; nothing selects or overrides it. ⚠️ NVFP4 *KV* is NOT available and has NO fallback: it routes to a trtllm-gen FP4 FMHA kernel built only for datacenter Blackwell (sm_100/103) and crashes on consumer sm_120 (vLLM #43562 / TRT-LLM #10241); no hardware class lists nvfp4 KV and launch_compat C5 REFUSES rather than downgrading -- fp8_e4m3 is the FP4-era KV here, as on all six 3.6/Tess nvfp4 slugs. ⚠️ MTP exposed to OPEN vllm#50021; mitigate with SPEC_N=0. On the 3.6 sibling the original OOM root-caused to MTP (draft head + cudagraphs + GDN prefill scratch), NOT context. ⚠️ NOTHING HAS BOOTED: authored on a 2x sm_86 rig where even a green boot would exercise only the fallback, not the FP4 path this quant exists for. First Blackwell boot IS the validation. Launch requires --force (experimental). Detail: learnings/qwen3.8-27b.md.",
     ),
 }
 
@@ -1115,8 +1500,21 @@ COMPOSE_REGISTRY = {
 DEFAULTS = {
     ("qwen3.6-27b", "vllm", "single"): "vllm/minimal",
     ("qwen3.6-27b", "vllm", "dual"): "vllm/dual",
-    ("qwen3.6-27b", "llamacpp", "single"): "llamacpp/default",
-    ("qwen3.6-27b", "ik-llama", "single"): "ik-llama/iq4ks-mtp",
+    # ("qwen3.6-27b", "llamacpp", "single") and ("qwen3.6-27b", "ik-llama", "single")
+    # REMOVED 2026-08-12 — every llama.cpp and ik-llama single-card qwen slug was
+    # deprecated (maintainer decision: consolidate single-card qwen onto vLLM), so
+    # NEITHER engine has a functional target left. Per the deprecation checklist the
+    # rows are REMOVED rather than repointed: the direct `<engine>/default` lookup
+    # does NOT status-filter, so leaving them would hand users a deprecated slug.
+    # Both now error loudly ("no default for model=qwen3.6-27b engine=…"), which is
+    # the intended degradation. The curated `<model>/default` walk DOES filter, so
+    # ENGINE_PREFERENCE[single] = [ik-llama, llamacpp, vllm] falls through to
+    # vllm/minimal.
+    # ⚠️ That is a real capability drop, not a like-for-like move: 200K → 32K ctx,
+    # single-card vision (llamacpp/mtp-vision @150K) → none, ~60/72 → ~32/33 TPS.
+    # qwen3.6-27b is dropped from RECOMMENDED_DEFAULT_MODELS in the same change so a
+    # bare `launch.sh` does not silently land single-card users on vllm/minimal,
+    # whose own header calls it a debugging baseline / 20 GB Ampere fallback.
     # No vLLM single-card Gemma default: fp8 KV is hardware-impossible on Ampere
     # sm_86 (vllm/gemma-mtp-tp1 deprecated 2026-05-31) and no bf16 single compose
     # ships. Single-card Gemma → beellama/gemma-dflash (the curated walk picks it).
@@ -1158,7 +1556,13 @@ DEFAULTS = {
 #   - New models are NOT auto-added. Adding a model touches nothing here;
 #     promote one explicitly only when desired.
 #   - Order within the (short) list = the tiebreak for "first installed".
-RECOMMENDED_DEFAULT_MODELS = ["qwen3.6-27b", "gemma-4-31b"]
+# ⚠️ qwen3.6-27b REMOVED 2026-08-12 (was first). With all its llama.cpp + ik-llama
+# single-card slugs deprecated, its single-card `<model>/default` resolves to
+# vllm/minimal — 32K ctx, no vision, a self-described debugging baseline. Leaving it
+# first here would make that the bare-`launch.sh` landing spot on any single-card rig.
+# It stays fully runnable by name; it is just no longer auto-selected. Revisit if a
+# functional long-context single-card qwen slug returns.
+RECOMMENDED_DEFAULT_MODELS = ["gemma-4-31b"]
 
 # Which engine wins, per detected topology, when resolving `<model>/default`
 # with no user pin. The resolver walks this list in order and picks the FIRST
@@ -1177,10 +1581,17 @@ RECOMMENDED_DEFAULT_MODELS = ["qwen3.6-27b", "gemma-4-31b"]
 # slugs deprecated — Anbeeld #98 won't-fix upstream DFlash VRAM regression;
 # pin v0.3.2-preview unmaintained). Slugs stay launchable by name with --force.
 # Re-add if the llama-cpp-mainline migration ever revives a beellama build.
+# ⚠️ `ik-llama` REMOVED from every walk 2026-08-12 — same precedent as beellama
+# (2026-07-27). Its last FUNCTIONAL slug was ik-llama/iq4ks-mtp; with that
+# deprecated, every remaining ik-llama slug is non-functional (the ornith pair is
+# `experimental`), so the engine can never resolve a curated default and was pure
+# dead weight at the head of the single-card walk. Its slugs stay launchable by
+# name with --force and visible in c3 via --all — this only removes it from
+# automatic recommendation. Re-add it the moment a functional ik-llama slug ships.
 ENGINE_PREFERENCE = {
-    "single": ["ik-llama", "llamacpp", "vllm"],
-    "dual": ["vllm", "ik-llama", "llamacpp"],
-    "multi": ["vllm", "ik-llama", "llamacpp"],
+    "single": ["llamacpp", "vllm"],
+    "dual": ["vllm", "llamacpp"],
+    "multi": ["vllm", "llamacpp"],
 }
 
 

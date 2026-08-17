@@ -123,7 +123,7 @@ services:
   vllm-qwen36-27b-single-nvfp4:
     # Pinned to a vLLM STABLE release (immutable, #407); the launchers inject
     # the engine-profile image over this default (#254).
-    image: ${VLLM_IMAGE:-vllm/vllm-openai:v0.25.1}
+    image: ${VLLM_IMAGE:-vllm/vllm-openai:v0.27.1}
     container_name: "${ESTATE_CONTAINER:-vllm-qwen36-27b-single-nvfp4}"
     restart: ${CLUB3090_RESTART:-unless-stopped}
     ports:
@@ -240,9 +240,12 @@ services:
       - --enable-auto-tool-choice
       - --tool-call-parser
       - qwen3_coder
-      # ⚠️ #810: this slug injects MTP via SPEC_ARGS by default — MTP + prefix caching
-      # is the vllm#43559 DeltaNet corruption pair, and pr48375 is NOT wired here yet.
-      # Prefix caching therefore defaults OFF until the wiring lands (#810).
+      # ⚠️ Prefix caching defaults OFF here BY POLICY (#810, maintainer ruling
+      # 2026-08-02): this slug injects MTP via SPEC_ARGS by default, and MTP +
+      # prefix caching is the vllm#43559 DeltaNet corruption pair. This slug
+      # does NOT vendor pr48375 and will not — no new patch vendoring; the
+      # pair-safety clears only when a pinned release contains the merged
+      # upstream fix (trigger on the docs/UPSTREAM.md #43559/#48375 row).
       # Re-enable at your own risk: PREFIX_CACHE_ARG=--enable-prefix-caching
       - "${PREFIX_CACHE_ARG:---no-enable-prefix-caching}"
       - --enable-chunked-prefill

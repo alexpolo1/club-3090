@@ -157,7 +157,7 @@ FIXTURES = {
         [{
             "Name": "/vllm-qwen-dual",
             "Config": {
-                "Image": "vllm/vllm-openai:v0.25.1",
+                "Image": "vllm/vllm-openai:v0.27.1",
                 "Labels": {"com.docker.compose.project.config_files": QWEN_DUAL},
                 "Cmd": cmd("qwen3.6-27b-autoround", 2, "fp8_e5m2", 262144,
                            {"method": "mtp", "num_speculative_tokens": 3}),
@@ -175,7 +175,7 @@ FIXTURES = {
         [{
             "Name": "/vllm-qwen-dual-tq3-mtp-genesis",
             "Config": {
-                "Image": "vllm/vllm-openai:v0.25.1",
+                "Image": "vllm/vllm-openai:v0.27.1",
                 "Labels": {},
                 "Cmd": cmd("qwen3.6-27b-autoround", 2, "turboquant_3bit_nc", 262144,
                            {"method": "mtp", "num_speculative_tokens": 2}),
@@ -193,7 +193,7 @@ FIXTURES = {
         {
             "Name": "/vllm-qwen-minimal",
             "Config": {
-                "Image": "vllm/vllm-openai:v0.25.1",
+                "Image": "vllm/vllm-openai:v0.27.1",
                 "Labels": {"com.docker.compose.project.config_files": QWEN_SINGLE},
                 "Cmd": cmd("qwen3.6-27b-autoround", 1, "auto", 48000),
                 "Env": [],
@@ -210,7 +210,7 @@ FIXTURES = {
         [{
             "Name": "/llama-cpp-qwen-single",
             "Config": {
-                "Image": "ghcr.io/ggml-org/llama.cpp:server-cuda-b9967",
+                "Image": "ghcr.io/ggml-org/llama.cpp:server-cuda-b10236",
                 "Labels": {},
                 "Cmd": cmd("qwen3.6-27b", 1, "q8_0", 131072),
                 "Env": [],
@@ -226,7 +226,7 @@ FIXTURES = {
         [{
             "Name": "/vllm-qwen-multi4",
             "Config": {
-                "Image": "vllm/vllm-openai:v0.25.1",
+                "Image": "vllm/vllm-openai:v0.27.1",
                 "Labels": {},
                 "Cmd": cmd("qwen3.6-27b-autoround", 4, "fp8_e4m3", 262144,
                            {"method": "mtp", "num_speculative_tokens": 3}),
@@ -245,7 +245,7 @@ FIXTURES = {
         [{
             "Name": "/vllm-gemma-dual",
             "Config": {
-                "Image": "vllm/vllm-openai:v0.25.1",
+                "Image": "vllm/vllm-openai:v0.27.1",
                 "Labels": {"com.docker.compose.project.config_files": GEMMA_DUAL},
                 "Cmd": cmd("gemma-4-31b", 2, "int8_per_token_head", 224000,
                            {"method": "mtp", "num_speculative_tokens": 4}),
@@ -585,13 +585,22 @@ fi
 
 # The repo's own BENCHMARKS.md must be refused outright, so a bare GH_MOCK run
 # can never mutate tracked history.
-if out="$(GH_MOCK=1 GH_MOCK_USER=octocat BENCHMARKS_FILE="${ROOT_DIR}/BENCHMARKS.md" \
+#
+# ⚠️ Compare the file against ITSELF across the run (sha256 before/after), NOT via
+# `git diff` (#961). `git diff` reports any working-tree difference, so it cannot
+# tell "the test mutated this file" from "the file was already dirty when the test
+# started" — and adding a model to the catalog REQUIRES editing BENCHMARKS.md while
+# a catalog-shape change REQUIRES the full suite, so the natural workflow tripped a
+# false failure claiming data loss. Same pattern already used for $bench_stub above.
+repo_bench="${ROOT_DIR}/BENCHMARKS.md"
+repo_bench_before="$(sha256sum < "$repo_bench")"
+if out="$(GH_MOCK=1 GH_MOCK_USER=octocat BENCHMARKS_FILE="$repo_bench" \
           bash scripts/submit-bench.sh --tag "$tag" --auto-submit --as-pr 2>&1)"; then
   echo "ASSERTION FAILED: insert into the repo's own BENCHMARKS.md was allowed" >&2
   exit 1
 fi
 assert_contains "$out" "refusing to insert into the repo's own BENCHMARKS.md"
-if ! git diff --quiet -- BENCHMARKS.md; then
+if [[ "$(sha256sum < "$repo_bench")" != "$repo_bench_before" ]]; then
   echo "ASSERTION FAILED: BENCHMARKS.md was modified by the test" >&2
   exit 1
 fi

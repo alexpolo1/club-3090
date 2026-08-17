@@ -10,6 +10,26 @@
 #     + prompt-processing throughput (`PP tok/s`)
 #   - shows MTP SpecDecoding metrics from docker logs at the end
 #
+# ⚠️⚠️ NEVER COMPARE A COLD BOOT AGAINST A HEAT-SOAKED ONE.
+#   The 3 warmups above settle the ENGINE (cudagraphs, caches). They do NOT settle
+#   the HARDWARE. A rig can take ~1 hour to reach thermal steady state, and a cold
+#   card measures materially faster on decode — @juslex reported ~4% on 2x3090
+#   (#922: rack air 29.6 -> 35.6 C over ~55 min, cores 80/82 -> 82/84 C). No
+#   throttling was involved: power sat pinned at the cap the whole time, so the
+#   CAP binds, not temperature — which is exactly why it does not show up as a
+#   clock drop you would notice.
+#
+#   That is larger than most deltas worth reporting. Their first read put one cold
+#   boot against three soaked ones and inflated a decode delta; it cost a day.
+#   Shubham independently hit the same shape on ik_llama (whichever arm ran SECOND
+#   was ~1% faster regardless of which arm it was).
+#
+#   ⇒ For any A/B: pre-warm both arms, or interleave A/B/A/B and compare like with
+#     like. A single sequential pair — the thing this script makes easiest — is the
+#     one design that cannot distinguish the patch from the position.
+#   ⇒ Prefill is far more robust (CV <=0.1% within a boot, <=1% across boots);
+#     decode is where this bites.
+#
 # Why two TPS metrics:
 #   - wall_TPS  = "user-perceived speed" (includes prefill cost)
 #   - decode_TPS = "model decode rate" (excludes prefill)
@@ -364,8 +384,22 @@ if [[ "$PP" == "1" || "$ENGINE_KIND" == "llamacpp" ]]; then
   PP_MODE="fallback"
 fi
 
+# Which request field turns reasoning off is model-specific, and an unrecognised
+# one is silently ignored — the model then reasons at full effort and the run
+# measures reasoning-heavy generation while reporting itself as thinking-off.
+# See preflight.sh::preflight_detect_thinking_control.
+if declare -F preflight_detect_thinking_control >/dev/null; then
+  preflight_detect_thinking_control
+else
+  THINK_CONTROL="enable_thinking"
+  THINK_OFF_KW='{"enable_thinking": false}'; THINK_ON_KW='{"enable_thinking": true}'
+  THINK_OFF_EFFORT=''; THINK_ON_EFFORT=''
+fi
 if [[ "$ENABLE_THINKING" == "1" ]]; then
-  echo "[bench] thinking: enabled (request chat_template_kwargs.enable_thinking=true)" >&2
+  export BENCH_THINK_KW="$THINK_ON_KW"  BENCH_THINK_EFFORT="$THINK_ON_EFFORT"
+  echo "[bench] thinking: enabled (${THINK_CONTROL} → ${THINK_ON_KW})" >&2
+else
+  export BENCH_THINK_KW="$THINK_OFF_KW" BENCH_THINK_EFFORT="$THINK_OFF_EFFORT"
 fi
 
 if [[ "${BENCH_MOCK:-0}" == "1" ]]; then
@@ -467,7 +501,17 @@ sys.exit(0 if walk(obj) else 1)
 }
 
 if [[ "$ENABLE_THINKING" != "1" ]] && server_reasoning_on; then
-  echo "[bench] WARN: server appears to have reasoning enabled, but bench requests send enable_thinking=false. Use ENABLE_THINKING=1 for reasoning-on TPS." >&2
+  echo "[bench] WARN: server appears to have reasoning enabled, but bench requests send thinking-off. Use ENABLE_THINKING=1 for reasoning-on TPS." >&2
+fi
+# server_reasoning_on() is blind twice over: it needs a docker CONTAINER (so a
+# bare-metal llama-server is skipped entirely) and it looks for an explicit
+# `--reasoning on` flag, which a model that reasons BY DEFAULT never needs. Both
+# were true on Inkling-Small 2026-08-12 — the run measured reasoning-on
+# generation, reported itself thinking-off, and this guard never fired. The
+# detected control closes that gap: no switch means reasoning cannot be turned
+# off at all, whatever the flags say.
+if [[ "$ENABLE_THINKING" != "1" && "${THINK_CONTROL:-}" == none* ]]; then
+  echo "[bench] WARN: no reasoning off-switch detected for this model — a thinking-off run is NOT possible and these numbers include reasoning tokens. Set VERIFY_THINK_OFF='{\"<key>\": <value>}' if the template uses a switch this harness doesn't know." >&2
 fi
 
 # ===========================================================================
@@ -634,12 +678,46 @@ WARMUPS = int(WARMUPS); RUNS = int(RUNS); QUIET = int(QUIET) == 1
 MAX_NARR = int(MAX_NARR); MAX_CODE = int(MAX_CODE)
 PP_FALLBACK_TOKENS = int(PP_FALLBACK_TOKENS); PP_MAX_TOKENS = int(PP_MAX_TOKENS)
 ENABLE_THINKING = ENABLE_THINKING == "1"
+try:
+    THINK_KW = json.loads(os.environ.get("BENCH_THINK_KW") or "")
+except Exception:
+    THINK_KW = {"enable_thinking": ENABLE_THINKING}
+THINK_EFFORT = os.environ.get("BENCH_THINK_EFFORT") or ""
 FORCE = int(FORCE)   # >0: force EXACTLY this many output tokens (max+min+ignore_eos)
 
 # --- capture-layer plumbing (all optional; absent => historical behaviour) ---
 # ENDPOINT=chat (default) keeps the historical /v1/chat/completions path with the
 # model's template applied. ENDPOINT=completion drives raw /v1/completions with NO
 # template — for base models, and for isolating template overhead on a chat model.
+# --- canonical sampler (#962) -----------------------------------------------
+# AGENTS.md defines the bench protocol as temperature=0.6, top_p=0.95, top_k=20.
+# Historically only the first two were SENT, so top_k and min_p fell through to
+# per-engine defaults — and those differ: llama.cpp applies top_k 40 / min_p 0.05,
+# vLLM top_k off / min_p 0. A "canonical" protocol that resolves differently per
+# engine cannot do the one job it exists for (cross-engine BENCHMARKS.md rows).
+#
+# All four are now sent explicitly. min_p is pinned to 0.0 — the protocol never
+# mentions it, and 0.0 means "no min_p floor", which is the neutral reading.
+# ⚠️ This CHANGES llama.cpp's effective sampling (top_k 40 -> 20, min_p 0.05 -> 0.0).
+# Throughput is essentially sampler-insensitive at fixed max_tokens, so historical
+# TPS rows stay comparable; anything QUALITY-shaped measured before this change was
+# taken under different sampling and should not be diffed against post-change runs.
+# Override per-run for sampler A/Bs (BENCH_TEMP / BENCH_TOP_P / BENCH_TOP_K /
+# BENCH_MIN_P); the effective values are printed at startup so a run is never
+# ambiguous about what it sampled with.
+def _envf(name, default):
+    try:
+        return float(os.environ.get(name) or default)
+    except ValueError:
+        return float(default)
+
+SAMPLER = {
+    "temperature": _envf("BENCH_TEMP", 0.6),
+    "top_p": _envf("BENCH_TOP_P", 0.95),
+    "top_k": int(_envf("BENCH_TOP_K", 20)),
+    "min_p": _envf("BENCH_MIN_P", 0.0),
+}
+
 ENDPOINT_MODE = os.environ.get("BENCH_ENDPOINT", "chat")
 PHASE_FILE = os.environ.get("BENCH_PHASE_FILE", "")
 SUMMARY_JSON = os.environ.get("BENCH_SUMMARY_JSON", "")
@@ -647,7 +725,7 @@ try:
     SHORT_EOS_FRAC = float(os.environ.get("BENCH_SHORT_EOS_FRAC", "0.25"))
 except ValueError:
     SHORT_EOS_FRAC = 0.25
-SUMMARY = {"shapes": {}, "endpoint": ENDPOINT_MODE}
+SUMMARY = {"shapes": {}, "endpoint": ENDPOINT_MODE, "sampler": dict(SAMPLER)}
 
 
 def progress(msg):
@@ -659,6 +737,19 @@ def progress(msg):
     for anything parsing it."""
     sys.stderr.write(msg + "\n")
     sys.stderr.flush()
+
+
+def announce_sampler():
+    """Print the EFFECTIVE sampler once (#962).
+
+    The bug this closes was invisible precisely because nothing echoed what the
+    bench sampled with — the only way to find out was to read the engine's own
+    boot log. A run should never be ambiguous about that after the fact.
+    """
+    progress("[bench] sampler: " + "  ".join(
+        f"{k}={v}" for k, v in (
+            ("temperature", SAMPLER["temperature"]), ("top_p", SAMPLER["top_p"]),
+            ("top_k", SAMPLER["top_k"]), ("min_p", SAMPLER["min_p"]))))
 
 
 def _log_lines():
@@ -752,8 +843,9 @@ def run_once(prompt, max_tokens):
     req_body = {
         "model": MODEL,
         "max_tokens": mt,
-        "temperature": 0.6,
-        "top_p": 0.95,
+        # Canonical sampler, sent in FULL so the effective values do not depend on
+        # engine defaults (#962). See the SAMPLER block above.
+        **SAMPLER,
         "stream": True,
         "stream_options": {"include_usage": True},
     }
@@ -766,7 +858,17 @@ def run_once(prompt, max_tokens):
         path = "/v1/completions"
     else:
         req_body["messages"] = [{"role": "user", "content": prompt}]
-        req_body["chat_template_kwargs"] = {"enable_thinking": ENABLE_THINKING}
+        # The reasoning switch is resolved by the shell (preflight.sh
+        # ::preflight_detect_thinking_control) and handed over as final JSON,
+        # because WHICH key works is model-specific and an unrecognised one is
+        # silently ignored — which would make a "thinking off" run silently
+        # measure reasoning-heavy generation.
+        req_body["chat_template_kwargs"] = THINK_KW
+        if THINK_EFFORT:
+            # The OpenAI-standard top-level parameter, sent alongside for
+            # engines that implement it (llama.cpp currently does not forward it
+            # into the template — see the preflight.sh block header).
+            req_body["reasoning_effort"] = THINK_EFFORT
         path = "/v1/chat/completions"
     if FORCE > 0:
         req_body["min_tokens"] = FORCE
@@ -1240,6 +1342,8 @@ def run_prefill_probe():
                 "prefill_tps_cv": ((s.stdev(pps) / _pm * 100) if len(pps) > 1 and _pm > 0 else 0.0),
                 "ttft_mean_ms": s.mean(ttfts) * 1000,
             }
+
+announce_sampler()
 
 if ONLY in ("both", "narr"):
     run_set("narrative", PROMPT_NARR, MAX_NARR)
@@ -1862,7 +1966,7 @@ bench_interconnect_block() {
   eng_text=""
   if [[ "${CONTAINER:-}" != "none" ]] && command -v docker >/dev/null 2>&1 \
      && docker inspect "${CONTAINER}" >/dev/null 2>&1; then
-    eng_text="$(docker logs "$CONTAINER" 2>&1 | command grep -E '\[nvlink\]|Custom allreduce is disabled' | head -8 || true)"
+    eng_text="$(docker logs "$CONTAINER" 2>&1 | command grep -E '\[nvlink\]|Custom allreduce is disabled|disable_custom_all_reduce=True' | head -8 || true)"
   fi
   if [[ "$ENGINE_KIND" == "llamacpp" || "${CONTAINER:-}" == "none" ]]; then
     # llama.cpp/ik-llama split layers across cards with plain copies — there is
@@ -1872,7 +1976,7 @@ bench_interconnect_block() {
   else
     case "$(printf '%s\n%s' "$eng_text" "$nccl_line" | p2p_classify_engagement 2>/dev/null || echo unknown)" in
       on)        l3="ENGAGED — engine reports its custom all-reduce ON" ;;
-      nccl_only) l3="engine-VETOED — vLLM disabled its custom all-reduce (NVLink-only gate at world>2, #786); P2P still live via NCCL peer transfers" ;;
+      nccl_only) l3="custom-AR OFF, P2P LIVE — the engine is not using its custom all-reduce; peer transfers still go via NCCL. Cause is either vLLM's own NVLink-only gate at world>2 (#786) or an operator-supplied --disable-custom-all-reduce (#922). Check the engine log to tell which; both are healthy states" ;;
       off)       l3="OFF — the serving container resolved to PCIe/no-P2P mode" ;;
       requested) l3="REQUESTED but UNVERIFIED — P2P forced on without a driver grant (#688)" ;;
       *)         l3="unknown — no [nvlink] boot line and no engine gate line in the log" ;;

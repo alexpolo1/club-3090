@@ -74,12 +74,12 @@
 services:
   vllm-nemotron-puzzle-75b:
     # vLLM STABLE. NemotronHPuzzleForCausalLM registered since v0.24.0 (#706) and carried in
-    # v0.25.x. Pinned to the vllm-stable engine spec (v0.25.1) so the direct-`docker compose`
+    # v0.25.x. Pinned to the vllm-stable engine spec (v0.27.1 since 2026-08-16) so the direct-`docker compose`
     # default matches the launcher-injected image — the NVFP4 multi4 sibling already runs v0.25.1
     # (TheFuzy's 4-card validation, #716) and Marlin csrc is byte-identical v0.24.0->v0.25.1.
     # Bumped v0.24.0->v0.25.1 2026-07-21 (image-drift fix; smoke-boot re-confirmed the W4A16 dual
     # path boots coherent on v0.25.1). Override with VLLM_IMAGE=... for a specific nightly.
-    image: ${VLLM_IMAGE:-vllm/vllm-openai:v0.25.1}
+    image: ${VLLM_IMAGE:-vllm/vllm-openai:v0.27.1}
     container_name: "${ESTATE_CONTAINER:-vllm-nemotron-puzzle-75b-dual-w4a16}"
     restart: ${CLUB3090_RESTART:-unless-stopped}
     ports:
@@ -100,6 +100,10 @@ services:
       - TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE:-${OFFLINE:-0}}
       - VLLM_WORKER_MULTIPROC_METHOD=spawn
       - NVLINK_MODE=${NVLINK_MODE:-auto}
+      # Opt-in transfer check: VLLM_SKIP_P2P_CHECK=0 makes vLLM PROVE peer access by
+      # moving bytes (report.sh reads the cache). Bare passthrough — absent unless set.
+      # docs/PCIE_P2P.md §7.
+      - VLLM_SKIP_P2P_CHECK
       - NCCL_CUMEM_ENABLE=0
       - NCCL_P2P_DISABLE=1
       - VLLM_NO_USAGE_STATS=1

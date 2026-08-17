@@ -24,10 +24,10 @@ vLLM Genesis patches work cleanly on Ada.
 
 **Watch out for the context derate.** A 24 GB 4090 carries more idle desktop + driver VRAM than a headless 3090, so single-card context ceilings land **~15–20% lower**. Observed: `long-text.yml` 180K → 90K, ik two-stage 200K → 160K, `dual-dflash-noviz` 200K → 180K. Start below the 3090 number and verify with `verify-stress.sh` (watch its ceiling VRAM-margin line).
 
-**⚠ UPDATE 2026-07-27: `beellama/dflash` is no longer the default — the beellama engine is retired** (all its slugs deprecated; Anbeeld closed the DFlash VRAM-regression report #98 as won't-fix, and the pin was unmaintained). The single-card walk now resolves to `ik-llama/iq4ks-mtp` automatically, which also takes the Ada gibberish below off the default path. Historical context: beellama's DFlash speculative path returns gibberish (`//////`) on sm_89 — reproduced on a 4090 in [#693](https://github.com/noonghunna/club-3090/issues/693) (the same weights serve fine under mainline llama.cpp and ik-llama on the same rig, so it's the DFlash path, not your setup). Until it's fixed, use **`ik-llama/iq4ks-mtp`** (keeps spec-dec via MTP, which works on Ada) or **`llamacpp/default`**, and pin your choice so `launch.sh` doesn't re-select the broken default:
+**⚠ UPDATE 2026-07-27: `beellama/dflash` is no longer the default — the beellama engine is retired** (all its slugs deprecated; Anbeeld closed the DFlash VRAM-regression report #98 as won't-fix, and the pin was unmaintained). ⚠️ **Superseded 2026-08-12:** `ik-llama/iq4ks-mtp` has itself been retired, along with every llama.cpp single-card qwen slug. The single-card walk now resolves to **`vllm/minimal`** (32K ctx, no vision). The Ada gibberish below is still off the default path. Historical context: beellama's DFlash speculative path returns gibberish (`//////`) on sm_89 — reproduced on a 4090 in [#693](https://github.com/noonghunna/club-3090/issues/693) (the same weights serve fine under mainline llama.cpp and ik-llama on the same rig, so it's the DFlash path, not your setup). Until it's fixed, use **`ik-llama/iq4ks-mtp`** (keeps spec-dec via MTP, which works on Ada) or **`llamacpp/default`**, and pin your choice so `launch.sh` doesn't re-select the broken default:
 
 ```bash
-./scripts/switch.sh --set-default ik-llama/iq4ks-mtp
+./scripts/switch.sh --set-default vllm/minimal   # ik-llama/iq4ks-mtp retired 2026-08-12
 ```
 
 Tracking + status: the beellama row in [`UPSTREAM.md`](UPSTREAM.md).
@@ -36,17 +36,35 @@ The composes don't currently inject Ada-specific FP8-native-compute defaults —
 
 ### Can I use a 5090?
 
-Yes — and the 32 GB envelope unlocks single-card configs the 3090 can't fit. Cross-rig measurements:
+Yes — the 32 GB envelope unlocks single-card configs the 3090 can't fit, and the Blackwell sm_120 Tensor Cores add native FP4 compute (the first consumer arch where 4-bit is a hardware feature, not just storage). Cross-rig measurements:
 
 - @apnar Gemma 4 31B `dual.yml`-shape forced TP=1: **159.67 / 215.10 TPS** (+46% narr / +51% code over 2× 3090 TP=2 on the same model)
 - @apnar Gemma 4 31B `dual-dflash.yml` forced TP=1: **150.40 / 261.06 TPS**
 - @efschu Qwen3.6-27B `dual-dflash.yml`-shape forced TP=1: **126.53 / 200.11 TPS** (highest single-card code TPS on the matrix)
+- @paulp83 Qwen3.6-27B NVFP4 dual TP=2 at 262K: **168.0 / 215.7 decode TPS**, 91% NIAH at 240K, soak PASS (#849, 2026-08-02) — first full gate on native FP4
 
-The 32 GB headroom clears Ampere boot OOMs — e.g. Gemma 4 single-card configs that don't fit on 24 GB. Vendored Marlin patches we ship for sm_86 edge cases are no-ops on Blackwell (vLLM auto-selects CUTLASS Machete on SM 9.0+); you can ignore them.
+**What works on Blackwell (sm_120):**
 
-`models/gemma-4-26b-a4b/vllm/compose/dual/docker-compose.yml` (Intel AutoRound INT4) currently `boot fail (SM86)` because Marlin can't handle the `moe_intermediate_size=704` K-dim alignment — SM 9.0+ has CUTLASS Machete which can. A 5090 / Pro 6000 should boot it cleanly; please report numbers if you try.
+- **AutoRound INT4 / AWQ / GPTQ** — same as every other arch, fully validated. The Marlin pad overlay we retired (upstream #45295 in v0.24.0+) was an sm_86-only fix; Blackwell uses CUTLASS Machete natively.
+- **NVFP4 weights** — native Tensor Core path on all Blackwell. We ship `vllm/qwen-27b-single-nvfp4` (single-card, ⚠️ Production w/ caveats) and `vllm/qwen-27b-dual-nvfp4` (dual TP=2, ⚠️ Production w/ caveats) for Qwen3.6-27B. The native CUTLASS path needs sm 9.0+; older cards fall back to the slower Marlin W4A16 route.
+- **FP8 weights** — native on sm_89+ via DeepGEMM. FP8 KV is storage-only on consumer Blackwell (no FA3 or trtllm-gen FMHA build for sm_120), same as Ada and Ampere.
+- **32 GB headroom** — clears Ampere boot OOMs (e.g. Gemma 4 single-card configs that don't fit on 24 GB).
 
-The composes don't currently use Blackwell-specific paths (FP4 quant, FP8 native attention compute) — tracked in [#246](https://github.com/noonghunna/club-3090/issues/246). Numbers from your rig are valuable: use the [Numbers from your rig](https://github.com/noonghunna/club-3090/issues/new?template=numbers-from-your-rig.yml) issue template.
+**What doesn't work on stock vLLM (and workarounds):**
+
+- **NVFP4 KV** crashes on stock vLLM (#43562) — the trtllm-gen FP4 FMHA has no sm_120 build. A community FA2+XQA route reaches real FP4 KV on patched images (#44851, #49011, #46329), measured at 1.6× the fp8 KV pool with no decode cost — but it requires a locally patched image and a V-scale write fix. Stay on `fp8_e4m3` KV for stock pins.
+- **MTP × hybrid-GDN spec-decode** has an open crash class (#50021) that hits on 5090 across NVFP4 and W4A8 alike. Mitigation: `SPEC=off` (disables the MTP drafter). v0.26.0 predates the fix.
+- **SymmMem communicator** explicitly rejects sm_120 — falls back to PYNCCL. No functional impact on our PCIe-only topologies.
+- **DeepGEMM** has no FP4 recipe on consumer Blackwell (sm_120/121) — `VLLM_USE_DEEP_GEMM=0` may be needed for some fp8 paths.
+
+**Known failure modes on dual 5090:**
+
+- NVFP4 compose exit 137 during inference — Marlin GEMM `aten::empty` allocation failure inside compiled graph (likely NVFP4 + Marlin kernel incompatibility on sm_120).
+- W4A8 soak test VRAM exhaustion — both cards saturated (32 GB each), engine crash mid-decode. Only ~1.8 GB free per GPU after boot.
+
+**The 5090 is a first-class hardware profile** (`rtx-5090`) in the launcher — it gets its own envelope, concurrency ceiling, and P2P handling. The `dual/nvfp4/mtp.yml` compose was authored blind (on the sm_86 maintainer rig via Marlin fallback) and community-validated on 2× 5090 in August 2026.
+
+The composes don't currently auto-select Blackwell-specific FP4 compute paths on stock pins — the FA2+XQA route and #46329 remain patch-image experiments. Track upstream issues: [#43562](https://github.com/vllm-project/vllm/issues/43562), [#46329](https://github.com/vllm-project/vllm/issues/46329), [#50021](https://github.com/vllm-project/vllm/issues/50021) + [`UPSTREAM.md`](UPSTREAM.md). Numbers from your rig are valuable: use the [Numbers from your rig](https://github.com/noonghunna/club-3090/issues/new?template=numbers-from-your-rig.yml) issue template.
 
 ### Do I need NVLink?
 
@@ -289,7 +307,7 @@ Two takeaways: **(1) K is the sensitive cache** — keep K higher and starve V (
 **On this stack:** the llama.cpp / ik_llama composes default to `q4_0` (max context — the per-token loss is small *on average*, but meaningful on the tail for structured output). If you serve **coding / agent / tool-calling** traffic, bump quality with the `KV_TYPE` override (shell env wins over `.env`):
 
 ```bash
-KV_TYPE=q5_0 bash scripts/switch.sh llamacpp/mtp     # ~93% tail vs q4_0's ~89%, at some context cost
+KV_TYPE=q5_0 bash scripts/switch.sh --force llamacpp/mtp     # ~93% tail vs q4_0's ~89%, at some context cost
 ```
 
 On vLLM, `turboquant_3bit_nc` is the long-context default; where context allows, prefer `fp8_e5m2` (≈ q8-tier tail) via `KV_CACHE_DTYPE`.
@@ -369,7 +387,7 @@ There are **two layers of "default"**, with different owners:
 | `<engine>/default` (e.g. `vllm/default`) | the repo's recommended config for that engine, on the detected topology | club-3090 (changes by PR) |
 | `<model>/default` (e.g. `qwen3.6-27b/default`) | **your** preferred way to run that model | **you** (`--set-default`) |
 
-By default `<model>/default` resolves to the *curated* pick — the first engine in `ENGINE_PREFERENCE` for your topology that has a healthy config (single-card Qwen → `ik-llama/iq4ks-mtp`; dual → `vllm/dual`). To make it resolve to **your** choice instead, pin a slug:
+By default `<model>/default` resolves to the *curated* pick — the first engine in `ENGINE_PREFERENCE` for your topology that has a healthy config (single-card Qwen → **`vllm/minimal`** since the 2026-08-12 retirements; dual → `vllm/dual`). To make it resolve to **your** choice instead, pin a slug:
 
 ```bash
 bash scripts/switch.sh --set-default vllm/dual-turbo   # pin (writes .env)
@@ -523,7 +541,7 @@ For a one-off bump: `GENESIS_PIN=<new-commit-sha> bash scripts/setup.sh qwen3.6-
 
 ### My hermes / openhands / OpenCode / Cline / OpenClaw / Cursor session OOMs after a few turns. What do I do?
 
-**Short answer:** route to `bash scripts/switch.sh vllm/dual` (if you have 2× 3090s) or `bash scripts/switch.sh llamacpp/default` (if 1× only). Single-card vLLM is **not safe** for accumulating-context multi-turn agent traffic on Qwen3.6-27B. We validated this 2026-05-03 across all six shipped single-card vLLM composes; only TP=2 and llama.cpp survive cleanly.
+**Short answer:** route to `bash scripts/switch.sh vllm/dual` (if you have 2× 3090s). ⚠️ **The single-card escape is gone as of 2026-08-12** — `llamacpp/default` and every other llama.cpp / ik-llama single-card qwen slug was retired (`--force` only), so on one card there is no longer a cliff-immune qwen path; `vllm/minimal` is functional but is single-card vLLM, which this answer warns about. Single-card vLLM is **not safe** for accumulating-context multi-turn agent traffic on Qwen3.6-27B. We validated this 2026-05-03 across all six shipped single-card vLLM composes; only TP=2 and llama.cpp survive cleanly.
 
 Symptoms users report: "performance degrades after 20 turns", "throughput drops to 0", "engine becomes unresponsive at ~30K tokens", "OOM after 4-5 turns of hermes", `chunk_fwd_o → torch.empty_like(v) → CUDA OOM`. All same root cause — Cliff 2b in [`docs/CLIFFS.md`](CLIFFS.md). Hardware-physical limit; not a tuning issue.
 
@@ -543,9 +561,12 @@ Symptoms users report: "performance degrades after 20 turns", "throughput drops 
 bash scripts/switch.sh vllm/dual    # 111+ TPS p50, 0 errors, 0 MiB growth across 5 sessions
 
 # 1× 3090 — different engine, different kernels, different allocator
-bash scripts/switch.sh llamacpp/default      # 21 TPS, 262K context, cliff-immune, vision
-bash scripts/switch.sh llamacpp/mtp          # ~60 code TPS, 131K, MTP, 7/7 verify-stress (incl. 91K needle)
-bash scripts/switch.sh llamacpp/mtp-vision   # ~66 code TPS, 49K + vision (multimodal MTP — drop UBATCH_SIZE to 512 + raise CTX_SIZE to 196608 if you need long ctx; see SINGLE_CARD.md)
+# ⚠️ ALL THREE RETIRED 2026-08-12 — `--force` only, not in `--list`. Kept for reference:
+bash scripts/switch.sh --force llamacpp/default      # 21 TPS, 262K context, cliff-immune, vision
+bash scripts/switch.sh --force llamacpp/mtp          # ~60 code TPS, 131K, MTP, 7/7 verify-stress (incl. 91K needle)
+bash scripts/switch.sh --force llamacpp/mtp-vision   # ~66 code TPS, 49K + vision
+# Functional single-card qwen path today:
+bash scripts/switch.sh vllm/minimal                  # 32K ctx, no vision, ~32/33 TPS
 ```
 
 **Want to verify your rig hits the same class:**

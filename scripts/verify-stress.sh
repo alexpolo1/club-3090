@@ -62,6 +62,12 @@
 #   PREFILL_TARGET_CHARS   Tool-response prefill payload size in chars
 #                          (default: 100000 ≈ 25K tokens; set higher to
 #                          push closer to the cliff under investigation).
+#   STRESS_REASONING_TIMEOUT_S  Client timeout (s) for probe 6's reasoning-
+#                          heavy request (default: 600). Raise on slow-decode
+#                          configs (CPU-offload MoE, big models at low TPS) —
+#                          8192 reasoning tokens at ~12 tok/s needs ~700s+,
+#                          so the default times out a HEALTHY server there.
+#                          Same pattern as verify-full's VERIFY_LONG_TIMEOUT.
 #   CEILING_FRACTION       Fraction of n_ctx to target for the top ceiling
 #                          rung (default: 0.92). Lower to test a safer fill.
 #   CEILING_STEP_TOKENS    Token increment between ceiling ladder rungs
@@ -108,6 +114,20 @@ URL="${URL:-http://localhost:8020}"
 # literal below is only a last resort if detection no-ops (endpoint unreachable).
 declare -F preflight_autodetect_model >/dev/null && preflight_autodetect_model
 MODEL="${MODEL:-qwen3.6-27b}"
+
+# Which request field turns reasoning off is model-specific, and an unrecognised
+# one is silently ignored — a family using a different switch would reason at
+# full effort through the whole longctx ladder, blowing the tight token budgets
+# (the needle checks cap at 30 tokens) for reasons that look like recall
+# failures. See preflight.sh::preflight_detect_thinking_control. THINK_FRAG_*
+# is the complete request fragment, splatted by the python blocks below.
+if declare -F preflight_detect_thinking_control >/dev/null; then
+  preflight_detect_thinking_control
+else
+  THINK_FRAG_OFF='{"chat_template_kwargs": {"enable_thinking": false}}'
+  THINK_FRAG_ON='{"chat_template_kwargs": {"enable_thinking": true}}'
+fi
+export THINK_FRAG_OFF THINK_FRAG_ON
 CONTAINER="${CONTAINER:-vllm-qwen36-27b}"
 
 # Detect VLLM_ENFORCE_EAGER=1 in the running container's env. Eager-mode
@@ -132,12 +152,34 @@ fi
 
 pass() { printf "  \033[32m✓\033[0m %s\n" "$1"; }
 fail() { printf "  \033[31m✗\033[0m %s\n" "$1"; printf "    \033[33m→\033[0m %s\n" "$2"; return 1; }
-skip() { printf "  \033[33m⊘\033[0m %s (skipped)\n" "$1"; }
+_SKIPPED=0
+skip() { printf "  \033[33m⊘\033[0m %s (skipped)\n" "$1"; _SKIPPED=1; }
 
 FAILED=0
+# The summary is split into two verdicts because this script answers two
+# DIFFERENT questions and they carry different weight (#1017):
+#   BOUNDARY — does the deployed config survive its edges (tool-prefill OOM,
+#              agent shapes, reasoning-heavy, VRAM ceiling)? Unambiguous.
+#   RECALL   — does the needle come back at depth? Real, but measured against a
+#              haystack built from ONE repeated block (~0.03% unique content at
+#              380K), so it establishes ADDRESSABILITY, not retrieval quality,
+#              and must not be quoted next to published NIAH/RULER scores.
+# One green line for both let a uniform-haystack pass read as "recall validated".
+_RECALL_CHECKS=" longctx longctx_large ceiling_ladder "
+RECALL_RUN=0;   RECALL_FAIL=0
+BOUND_RUN=0;    BOUND_FAIL=0
 run_check() {
   local label="$1"; shift
-  if "$@"; then :; else FAILED=$((FAILED + 1)); fi
+  local rc=0
+  _SKIPPED=0
+  if "$@"; then :; else rc=1; FAILED=$((FAILED + 1)); fi
+  if [[ "$_SKIPPED" == "1" ]]; then return 0; fi   # skipped checks count in neither bucket
+  if [[ "$_RECALL_CHECKS" == *" $label "* ]]; then
+    RECALL_RUN=$((RECALL_RUN + 1)); [[ "$rc" == "1" ]] && RECALL_FAIL=$((RECALL_FAIL + 1))
+  else
+    BOUND_RUN=$((BOUND_RUN + 1));  [[ "$rc" == "1" ]] && BOUND_FAIL=$((BOUND_FAIL + 1))
+  fi
+  return 0
 }
 
 # ---- Engine detection (parallel to verify-full.sh::detect_engine, see #87) ---
@@ -376,7 +418,7 @@ req = {
     "messages": [{"role": "user", "content": content}],
     "max_tokens": 30,
     "temperature": 0.0,
-    "chat_template_kwargs": {"enable_thinking": False},
+    **json.loads(os.environ.get("THINK_FRAG_OFF") or '{"chat_template_kwargs": {"enable_thinking": false}}'),
 }
 with open(os.environ['SECRET_FILE'], 'w') as f:
     f.write(secret)
@@ -525,7 +567,7 @@ payload = {
     "tool_choice": "auto",
     "max_tokens": 500,
     "temperature": 0.6,
-    "chat_template_kwargs": {"enable_thinking": False},
+    **json.loads(os.environ.get("THINK_FRAG_OFF") or '{"chat_template_kwargs": {"enable_thinking": false}}'),
 }
 with open(os.environ['REQ_FILE'], 'w') as f:
     json.dump(payload, f)
@@ -542,7 +584,7 @@ EOF
     200)
       local content_len tc_count finish
       read -r content_len tc_count finish < <(python3 -c "
-import json
+import json, os
 try:
     d = json.load(open('${resp_file}'))
     msg = d['choices'][0]['message']
@@ -886,7 +928,7 @@ body = {
 with open(os.environ['REQ_FILE'], 'w') as f:
     json.dump(body, f)
 PYEOF
-  http_code="$(curl -sS -o "${resp_file}" -w "%{http_code}" --max-time 600 \
+  http_code="$(curl -sS -o "${resp_file}" -w "%{http_code}" --max-time "${STRESS_REASONING_TIMEOUT_S:-600}" \
     -H "Content-Type: application/json" -X POST \
     -d "@${req_file}" "${URL}/v1/chat/completions" 2>/dev/null || echo "000")"
   rm -f "$req_file"
@@ -1232,7 +1274,7 @@ print(' '.join(str(r) for r in rungs))
   cal_req="$(mktemp --suffix=.json)"
   cal_result="$(mktemp --suffix=.json)"
   python3 -c "
-import json
+import json, os
 block = (
     'This section describes the history of computing in detail. '
     'Transistors were invented in 1947 at Bell Labs. The integrated circuit came a decade later. '
@@ -1243,7 +1285,7 @@ req = {
     'model': '${MODEL}',
     'messages': [{'role': 'user', 'content': block + '\n\nHi.'}],
     'max_tokens': 5, 'temperature': 0.0,
-    'chat_template_kwargs': {'enable_thinking': False},
+    **json.loads(os.environ.get('THINK_FRAG_OFF') or '{\"chat_template_kwargs\": {\"enable_thinking\": false}}'),
 }
 with open('${cal_req}', 'w') as f:
     json.dump(req, f)
@@ -1316,7 +1358,7 @@ req = {
     "messages": [{"role": "user", "content": content}],
     "max_tokens": 30,
     "temperature": 0.0,
-    "chat_template_kwargs": {"enable_thinking": False},
+    **json.loads(os.environ.get("THINK_FRAG_OFF") or '{"chat_template_kwargs": {"enable_thinking": false}}'),
 }
 with open(os.environ['SECRET_FILE'], 'w') as f:
     f.write(secret)
@@ -1505,6 +1547,21 @@ EOF
 run_check "ceiling_ladder" check_ceiling_ladder
 ensure_engine_alive "probe 8 (ceiling ladder)" || true
 
+echo ""
+_c_ok=$'\033[32m'; _c_bad=$'\033[31m'; _c_dim=$'\033[2m'; _c_off=$'\033[0m'
+_b_col="$_c_ok"; [[ "$BOUND_FAIL"  == "0" ]] || _b_col="$_c_bad"
+_r_col="$_c_ok"; [[ "$RECALL_FAIL" == "0" ]] || _r_col="$_c_bad"
+if [[ "$BOUND_RUN" != "0" ]]; then
+  printf "  %sboundary checks%s  %d/%d passed  %s(tool-prefill OOM, agent shapes, reasoning-heavy, VRAM ceiling)%s\n" \
+    "$_b_col" "$_c_off" "$((BOUND_RUN - BOUND_FAIL))" "$BOUND_RUN" "$_c_dim" "$_c_off"
+fi
+if [[ "$RECALL_RUN" != "0" ]]; then
+  printf "  %srecall ladder%s    %d/%d passed  %s(uniform-haystack: ADDRESSABILITY, not retrieval%s\n" \
+    "$_r_col" "$_c_off" "$((RECALL_RUN - RECALL_FAIL))" "$RECALL_RUN" "$_c_dim" "$_c_off"
+  printf "                     %squality — do not quote beside NIAH/RULER scores. #1017)%s\n" "$_c_dim" "$_c_off"
+else
+  printf "  %srecall ladder%s    skipped (SKIP_LONGCTX / SKIP_CEILING)%s\n" "$_c_dim" "$_c_off" "$_c_off"
+fi
 echo ""
 if [[ "$FAILED" == "0" ]]; then
   printf "\033[32mAll stress / boundary checks passed.\033[0m KV-cache and prefill paths are sound for the deployed config.\n"

@@ -3228,10 +3228,10 @@ class CockpitData:
           - ``--env-file .env`` (when present) resolves repo vars like
             ``${MODEL_DIR}`` / ``${HF_TOKEN}`` that some composes (comfyui) need.
 
-        Reconcile-gated: a GPU-holding service (ComfyUI / Step-Audio) can't
-        silently collide with whatever holds the cards, while a non-GPU web
-        service (litellm / qdrant / …) clears the gate immediately.  Tolerates the
-        ``.yml`` / ``.yaml`` spelling."""
+        Reconcile-gated for GPU-holding services only (ComfyUI / Step-Audio) so
+        they can't silently collide with whatever holds the cards; non-GPU web
+        services (litellm / qdrant / searxng / open-webui) skip the gate entirely.
+        Tolerates the ``.yml`` / ``.yaml`` spelling."""
         resolved = self._resolve_service_compose(name)
         rel, project = resolved if resolved is not None else (
             f"services/{name}/docker-compose.yml",
@@ -3247,11 +3247,15 @@ class CockpitData:
         # `env K=V …` (process env) wins over --env-file for compose interpolation.
         if name == STUDIO_DIRECTOR_CONTAINER:
             cmd = ["env", *(f"{k}={v}" for k, v in self.director_compose_env().items()), *cmd]
+        # Reconcile-gated for GPU-holding services only: they can't silently
+        # collide with whatever holds the cards; non-GPU web services clear
+        # the gate immediately.
+        is_gpu_holder = _classify_container_kind(name) is not None
         return ActionPlan(
             kind="service-up",
             cmd=cmd,
             description=f"docker compose up {name}",
-            requires_reconcile=True,
+            requires_reconcile=is_gpu_holder,
         )
 
     def service_start_or_restart(self, name: str) -> ActionPlan:
@@ -4906,6 +4910,9 @@ def _variant_row_from_dict(d: dict[str, Any]) -> VariantRow:
         # Weight-offload backend (catalog offload column) — same pattern;
         # "" when the contract didn't carry it (resident/older emit) → shows "—".
         object.__setattr__(row, "offload", str(d.get("offload") or ""))
+        # Minimum host RAM for offload slugs (hard gate). Kept as int|None rather than
+        # str so the column can render "—" for resident slugs without a magic string.
+        object.__setattr__(row, "host_ram_gb", d.get("host_ram_gb"))
         object.__setattr__(row, "chat_template", str(d.get("chat_template") or "native"))
         # W4A8-int8-activation capability (c3 serve-confirm checkbox, #609).
         object.__setattr__(row, "act8_capable", bool(d.get("act8_capable")))
