@@ -129,3 +129,15 @@ model_list:
       model: openai/thinkingcap-27b
       api_base: http://host.docker.internal:8099/v1
       api_key: EMPTY
+
+  # Qwen3.8-27B FP8 — LOCAL model, the current dual-3090 production scene on :8091
+  # (registry slug vllm/qwen38-27b-dual-max). NOT to be confused with qwen3.8-max
+  # above, which is the Aliyun-hosted Qwen3.8-Max-Preview reached over the network.
+  # Only one scene occupies the cards at a time, so this route answers only while
+  # the qwen3.8 scene is up; the gateway lists it either way (:4000 is not a
+  # readiness signal — probe :8091/v1/models for that).
+  - model_name: qwen3.8-27b
+    litellm_params:
+      model: openai/qwen3.8-27b
+      api_base: http://host.docker.internal:8091/v1
+      api_key: EMPTY
