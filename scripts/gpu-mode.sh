@@ -383,7 +383,13 @@ show_status() {
     # disagree with itself. Also drops up to 9 redundant 2s-timeout curls on
     # a rig where nothing is serving (the guard used to re-probe everything).
     local _endpoint_up=0
-    # Check ports in priority order: 8010, 8012, 8020, 11434, 4000
+    # Check ports in priority order: 8091, 8010, 8012, 8020, 11434, 4000
+    if curl -sf -m 2 http://localhost:8091/v1/models >/dev/null 2>&1; then
+        _endpoint_up=1
+        local m
+        m=$(curl -sf -m 2 http://localhost:8091/v1/models | python3 -c "import sys,json;d=json.load(sys.stdin);print(', '.join(x['id'] for x in d.get('data',[])))" 2>/dev/null)
+        echo -e "  ${GREEN}▶${NC} qwen3.8-27b-dual-max @ :8091 → ${m:-unknown} (FP8 + fp8 KV + 262K + vision, MTP off)"
+    fi
     if curl -sf -m 2 http://localhost:8010/v1/models >/dev/null 2>&1; then
         _endpoint_up=1
         local m
