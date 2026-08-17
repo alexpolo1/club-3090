@@ -22,48 +22,34 @@
 #   Template:  native — the repo's own chat_template.jinja. NOT froggeric.
 #              ⚠️ This is a deliberate break from the qwen3.6-27b composes; see
 #              "Chat template" below. The 3.8 template is a DIFFERENT program.
-#   Max ctx:   262144 — the architectural ceiling (text_config.max_position_embeddings).
-#              COMPUTED to fit + inherited from the byte-for-byte-comparable
-#              qwen3.6-27b FP8 tier. NEVER MEASURED HERE. See "Context budget".
+#   Max ctx:   262144 allocated — the architectural ceiling
+#              (text_config.max_position_embeddings). MEASURED FILL 240,633 tok
+#              (91.8%) via the staggered-NIAH ceiling ladder, 6/6 rungs, VRAM
+#              margin 1,925 MB flat across the ladder (2026-08-17, TP=2, v0.27.1).
+#              The predicted "comparable to qwen3.6-27b's ~240K" gap held: an
+#              independent 2x3090 run (#995, NVLink, v0.24.0) measured 240,636 —
+#              three tokens apart. Boot envelope: KV pool 313,367 tok = 1.20x the
+#              addressable window, 21,175 MiB/card. See "Context budget".
 #   Genesis:   none — intentionally Genesis-free
-#   Status:    🐣 Incubating
-#   Caveats:   NOTHING HAS BOOTED. Authored 2026-08-14; the weights have since
-#              landed and CRC-verified, but no engine has ever loaded them, so
-#              zero RUNTIME evidence exists for anything below.
-#              Specifically unvalidated on Qwen3.8-27B:
-#                - never launched — no boot log, no served token, no VRAM reading
-#                - no verify-full (0/8), no verify-stress, no NIAH, no soak
-#                - no bench: NO TPS / TTFT / accept-length number is claimed anywhere
-#                - no quality run (8-pack not executed in either reasoning mode).
-#                  There is deliberately NO `Quality:` field on this compose —
-#                  the qwen3.6 tier's 109/150 is ITS number, not this model's.
-#                - Max ctx 262144 is ARITHMETIC + a sibling analogy, never filled.
-#                  Allocating a context is not filling it: the qwen3.6-27b FP8 dual,
-#                  same growing-attention geometry and same weight footprint,
-#                  NIAH-fills to ~240K of its allocated 262K. Expect a comparable
-#                  or worse gap here until a ladder proves otherwise.
-#                - ENGINE COMPATIBILITY: ⚠️ the "pin predates the model" concern is
-#                  GONE as of the v0.27.1 bump — Qwen3.8-27B published 2026-08-05,
-#                  v0.27.1 on 2026-08-11 — and sibling qwen3.8 slugs (dual-fast,
-#                  dual-nvfp4) BOOT on it, verify-full 9/9. What is still unproven is
-#                  THESE fp8 slugs, which have never booted on any pin. The Qwen3_5ForConditionalGeneration arch IS served on this
-#                  pin (qwen3.6-27b FP8, Tess-4-27B), and the quantization_config is
-#                  byte-shaped identically to qwen3.6-27b-FP8 — but "should load" is
-#                  an inference, not an observation.
-#                - MTP head present in the checkpoint != MTP head works. Accept rate
-#                  is unmeasured. On the 35B-A3B MoE sibling the BUILT-IN head is
-#                  net-negative (-51%) while an external drafter is +49%, so a
-#                  present head is not a free win. SPEC=off if it misbehaves.
-#                - vision: tower is in the checkpoint, but no image/video request
-#                  has ever been served. Treat as text-only until proven.
-#              • ⚠️ MTP × hybrid-GDN wild write — vllm#50021, OPEN and LIVE IN THIS PIN.
-#                Inherited exposure, not a new one: Qwen3.8-27B is the same
-#                Qwen3-Next/DeltaNet hybrid-GDN family as qwen3.6-27b and Tess-4-27B,
-#                and the fault is an UNBOUNDED index in the shared GDN spec-decode
-#                path — it is quant-, topology- and depth-independent. See
-#                "Upstream-risk" below and the docs/UPSTREAM.md row.
-#              Promote to 🧪 only after a clean boot + verify-full; to ⚠️/✅ only
-#              after the full gate (verify-stress + bench + soak + quality).
+#   Status:    🧪 Experimental
+#   Quality:   8-pack (--full, benchlocal packs toolcall v1.0.1 / instructfollow
+#              v1.0.0 / structoutput v1.1.0 / dataextract v1.2.0 / reasonmath
+#              v1.0.0 / bugfind v1.0.1 / hermesagent v1.0.0 / cli-40 v1.0.2,
+#              2026-08-17, TP=2, v0.27.1, SPEC=off, temp=0):
+#                reasoning OFF: 118/150 (79%) — 0 flaky, pass@1 == pass@3
+#                  ToolCall 13/15 · InstructFollow 13/15 · StructOutput 15/15
+#                  · DataExtract 10/15 · ReasonMath 11/15 · BugFind 15/15
+#                  · HermesAgent 15/20 · CLI-40 26/40
+#                reasoning ON:  127/150 (85%) pass@1, 133/150 (89%) pass@3, 6 flaky
+#                  ToolCall 13/15 · InstructFollow 14/15 · StructOutput 15/15
+#                  · DataExtract 14/15 · ReasonMath 14/15 · BugFind 14/15
+#                  · HermesAgent 13/20 · CLI-40 30/40
+#              ⚠️ Do NOT read "ON is better" as a deployment recommendation. The
+#              +9 comes from the analytical packs; the AGENTIC pack REGRESSES
+#              (HermesAgent 15/20 -> 13/20), and ON is nondeterministic at temp=0
+#              (6 flaky, pass@1 != pass@3) where OFF is exactly reproducible.
+#              This compose ships thinking OFF, which is the right default for
+#              agent/tool workloads on that evidence.
 #   Upstream-risk:  • ⚠️ MTP × hybrid-GDN wild write — vllm#50021, OPEN and LIVE IN THIS PIN.
 #                The GDN spec-decode path builds a state-block index from an UNBOUNDED
 #                accepted-token count; a zero/stale count dereferences a wild address →
@@ -72,17 +58,45 @@
 #                Not quant-, topology- or depth-specific: hit on Ampere+Ada and on
 #                2× 5090 across NVFP4 AND W4A8 alike. The vendored pr48375 fixes
 #                vllm#43559 (corruption) and does NOT cover this fault.
-#                ⚠️ THIS MODEL HAS NEVER RUN, so it has never been OBSERVED to crash —
-#                that is absence of evidence, not evidence of absence. The exposure is
-#                structural (same hybrid-GDN kernel, MTP on) and carries over.
+#                ⚠️ NOT OBSERVED HERE, AND NOT DISPROVEN (2026-08-17): a 79-minute
+#                agent-shaped soak under MTP n=3 — 17 cycles of multi-turn growing
+#                context + chained tool-call runs, plus a continuous soak
+#                (silent_empty 0/50) — produced no hard fault, no restart and no new
+#                Xid. That covers only the LOW end of the reported minutes-to-hours
+#                window, so it is "no failure signal on this sample", not safety.
+#                The exposure is structural (same hybrid-GDN kernel) and carries over.
 #                MITIGATION: run the drafter off — SPEC=off. Lower n cuts frequency,
 #                NOT exposure (n=3 was called stable on one rig and crashed AT n=3 on
 #                another). Clears when #50021 merges and a pin bump inherits it;
 #                v0.26.0 PREDATES the fix, so the queued bump inherits nothing here.
 #                Full detail, evidence stack + re-test trigger: docs/UPSTREAM.md.
 #   Best for:  max-weight-fidelity Qwen3.8-27B on 2 cards, and the on-rig proxy for
-#              the 4-card vllm/qwen38-27b-multi4-max. NOT yet recommendable for
-#              anything — see Caveats.
+#              the 4-card vllm/qwen38-27b-multi4-max.
+# ---------------------------------------------------------------------------
+# STILL-OPEN CAVEATS (relocated from the schema 2026-08-17: the `Caveats:` field
+# is required for 🐣 and omitted for 🧪, but these remain true and load-bearing):
+#
+#   • ⚠️ vllm#50021 is OPEN — see "Upstream-risk" above. This is the one risk the
+#     full gate did NOT clear. Failure mode is LOUD (dead worker + Xid), which the
+#     boot script's health watch catches; it is not a silent-corruption risk.
+#   • ⚠️ FP8 IS NOT A DECODE WIN ON AMPERE. sm_86 has no native FP8 compute, so
+#     these weights serve weight-only through Marlin FP8 (W8A16). The win is memory
+#     and fidelity. Measured here: 45.1 TPS narrative with the drafter off, vs an
+#     NVLink+MTP rig's 79.6 on the same slug (#995) — interconnect and drafter, not
+#     the quant, are what move this number.
+#   • ⚠️ THE SAMPLER DOES NOT FOLLOW THE THINKING FLAG. This compose ships the model
+#     card's INSTRUCT row (temp 0.7 / top_p 0.80 / presence_penalty 1.5) because it
+#     ships thinking OFF. Enabling thinking WITHOUT also setting TEMP=1.0
+#     TOP_P=0.95 PRESENCE_PENALTY=0.0 is a silent mismatch. The Quality: numbers
+#     above sidestep this entirely — packs run at temp=0.
+#   • MTP n=3 is measured GOOD on this checkpoint (acceptance 3.46/4.0, draft
+#     acceptance 91.9%, +44% narrative decode) — unlike the 35B-A3B MoE sibling
+#     where the built-in head is net-negative. club-3090 #710 (chained-agent prefix
+#     poisoning) does NOT reproduce here: 18 probe runs, all 6/6 -> 6/6.
+#   • The Quality: numbers were measured at SPEC=off. Production on the maintainer
+#     rig runs SPEC=on since 2026-08-17; the 8-pack has NOT been re-run under MTP.
+#   • Vision is smoke-tested only (2026-08-16) — no quality gate, no resolution or
+#     duration limits explored.
 # ---------------------------------------------------------------------------
 # Siblings: 5 slugs for this model (2 llama.cpp, 3 vLLM) — see
 # `switch.sh --list --all` or the registry. ⚠️ This dual is NOT a clean proxy
