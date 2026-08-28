@@ -16,6 +16,7 @@ gallery, one refine-by-reply UX across the creative modalities.
 
 | Deep-dive | Covers |
 |---|---|
+| **[agents-architecture.md](agents-architecture.md)** | **How the director thinks** — the one 4B behind every lane, the two agent shapes, the Production Director decision flow, the per-lane comparison + the system-prompt map |
 | **[requirements.md](requirements.md)** | **Can I run this?** — GPU / CPU / RAM / disk / software, single-vs-dual-card, the director-placement VRAM lever |
 | **[image.md](image.md)** | HiDream-O1 (top quality) · Ideogram-4 (design/logo/text) · Chroma + Z-Image (uncensored) · Krea 2 (aesthetic) · the native-button shim |
 | **[video.md](video.md)** | LTX-2.3 (video+audio) · Sulphur / 10Eros (uncensored) · Wan2.2 (uncensored T2V) · 60 s+ chaining · the single-stage rule |
@@ -80,7 +81,7 @@ Studio only borrows a small qwen "director" to craft prompts.)_
                                            └───────────────────────────┘
 ```
 
-The qwen **director** crafts the right prompt shape per lane; **ComfyUI** renders image/video/music/SFX; the **step-voice** and **studio-tts** services handle premium + narration voice; the **orchestrator** chains long videos; everything lands in the always-on **gallery**. Text/LLM chat is the separate core stack (this is image/video/audio only).
+The qwen **director** crafts the right prompt shape per lane; **ComfyUI** renders image/video/music/SFX; the **step-voice** and **studio-tts** services handle premium + narration voice; the **orchestrator** chains long videos; **SearXNG** (`:8088`) lets the experimental 🎬 Production director ground documentaries in real web facts (see [agents-architecture.md](agents-architecture.md)); everything lands in the always-on **gallery**. Text/LLM chat is the separate core stack (this is image/video/audio only).
 
 ### One scene, lanes inside it
 
@@ -141,8 +142,10 @@ gemma-4-12b — the uncensored DiTs still render, only the prompt-writing change
 (~120 GB), brings the scene up, and installs the OWUI Studio pipe:
 
 ```bash
-bash scripts/setup-ai-studio.sh        # add --yes to skip the confirm; SKIP_BUILD / SKIP_DOWNLOAD / SKIP_PIPE to trim
+bash scripts/setup-ai-studio.sh        # add --yes to skip the confirm; SKIP_BUILD / SKIP_DOWNLOAD / SKIP_DISK_CHECK / SKIP_PIPE to trim
 ```
+
+**Where the models land:** everything goes under your **`MODEL_DIR`** (set in repo-root `.env`, e.g. via c3 Settings) — the HF/GGUF weights at `$MODEL_DIR`, and the ComfyUI tree at a `comfyui` sibling of it (e.g. `MODEL_DIR=/home/me/models` → ComfyUI at `/home/me/comfyui`). Override `COMFYUI_ROOT` / `COMFYUI_MODELS_DIR` to decouple them. Resuming a download that already pushed you under the free-space threshold? `SKIP_DISK_CHECK=1` bypasses the preflight (the roster pull is idempotent and only fetches what's missing).
 
 **Already set up?** Just bring the scene up (or do it from c3 → Operate):
 

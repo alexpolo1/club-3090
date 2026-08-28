@@ -1,0 +1,110 @@
+== L1 A/B START 21:19:29  salt-stamp=1783970369 ==
+====================================================================
+LEG L1=30GB  (L2 stays 1) — 21:19:29
+====================================================================
+[switch]   64s — Loading weights
+[switch]   120s elapsed, still waiting...
+[switch]   180s elapsed, still waiting...
+[switch]   200s — Capturing CUDA graphs
+[switch]   216s — Application startup complete
+[switch] ✓ ready (216s)
+[switch] ▶ API:  http://192.168.1.98:8017/v1   (model: qwen3.6-27b · OpenAI-compatible · no auth)
+[switch] done. Try:  curl -s http://localhost:8017/v1/models | jq .
+>> container LMCACHE_L1_GB=30  LMCACHE_L2=1  (want L1=30 L2=1)
+LMCache L1 retention probe -> http://localhost:8017   model=qwen3.6-27b
+  sessions=8  target_tokens/session~=48000  warm_threshold=8.0s  kv=131KB/tok
+
+Building calibrated haystacks (one /tokenize probe each)...
+
+Round 1 - cold insert (fills L1):
+  session  1: cold TTFT   53.20s  (prompt_tokens=47559)
+  session  2: cold TTFT   52.73s  (prompt_tokens=47991)
+  session  3: cold TTFT   53.78s  (prompt_tokens=48207)
+  session  4: cold TTFT   51.33s  (prompt_tokens=46318)
+  session  5: cold TTFT   52.83s  (prompt_tokens=47015)
+  session  6: cold TTFT   54.30s  (prompt_tokens=47676)
+  session  7: cold TTFT   55.95s  (prompt_tokens=48343)
+  session  8: cold TTFT   56.34s  (prompt_tokens=48098)
+
+  inserted ~381207 tokens ~= 49.9 GB of L1
+  capacity lines: L1=30 -> ~229K tok (~30 GB), L1=60 -> ~458K tok (~60 GB)
+
+Round 2 - retention read (same prefixes; warm = retained):
+  session  1: TTFT    3.32s  WARM  retained
+  session  2: TTFT    4.35s  WARM  retained
+  session  3: TTFT    4.16s  WARM  retained
+  session  4: TTFT    3.58s  WARM  retained
+  session  5: TTFT    5.09s  WARM  retained
+  session  6: TTFT    1.09s  WARM  retained
+  session  7: TTFT    1.87s  WARM  retained
+  session  8: TTFT    1.48s  WARM  retained
+
+  retained warm: 8/8
+
+  PASS - all sessions retained. L1 held the full working set;
+         this set would have evicted its earliest sessions at L1=30.
+>> leg L1=30 done, log=_local-lmcache-tuning/l1ab-L130.log
+====================================================================
+LEG L1=60GB  (L2 stays 1) — 21:30:54
+====================================================================
+[switch]   68s — Loading weights
+[switch]   120s elapsed, still waiting...
+[switch]   180s elapsed, still waiting...
+[switch]   208s — Capturing CUDA graphs
+[switch]   224s — Application startup complete
+[switch] ✓ ready (224s)
+[switch] ▶ API:  http://192.168.1.98:8017/v1   (model: qwen3.6-27b · OpenAI-compatible · no auth)
+[switch] done. Try:  curl -s http://localhost:8017/v1/models | jq .
+>> container LMCACHE_L1_GB=60  LMCACHE_L2=1  (want L1=60 L2=1)
+LMCache L1 retention probe -> http://localhost:8017   model=qwen3.6-27b
+  sessions=8  target_tokens/session~=48000  warm_threshold=8.0s  kv=131KB/tok
+
+Building calibrated haystacks (one /tokenize probe each)...
+
+Round 1 - cold insert (fills L1):
+  session  1: cold TTFT   55.80s  (prompt_tokens=48631)
+  session  2: cold TTFT   51.99s  (prompt_tokens=46869)
+  session  3: cold TTFT   54.48s  (prompt_tokens=48031)
+  session  4: cold TTFT   55.22s  (prompt_tokens=48240)
+  session  5: cold TTFT   55.62s  (prompt_tokens=47982)
+  session  6: cold TTFT   58.44s  (prompt_tokens=49035)
+  session  7: cold TTFT   56.92s  (prompt_tokens=47843)
+  session  8: cold TTFT   58.67s  (prompt_tokens=48719)
+
+  inserted ~385350 tokens ~= 50.5 GB of L1
+  capacity lines: L1=30 -> ~229K tok (~30 GB), L1=60 -> ~458K tok (~60 GB)
+
+Round 2 - retention read (same prefixes; warm = retained):
+  session  1: TTFT    2.39s  WARM  retained
+  session  2: TTFT    2.05s  WARM  retained
+  session  3: TTFT    1.42s  WARM  retained
+  session  4: TTFT    1.71s  WARM  retained
+  session  5: TTFT    1.27s  WARM  retained
+  session  6: TTFT    3.04s  WARM  retained
+  session  7: TTFT    1.05s  WARM  retained
+  session  8: TTFT    2.50s  WARM  retained
+
+  retained warm: 8/8
+
+  PASS - all sessions retained. L1 held the full working set;
+         this set would have evicted its earliest sessions at L1=30.
+>> leg L1=60 done, log=_local-lmcache-tuning/l1ab-L160.log
+>> FINAL production state: LMCACHE_L1_GB=60  LMCACHE_L2=1  (want 60 / 1)
+====================================================================
+COMPARISON — Round-2 (warm) TTFT per session, L1=30 vs L1=60
+====================================================================
+sess   L1=30 s   L1=60 s     faster
+   1      3.32      2.39      L1=60
+   2      4.35      2.05      L1=60
+   3      4.16      1.42      L1=60
+   4      3.58      1.71      L1=60
+   5      5.09      1.27      L1=60
+   6      1.09      3.04      L1=30
+   7      1.87      1.05      L1=60
+   8      1.48      2.50      L1=30
+
+L1=30 warm: n=8 mean=3.12s median=3.45s max=5.09s
+L1=60 warm: n=8 mean=1.93s median=1.88s max=3.04s
+
+VERDICT: L1=60 warm reads ~1.6x faster => the RAM IS doing work.
+== L1 A/B DONE 21:42:31 ==

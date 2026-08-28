@@ -150,10 +150,26 @@ quant_match = (m.weights[first] or {}).get("format") or first
 check(isinstance(quant_match, str) and quant_match,
       f"route-C: quant_match resolved from the curated model's weights "
       f"(got {quant_match!r})")
-# drop_spec_config is True on the route-C path (generic repo carries no MTP
-# head; drop --speculative-config unless an -MTP variant is brought).
-check(True, "route-C: drop_spec_config=True (curated MTP head absent in a "
-            "generic repo) — mirrors the human NOTE + BRING_YOUR_OWN docs")
+# drop_spec_config is now DETECTED, not blanket-True: _swap_path keeps
+# --speculative-config when the brought checkpoint actually carries an MTP head
+# (deriver.detect_mtp_head: config DECLARES the MTP layers + a dedicated mtp
+# weights file). Regression guard for the bug where head-preserving fine-tunes
+# (e.g. ThinkingCap AutoRound) were silently served MTP-off.
+from scripts.lib.profiles.deriver import detect_mtp_head
+_mtp_api = {"siblings": [{"rfilename": "model-00001-of-00007.safetensors"},
+                         {"rfilename": "model_mtp_bf16.safetensors"}]}
+_plain_api = {"siblings": [{"rfilename": "model.safetensors"}]}
+check(detect_mtp_head({"mtp_num_hidden_layers": 1}, _mtp_api) is True,
+      "route-C: MTP head PRESENT (config declares + mtp weights file) -> keep "
+      "--speculative-config (drop_spec_config=False)")
+check(detect_mtp_head({"num_hidden_layers": 48}, _plain_api) is False,
+      "route-C: plain re-quant (no MTP declared, no mtp file) -> drop "
+      "--speculative-config (drop_spec_config=True)")
+check(detect_mtp_head({"text_config": {"num_nextn_predict_layers": 1}}, _mtp_api) is True,
+      "route-C: MTP declared in nested text_config (VLM) + file present -> keep")
+check(detect_mtp_head({"mtp_num_hidden_layers": 1}, _plain_api) is False,
+      "route-C: declares MTP but no dedicated mtp weights file -> drop "
+      "(embedded head not detectable without the index; conservative)")
 
 # Route B: an arch with NO curated sibling -> the self-contained GGUF
 # fallback (route B, no sibling/quant_match).
@@ -202,6 +218,101 @@ rm -f "$_sh_out" "$_sh_err" "$_py_out" "$_py_err"
 # residue and the CI condition (gitignored runtime state ABSENT) is restored
 # (same discipline as test-pull.sh).
 rm -rf "$ROOT_DIR/.pull-captures"
+
+# ---------------------------------------------------------------------------
+# 4: apply-swap EMIT — swap_apply.emit_swap_compose clones the sibling's REAL
+#    compose (curated chat-template / parsers preserved) with --model re-pointed
+#    at the brought weights, keeping --speculative-config iff the checkpoint has
+#    an MTP head. No network (reads the on-disk vllm/dual compose). The download
+#    + Route-C derive is exercised live by the c3 dogfood, not here.
+# ---------------------------------------------------------------------------
+python3 - "$ROOT_DIR" <<'PY' || failures=$((failures+1))
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+sys.path.insert(0, str(root))
+
+import yaml
+from scripts.lib.profiles import swap_apply as SA
+
+ok = True
+
+
+def check(cond, msg):
+    global ok
+    print(("PASS: " if cond else "FAIL: ") + msg, file=sys.stdout if cond else sys.stderr)
+    if not cond:
+        ok = False
+
+
+def _cmd(compose_path):
+    doc = yaml.safe_load(Path(compose_path).read_text(encoding="utf-8"))
+    svc = next(iter(doc["services"].values()))
+    return svc, svc["command"], Path(compose_path).read_text(encoding="utf-8")
+
+
+def _val(cmd, flag):
+    return cmd[cmd.index(flag) + 1] if flag in cmd else None
+
+
+# pure command-list surgery (no I/O)
+_in = ["--model", "/old", "--served-model-name", "a", "b",
+       "--quantization", "auto_round", "--speculative-config", '{"method":"mtp"}']
+_keep = SA.apply_command_overrides(_in, model_path="/brought-model",
+                                   served_name="mine", drop_spec=False)
+check(_val(_keep, "--model") == "/brought-model", "override: --model repointed")
+check(_val(_keep, "--served-model-name") == "${SERVED_NAME:-mine}" and "a" not in _keep and "b" not in _keep,
+      "override: --served-model-name replaces ALL sibling served values (env-gated, P2b)")
+check(_val(_keep, "--quantization") == "auto_round", "override: --quantization untouched")
+check("--speculative-config" in _keep, "override: spec-config KEPT when drop_spec=False")
+_drop = SA.apply_command_overrides(_in, model_path="/b", served_name="m", drop_spec=True)
+check("--speculative-config" not in _drop, "override: spec-config + value DROPPED when drop_spec=True")
+
+# full emit against the real vllm/dual sibling compose — MTP-head present
+p_mtp = SA.emit_swap_compose(root, "vllm/dual", Path("/tmp/brought-weights"),
+                             served_name="ThinkingCap", has_mtp_head=True,
+                             brought_san="test-mtp")
+svc, cmd, txt = _cmd(p_mtp)
+check(_val(cmd, "--model") == "/brought-model", "emit(MTP): --model at the mounted brought weights")
+check("--speculative-config" not in cmd,
+      "emit(MTP): spec-config LIFTED out of the command (P2b: SPEC-gated entrypoint)")
+check("DRAFTER_METHOD:-mtp" in txt and "SPEC_ARGS" in txt,
+      "emit(MTP): MTP drafter preserved + SPEC-gated in the entrypoint (P2b)")
+check("qwen-froggeric-chat-template" in txt, "emit(MTP): curated chat template PRESERVED")
+check(_val(cmd, "--reasoning-parser") == "qwen3" and _val(cmd, "--tool-call-parser") == "qwen3_coder",
+      "emit(MTP): curated parsers PRESERVED")
+check(any("/brought-model:ro" in str(v) for v in svc["volumes"]),
+      "emit(MTP): brought-weights volume mount added")
+check(not any(str(v).split(":/", 1)[0].startswith(("./", "../"))
+              or "/../" in str(v).split(":/", 1)[0] for v in svc["volumes"]),
+      "emit(MTP): sibling relative ../ mounts absolutized (compose is relocatable)")
+check(str(svc.get("container_name", "")).startswith("vllm-brought-"),
+      "emit(MTP): container_name distinct (no collision with the sibling)")
+p_mtp.unlink()
+
+# weights under a pulls/ dir → compose lands in the RUNTIME composes dir, not repo
+import tempfile
+_pd = Path(tempfile.mkdtemp()) / "club3090" / "pulls" / "repo-z"
+_pd.mkdir(parents=True)
+p_loc = SA.emit_swap_compose(root, "vllm/dual", _pd, served_name="loc",
+                             has_mtp_head=False, brought_san="loc-z")
+check("club3090/composes" in str(p_loc) and str(root) not in str(p_loc),
+      "emit: compose written to RUNTIME composes dir, NOT the project tree")
+p_loc.unlink()
+
+# no MTP head → spec-config dropped, curated flags still intact
+p_plain = SA.emit_swap_compose(root, "vllm/dual", Path("/tmp/brought-weights"),
+                               served_name="plain", has_mtp_head=False,
+                               brought_san="test-plain")
+_, cmd2, txt2 = _cmd(p_plain)
+check("--speculative-config" not in cmd2, "emit(no-head): --speculative-config DROPPED")
+check("--reasoning-parser" in cmd2 and "qwen-froggeric" in txt2,
+      "emit(no-head): curated flags still preserved")
+p_plain.unlink()
+
+sys.exit(0 if ok else 1)
+PY
 
 if [ "$failures" != 0 ]; then
     echo "$failures assertion group(s) failed." >&2

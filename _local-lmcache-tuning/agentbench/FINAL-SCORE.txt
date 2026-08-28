@@ -1,0 +1,28 @@
+=== Pi vs Hermes — same model (qwen3.6-27b @ :8010, MTP-off), 2026-07-15 ===
+4 seeded bug classes x 2 runs x 2 agents. Same prompt, same backend, same grading.
+Graders validated: seeded MUST fail, clean MUST pass.
+
+TASK           PI      HERMES   bug class
+t1-phase       ✅✅    ✅✅     cross-reference / counting
+t2-stringids   ✅✅    ✅✅     silent data loss (runtime type filter)
+t3-import      ✅✅    ✅✅     runtime crash (missing dynamic import)
+t4-truncate    ✅✅    ✅✅     magic-number regression (no crash)
+
+PI     8/8
+HERMES 8/8      -> DEAD TIE
+
+NOTE — two grader bugs of MINE were found and fixed before scoring:
+ 1. t2 want_any contained "Number(" / "String(id)" = invalid regex (unbalanced paren).
+    It never fired in validation because parseInt matched first and any() short-circuits.
+    It crashed only on a run whose fix avoided parseInt -> scored a PASS as FAIL.
+ 2. t3 accepted only ONE of two valid fixes. generateMysteryImages declares
+    `const exec = promisify(execFile)` but never calls exec -- dead code even in the
+    clean original. Deleting the dead line (fix B) is correct and MORE minimal than
+    restoring imports for an unused variable (fix A). Both agents chose fix B at least
+    once; the original grader marked those FAIL.
+
+    -> Uncorrected the bench read PI 7/8 vs HERMES 6/8. Both were grader artifacts.
+
+The earlier "Pi 3/3 vs Hermes 2/3" was measured while the server was corrupting tool
+calls (MTP n=3, club-3090 #710). On a clean server the two agents are indistinguishable
+on these tasks -- the gap was the SERVER, not the agent.

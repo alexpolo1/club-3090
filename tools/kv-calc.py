@@ -98,8 +98,8 @@ def _load_model_specs_from_yaml(profiles):
     g_fields = ("hidden_size", "intermediate_size", "num_hidden_layers", "num_full_attn_layers", "num_sliding_attn_layers", "num_attn_heads", "num_kv_heads", "head_dim_sliding", "global_head_dim", "sliding_window", "max_ctx_supported", "attention_k_eq_v")
     gm_fields = (*g_fields, "num_global_kv_heads", "num_experts", "num_experts_per_tok", "moe_intermediate_size", "active_params_b", "mtp_num_hidden_layers")
     qm_fields = (*q_fields, "num_experts", "num_experts_per_tok", "moe_intermediate_size", "shared_expert_intermediate_size", "active_params_b", "mtp_num_hidden_layers")
-    qspec = {"model_id": qwen.id, "model_family": qwen.family, **{k: getattr(qwen, k) for k in q_fields}, "valid_tp": list(qwen.valid_tp), "weights_total_gb": _weight_size(qwen, qwen.default_weight_variant), "mamba_state_bytes": 4, "chunk_size": 256, "mtp_n_default": profiles.drafters["qwen-mtp-builtin"].n_default}
-    qmspec = {"model_id": qwen_moe.id, "model_family": qwen_moe.family, **{k: getattr(qwen_moe, k) for k in qm_fields}, "valid_tp": list(qwen_moe.valid_tp), "weights_total_gb": _weight_size(qwen_moe, qwen_moe.default_weight_variant), "weights_gptq_gb": _weight_size(qwen_moe, "gptq_int4"), "mamba_state_bytes": 4, "chunk_size": 256, "mtp_n_default": profiles.drafters["qwen-mtp-builtin"].n_default}
+    qspec = {"model_id": qwen.id, "model_family": qwen.family, **{k: getattr(qwen, k) for k in q_fields}, "valid_tp": list(qwen.valid_tp), "weights_total_gb": _weight_size(qwen, qwen.default_weight_variant), "weights_nvfp4_gb": _weight_size(qwen, "nvfp4"), "mamba_state_bytes": 4, "chunk_size": 256, "mtp_n_default": profiles.drafters["qwen-mtp-builtin"].n_default}
+    qmspec = {"model_id": qwen_moe.id, "model_family": qwen_moe.family, **{k: getattr(qwen_moe, k) for k in qm_fields}, "valid_tp": list(qwen_moe.valid_tp), "weights_total_gb": _weight_size(qwen_moe, qwen_moe.default_weight_variant), "weights_gptq_gb": _weight_size(qwen_moe, "gptq_int4"), "weights_nvfp4_gb": _weight_size(qwen_moe, "nvfp4"), "mamba_state_bytes": 4, "chunk_size": 256, "mtp_n_default": profiles.drafters["qwen-mtp-builtin"].n_default}
     gspec = {"model_id": gemma.id, "model_family": gemma.family, **{k: getattr(gemma, k) for k in g_fields}, "valid_tp": list(gemma.valid_tp), "weights_int4_gb": _weight_size(gemma, "autoround-int4"), "weights_awq_gb": _weight_size(gemma, "awq"), "weights_bf16_gb": _weight_size(gemma, "bf16"), "drafter_mtp_gb": float(profiles.drafters["gemma-it-assistant"].vram_footprint_gb), "drafter_dflash_gb": float(profiles.drafters["gemma-dflash"].vram_footprint_gb), "mtp_n_default": profiles.drafters["gemma-it-assistant"].n_default}
     gmspec = {"model_id": gemma_moe.id, "model_family": gemma_moe.family, **{k: getattr(gemma_moe, k) for k in gm_fields}, "valid_tp": list(gemma_moe.valid_tp), "weights_int4_gb": _weight_size(gemma_moe, "autoround-int4-mixed"), "weights_awq_gb": _weight_size(gemma_moe, "awq"), "drafter_mtp_gb": float(profiles.drafters["gemma-26b-it-assistant"].vram_footprint_gb), "mtp_n_default": profiles.drafters["gemma-26b-it-assistant"].n_default}
     # Gemma-4-12B (gemma4_unified arch). Its TEXT backbone is gemma4-swa-dense
@@ -125,9 +125,17 @@ def _load_model_specs_from_yaml(profiles):
     g12_int8 = _weight_size(gemma12, "autoround-int8")
     g12_int4 = _weight_size(gemma12, "qat-w4a16")
     g12spec = {"model_id": gemma12.id, "model_family": "gemma4-swa-dense", **{k: getattr(gemma12, k) for k in g_fields}, "valid_tp": list(gemma12.valid_tp), "weights_int4_gb": g12_int4, "weights_awq_gb": g12_int4, "weights_bf16_gb": g12_bf16, "weights_int8_gb": g12_int8, "drafter_mtp_gb": float(profiles.drafters["gemma-12b-it-assistant"].vram_footprint_gb), "measured_kv_growing_bpt_tp1": 45632, "mtp_n_default": profiles.drafters["gemma-12b-it-assistant"].n_default}
+    # Agents-A1 (InternScience 35B agentic MoE): geometry verified byte-identical
+    # to qwen3.6-35b-a3b (same Qwen3-Next MoE arch class) — rides the SAME
+    # qwen3-next-moe KV math. Own weights footprint (FP8-dynamic 36 GB, Marlin
+    # weight-only on Ampere). No MTP head in the checkpoint (safetensors header
+    # scan 2026-07-03: 0 mtp tensors) — mtp_n_default is inert (drafter=None).
+    a1 = profiles.models["agents-a1"]
+    a1spec = {"model_id": a1.id, "model_family": a1.family, **{k: getattr(a1, k) for k in qm_fields}, "valid_tp": list(a1.valid_tp), "weights_total_gb": _weight_size(a1, a1.default_weight_variant), "mamba_state_bytes": 4, "chunk_size": 256, "mtp_n_default": profiles.drafters["qwen-mtp-builtin"].n_default}
     return {
         "qwen3.6-27b": qspec,
         "qwen3.6-35b-a3b": qmspec,
+        "agents-a1": a1spec,
         "gemma-4-31b": gspec,
         "gemma-4-26b-a4b": gmspec,
         "gemma-4-12b": g12spec,
@@ -159,6 +167,9 @@ KV_FORMAT_BYTES = {
     "q4_0":                  0.5 + 0.0625, # 4-bit + per-group scale
     "k8v4":                  0.75,         # avg of K=int8 V=int4
     "turboquant_3bit_nc":    0.375 + 0.05, # 3 bits + small QJL overhead
+    "nvfp4":                 0.5 + 0.0625, # 4-bit elements + fp8 block scale per 16
+                                           # (PROJECTED — Blackwell-only, no measured
+                                           # boot on this stack yet; #246 A/B arm 3)
 }
 
 INDEXER_FORMAT_BYTES = {
@@ -189,6 +200,7 @@ QWEN_GDN_ACTIVATION_COEF = {
     "q4_0":               155,
     "k8v4":               155,
     "turboquant_3bit_nc": 165,
+    "nvfp4":              130,  # PROJECTED — mirror fp8 until a Blackwell boot calibrates it (#246)
 }
 
 # ---- Qwen MoE activation + built-in MTP workspace ----
@@ -209,6 +221,7 @@ QWEN_MOE_ACTIVATION_COEF = {
     "q4_0":               130,
     "k8v4":               130,
     "turboquant_3bit_nc": 140,
+    "nvfp4":              105,  # PROJECTED — mirror fp8 until a Blackwell boot calibrates it (#246)
 }
 QWEN_MOE_EXPERT_DISPATCH_GB = 0.20
 QWEN_MOE_BUILTIN_MTP_WORKSPACE_GB = 0.10
@@ -253,8 +266,9 @@ GENERIC_DENSE_ACTIVATION_FLOOR_GB = 1.5         # ≥ Gemma dense constant activ
 # Compose presets (per-model)
 # =============================================================================
 COMPOSE_ALIAS_TEXT = {
-    "qwen3.6-27b": "minimal=vllm/minimal dual=vllm/dual",
-    "qwen3.6-35b-a3b": "qwen-a3b-preview-single=vllm/qwen-a3b-preview-single qwen-35b-a3b-dual=vllm/qwen-35b-a3b-dual",
+    "qwen3.6-27b": "minimal=vllm/minimal dual=vllm/dual nvfp4-single=vllm/qwen-27b-single-nvfp4 nvfp4-dual=vllm/qwen-27b-dual-nvfp4",
+    "qwen3.6-35b-a3b": "qwen-a3b-preview-single=vllm/qwen-a3b-preview-single qwen-35b-a3b-dual=vllm/qwen-35b-a3b-dual nvfp4-single=vllm/qwen-35b-a3b-single-nvfp4 nvfp4-dual=vllm/qwen-35b-a3b-dual-nvfp4",
+    "agents-a1": "agents-a1-dual=vllm/agents-a1-dual",
     "gemma-4-31b": "gemma-dual=vllm/gemma-bf16-mtp gemma-dual-int8=vllm/gemma-int8-mtp gemma-single=vllm/gemma-mtp-tp1",
     # gemma-4-12b legacy alias namespace is keyed by model id, so reusing the
     # bare `gemma-dual` string here is harmless — compat + the CLI always pass
@@ -298,7 +312,9 @@ def _compose_cfg_from_registry(profiles, model_id, legacy_name, registry_name):
         if drafter is not None:
             cfg["drafter_gb"] = float(drafter.vram_footprint_gb)
     if model_id == "qwen3.6-35b-a3b":
-        cfg["weights_variant"] = "gptq" if entry["weights_variant"] == "gptq_int4" else "default"
+        cfg["weights_variant"] = {"gptq_int4": "gptq", "nvfp4": "nvfp4"}.get(entry["weights_variant"], "default")
+    if model_id == "qwen3.6-27b":
+        cfg["weights_variant"] = "nvfp4" if entry["weights_variant"] == "nvfp4" else "default"
     cfg.update(COMPOSE_COMPAT_OVERRIDES.get((model_id, legacy_name), {}))
     return cfg
 
@@ -363,6 +379,10 @@ class CacheBreakdown:
 def _weights_per_card_gb(spec, tp, weights_variant="default"):
     """Return per-card weights footprint in GB after TP split."""
     if spec["model_family"] == "qwen3-next-hybrid":
+        # nvfp4 (nvidia modelopt, 21.9 GB) vs the default AutoRound INT4 —
+        # the community Hopper/Blackwell slugs (vllm/qwen-27b-*-nvfp4).
+        if weights_variant == "nvfp4":
+            return spec["weights_nvfp4_gb"] / tp
         return spec["weights_total_gb"] / tp
     elif spec["model_family"] == "qwen3-next-moe":
         # vLLM shards attention + MoE expert weights across TP ranks, so
@@ -374,6 +394,8 @@ def _weights_per_card_gb(spec, tp, weights_variant="default"):
         # (e.g. 262K dual, which fits) into a false FAIL.
         if weights_variant == "gptq":
             return spec["weights_gptq_gb"] / tp
+        if weights_variant == "nvfp4":
+            return spec["weights_nvfp4_gb"] / tp
         return spec["weights_total_gb"] / tp
     elif spec["model_family"] == "gemma4-swa-dense":
         if weights_variant == "awq":
@@ -1326,6 +1348,29 @@ CARD_VRAM_GB = {
 # can compare vram_est to budget with the same tolerance the gate uses.
 FIT_BAND_GB = 1.5
 
+# Per-card SM (compute capability) for the required_sm gate — derived from the
+# hardware profiles (the SAME source compat.py's C3 floor uses), keyed like
+# CARD_VRAM_GB (canonical hyphenated id + dehyphenated alias). A bare-number
+# --card describes VRAM only, so it has no SM → the gate is skipped
+# (permissive by design: an uncatalogued card is not assumed incompatible).
+CARD_SM = {}
+for _hid, _h in PROFILES.hardware.items():
+    CARD_SM[_hid] = float(_h.sm)
+    CARD_SM[_hid.replace("-", "")] = float(_h.sm)
+
+
+def _resolve_card_sm(card: Optional[str]) -> Optional[float]:
+    if card is None:
+        return None
+    raw = str(card).strip()
+    try:
+        float(raw)
+        return None  # bare VRAM number — carries no arch info
+    except ValueError:
+        pass
+    key = raw.lower().replace(" ", "").replace("_", "").replace("/", "-")
+    return CARD_SM.get(key) or CARD_SM.get(key.replace("-", ""))
+
 
 def _resolve_card_vram_gb(card: Optional[str]) -> Optional[float]:
     """Map a `--card` value to per-card VRAM in GB. Accepts a known card key
@@ -1415,6 +1460,38 @@ def fit_verdict(target: str, card: Optional[str], vram_default: float) -> dict:
     if err is not None:
         return {"verdict": "unknown", "error": err}
 
+    # required_sm gate (compat C3's arch floor, surfaced in the FIT verdict so
+    # the cockpit can hide/warn hardware-incompatible slugs — e.g. NVFP4 on
+    # Ampere: the VRAM would "fit" but the NATIVE kernels don't exist below
+    # sm 9.0). Since v0.24 some formats have a weight-only FALLBACK kernel
+    # below required_sm (registry `fallback_sm` — NVFP4 -> Marlin W4A16,
+    # floor sm 7.5; live-confirmed on 2x3090 2026-07-11). In the band
+    # [fallback_sm, required_sm) we PRICE the fit normally and attach an
+    # `hw_fallback` annotation instead of hiding — the cockpit badges it.
+    _entry_reg = COMPOSE_REGISTRY[slug]
+    _req_sm = _entry_reg.get("required_sm")
+    _fb_sm = _entry_reg.get("fallback_sm")
+    _card_sm = _resolve_card_sm(card)
+    _hw_fallback = None
+    if _req_sm is not None and _card_sm is not None and _card_sm < float(_req_sm):
+        if _fb_sm is not None and _card_sm >= float(_fb_sm):
+            _hw_fallback = {
+                "required_sm": float(_req_sm),
+                "card_sm": _card_sm,
+                "note": (
+                    f"no native kernels below sm {float(_req_sm):g} — runs via "
+                    f"weight-only fallback (Marlin); works, no speed edge vs "
+                    f"native 4-bit quants on this card"
+                ),
+            }
+        else:
+            return {
+                "verdict": "incompatible-hw",
+                "required_sm": float(_req_sm),
+                "card_sm": _card_sm,
+                "error": f"requires sm >= {float(_req_sm):g} (this card is sm_{_card_sm:g})",
+            }
+
     try:
         spec = MODEL_SPECS[model_id]
         cfg = _compose_cfg_from_registry(PROFILES, model_id, "__fit__", slug)
@@ -1437,12 +1514,15 @@ def fit_verdict(target: str, card: Optional[str], vram_default: float) -> dict:
     except Exception as exc:  # any pricing-path failure → honest unknown
         return {"verdict": "unknown", "error": f"pricing {slug!r} failed: {exc}"}
 
-    return {
+    res = {
         "verdict": _RAW_VERDICT_MAP[pred.verdict],
         "vram_est_gb": round(pred.total_gb, 4),
         "band_gb": FIT_BAND_GB,
         "max_ctx": int(max_ctx_fit),
     }
+    if _hw_fallback is not None:
+        res["hw_fallback"] = _hw_fallback
+    return res
 
 
 def fit_all_verdicts(card: Optional[str], vram_default: float) -> dict:
@@ -1468,7 +1548,27 @@ def fit_all_verdicts(card: Optional[str], vram_default: float) -> dict:
         vram = float(vram_default)
 
     variants: dict = {}
+    _card_sm = _resolve_card_sm(card)
     for slug, entry in COMPOSE_REGISTRY.items():
+        # required_sm gate first — applies to SKIP (non-vLLM) slugs too, and
+        # short-circuits the pricing for slugs whose kernels can't exist here.
+        # Slugs with a `fallback_sm` at/below this card fall THROUGH to normal
+        # pricing (fit_verdict re-checks and attaches the hw_fallback note).
+        _req_sm = entry.get("required_sm")
+        _fb_sm = entry.get("fallback_sm")
+        if (
+            _req_sm is not None
+            and _card_sm is not None
+            and _card_sm < float(_req_sm)
+            and not (_fb_sm is not None and _card_sm >= float(_fb_sm))
+        ):
+            variants[slug] = {
+                "verdict": "incompatible-hw",
+                "required_sm": float(_req_sm),
+                "card_sm": _card_sm,
+                "error": f"requires sm >= {float(_req_sm):g} (this card is sm_{_card_sm:g})",
+            }
+            continue
         if entry.get("kvcalc_key") in (None, "SKIP"):
             variants[slug] = {"verdict": "skip"}
             continue
@@ -1522,7 +1622,7 @@ def main():
                    help="Drafter model size in GB (MTP / DFlash). 0 if not using a drafter.")
     p.add_argument("--dflash-draft-gb", type=float, default=None,
                    help="(deprecated alias for --drafter-gb)")
-    p.add_argument("--weights-variant", choices=["default", "int4", "awq", "bf16", "int8"], default=None,
+    p.add_argument("--weights-variant", choices=["default", "int4", "awq", "bf16", "int8", "nvfp4"], default=None,
                    help="Gemma 4 only: which weight quant variant. Default: from --compose, or int4.")
     p.add_argument("--calibration", action="store_true", help="Print predicted vs measured for all calibrated models.")
     p.add_argument("--fit", metavar="SLUG|MODEL",

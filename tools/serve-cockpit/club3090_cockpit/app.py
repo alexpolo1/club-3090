@@ -42,6 +42,7 @@ NEVER executed live — tests inject fakes and conftest blocks the real spawn.
 from __future__ import annotations
 
 import dataclasses
+import re
 from collections import OrderedDict
 from pathlib import Path
 from typing import NamedTuple, Optional
@@ -78,6 +79,7 @@ from club3090_tui_core.widgets.live_pane import LivePane
 
 from .data import (
     ActionPlan,
+    ArtifactInventory,
     BenchRow,
     ByoResult,
     CatalogEntry,
@@ -86,6 +88,7 @@ from .data import (
     EstateTelemetry,
     EvidenceReport,
     EvidenceTag,
+    GATE_STEPS,
     Measurement,
     MeasureVsBar,
     OptimizerReport,
@@ -105,6 +108,7 @@ from .data import (
     downgrade_fit_glyph,
     measurement_from_explain_columns,
     parse_ctx_label,
+    variant_quant,
 )
 from .services import CockpitData
 
@@ -112,12 +116,22 @@ from .services import CockpitData
 
 _STATUS_GLYPH: dict[str, str] = {
     "production": "✅",
-    "caveats": "⚠️",
+    # ⚠️ 👁️ ⏸️ 🗑️ carry a U+FE0F variation selector — Rich's cell_len reserves
+    # 2 cols but many terminals render them 1-wide, shifting every column after
+    # the status cell.  These replacements are Emoji_Presentation=Yes (no VS16),
+    # so cell_len == terminal width == 2 everywhere.  (Status is also the LAST
+    # catalog column now, so any residual slop has nothing to misalign.)
+    # caveats = an ORANGE text-presentation checkmark (U+2714 — colorable,
+    # unlike the ✅ emoji whose green is baked into the color font): reads as
+    # "works, with caveats" instead of the error-adjacent ❗ (user call
+    # 2026-07-11). Markup-wrapped — glyph consumers must render via markup
+    # (the DataTable cell wraps with Text.from_markup).
+    "caveats": "[orange1]✔[/orange1]",
     "experimental": "🧪",
     "incubating": "🐣",
-    "preview": "👁️",
-    "upstream-gated": "⏸️",
-    "deprecated": "🗑️",
+    "preview": "👀",
+    "upstream-gated": "🚧",
+    "deprecated": "🚫",
 }
 
 
@@ -134,6 +148,94 @@ def _error_headline(err: str) -> str:
 
 def _status_glyph(status: str) -> str:
     return _STATUS_GLYPH.get(status.lower(), status)
+
+
+_KV_LABELS = {
+    "int8_per_token_head": "int8-PTH", "fp8_e4m3": "fp8/e4m3",
+    "fp8_e5m2": "fp8/e5m2", "fp8": "fp8", "turboquant_3bit_nc": "tq3",
+    "turboquant_4bit_nc": "tq4", "bf16": "bf16", "fp16": "fp16",
+    "q4_0": "q4_0", "q4_1": "q4_1", "q5_0": "q5_0", "q8_0": "q8_0",
+}
+
+
+# Weights column — the label is DERIVED from the weights_variant token (the
+# compose <quant>/ dir name) by PATTERN, not by a hand-map keyed on full tokens:
+# the hand-map drifted immediately (18/30 catalog tokens fell to a naive
+# first-segment fallback that showed the PROVIDER prefix — "beellama",
+# "unsloth", "deepreinforce" — instead of the quant).  Precedence: an explicit
+# GGUF quant segment (q4km / q8kxl / iq4ks / q6kp …) wins; then the known
+# safetensors formats; else the model profile's `format:` (threaded through the
+# emit as row.weights_format) — the honest answer for fine-tune artifact slugs
+# whose token carries no quant segment (mudler-apex-compact → "gguf").
+_GGUF_SEG = re.compile(r"^i?q\d[a-z0-9_]*$")
+
+
+def _weights_label(e: "CatalogEntry") -> str:
+    """Compact weights-quant token for the catalog Weights column."""
+    wv = (e.weights_variant or "").lower()
+    if not wv:
+        return "—"
+    segs = wv.split("-")
+    for s in segs:
+        if _GGUF_SEG.match(s):
+            return s
+    if "nvfp4" in segs:
+        return "nvfp4"
+    if "w4a16" in segs:
+        return "w4a16"
+    if "awq" in segs:  # awq · awq-bf16-int4 · qat-awq-int4 — all int4 weights
+        return "awq4"
+    if "autoround" in segs:
+        return "int8·AR" if "int8" in segs else "int4·AR"
+    if "fp8" in segs:  # fp8 · fp8-dynamic
+        return "fp8"
+    if "bf16" in segs:
+        return "bf16"
+    # No quant segment in the token (custom-named mixed-quant packs like
+    # PRISM-PRO-DQ / APEX-MTP-I-*): prefer the entry's explicit quant_label
+    # (GGUF-header ground truth baked into the model YAML), then the coarse
+    # format ("gguf"), then the raw token.
+    return (
+        (getattr(e.row, "weights_quant_label", "") or "")
+        or (getattr(e.row, "weights_format", "") or "")
+        or wv
+    )
+
+
+def _kv_label(e: "CatalogEntry") -> str:
+    """Compact KV-cache-format token for the catalog KV column (from the registry)."""
+    kv = (getattr(e.row, "kv_format", "") or "").lower()
+    return _KV_LABELS.get(kv, kv or "—")
+
+
+# Spec Dec column — DERIVED from the registry `drafter` id (already in-app as
+# row.drafter; emitted at registry-emit.sh, threaded in services.py) → a compact
+# method[·mechanism] token, by PATTERN on the id (zero emit/guard change; the id
+# reliably encodes the mechanism).  DFlash is ALWAYS an external drafter, so it
+# needs no suffix; the built-in-vs-external split exists only WITHIN MTP, so the
+# suffix names the actual mechanism (`gguf` external GGUF drafter · `asst`
+# external assistant draft-model) — the "drafter type matters" distinction — not
+# a vague "ext".  The bare `MTP` = built-in head (the common qwen case).  The
+# slug detail card carries the full form (n= count + source).
+def _spec_token(drafter: str) -> str:
+    """Pure ``drafter``-id → compact spec-dec label.  '' when no drafter."""
+    dr = (drafter or "").strip().lower()
+    if not dr:
+        return ""
+    if "dflash" in dr:
+        return "DFlash"
+    if "ngram" in dr:
+        return "ngram"
+    if "assistant" in dr:      # gemma *-it-assistant → spec_method mtp_assistant
+        return "MTP·asst"
+    if "mtp" in dr:            # builtin head vs external gguf drafter
+        return "MTP·gguf" if "gguf" in dr else "MTP"
+    return "spec"              # unknown non-empty drafter — safety fallback
+
+
+def _spec_label(e: "CatalogEntry") -> str:
+    """Compact spec-dec method token for the catalog Spec Dec column ('—' = none)."""
+    return _spec_token(getattr(e.row, "drafter", "")) or "—"
 
 
 def _weights_glyph(e: CatalogEntry) -> str:
@@ -221,6 +323,140 @@ def profile_select_options(
     pairs = [(o.label, o.slug) for o in options]
     pairs.append(("✎ custom slug…", PROFILE_CUSTOM_SENTINEL))
     return pairs
+
+
+# ── Bring funnel (design §2b, maintainer UX decisions 2026-07-05) ─────────────
+# §2b-3 — artifact→engine compat is ABSOLUTE: a GGUF pick never sees a vLLM
+# slug; a safetensors repo never sees the llama.cpp family.  Tokens are the
+# _canon_engine_family space (which collapses ik-llama + llamacpp to ONE
+# "llama-cpp" family — both are GGUF engines, so the filter doesn't care;
+# the display label uses the precise switch_engine / slug prefix instead).
+_GGUF_ENGINE_FAMILIES = frozenset({"llama-cpp", "beellama"})
+_SAFETENSORS_ENGINE_FAMILIES = frozenset({"vllm", "sglang"})
+_TOPO_CARDS = {"single": 1, "dual": 2, "multi3": 3, "multi4": 4, "multi8": 8}
+# The weights may claim at most this fraction of a topology's TOTAL VRAM in
+# the DISPLAY filter — KV + runtime overhead need the rest.  Deliberately
+# generous: the funnel only HIDES what clearly cannot fit; borderline stays
+# visible and the real fit-check adjudicates.
+_FUNNEL_WEIGHTS_VRAM_FRAC = 0.90
+
+
+def funnel_slug_options(
+    variants: list["VariantRow"],
+    artifact_format: str,
+    *,
+    artifact_gb: Optional[float] = None,
+    vram_gb: Optional[float] = None,
+    gpu_count: Optional[int] = None,
+) -> list["ProfileOption"]:
+    """§2b-4/5 — the staged Bring funnel's slug options: EVERY catalog variant
+    that passes the artifact→engine compat filter (the filter already shrinks
+    the list, so no representative-collapsing here — distinct from
+    :func:`profile_templates`, which stays the pre-inspect short list), labeled
+    topology-FIRST (``topology/engine/model-quant · serving``) and sorted so
+    all models under the same topology/engine appear together.
+
+    Topology floor (maintainer rule, 2026-07-05): when the selected artifact's
+    size is known, HIDE topologies whose total VRAM can't hold the weights
+    (``artifact_gb > cards × vram_gb × 0.90``) — a 34G Q8 never shows single-
+    card slugs on a 24G card.  One-directional by design: larger topologies
+    are NEVER hidden (running a small quant across more GPUs for KV/concurrency
+    is legitimate).  Topologies needing more cards than the rig has are hidden
+    too.  Unknown sizes/rig → no floor (never guess-hide)."""
+    fams = (
+        _GGUF_ENGINE_FAMILIES if artifact_format == "gguf"
+        else _SAFETENSORS_ENGINE_FAMILIES
+    )
+    raw: list[tuple[str, str, ProfileOption]] = []
+    seen: set[str] = set()
+    for row in variants:
+        slug = (getattr(row, "slug", "") or "").strip()
+        if not slug or slug in seen:
+            continue
+        family = _canon_engine_family(getattr(row, "engine", "") or "")
+        if family not in fams:
+            continue
+        topo = _variant_topology(row) or ""
+        cards = _TOPO_CARDS.get(topo)
+        if cards is not None:
+            if gpu_count is not None and cards > gpu_count:
+                continue  # the rig can't host this topology at all
+            if (
+                artifact_gb is not None
+                and vram_gb is not None
+                and artifact_gb > cards * vram_gb * _FUNNEL_WEIGHTS_VRAM_FRAC
+            ):
+                continue  # weights alone exceed the topology's VRAM — floor
+        seen.add(slug)
+        model = (getattr(row, "model", "") or "").strip() or "—"
+        quant = variant_quant(row) or ""
+        # basename stem ONLY — some registry rows carry a subpath in `file`
+        # (dogfood r2: `dual/piehsoft-q6k/mtp.yml` rendered a duplicated tail)
+        stem = (getattr(row, "file", "") or "").rsplit("/", 1)[-1].rsplit(".", 1)[0]
+        # Display engine = the PRECISE token (switch_engine, else the slug's
+        # own prefix) — the canon family is filter-only (it can't tell
+        # ik-llama from llamacpp, which the label must).
+        eng = (
+            (getattr(row, "switch_engine", "") or "").strip()
+            or slug.split("/", 1)[0]
+        )
+        tail = f"{model}-{quant}" if quant else model
+        label = f"{topo or '—'}/{eng}/{tail}"
+        # Spec-dec facet (the Catalog Spec Dec column, mirrored into the funnel —
+        # a producer picks partly by which drafter a candidate enables).  Folded
+        # into the LABEL, not just appended, so two slugs identical on
+        # topology/engine/quant but differing only by drafter (e.g. fp8-mtp vs a
+        # no-drafter fp8) get disambiguated by `· MTP` instead of falling to the
+        # serving-stem tail.  Skipped for no-drafter slugs (keeps them clean).
+        spec = _spec_token(getattr(row, "drafter", ""))
+        if spec:
+            label = f"{label}  ·  {spec}"
+        status = (getattr(row, "status", "") or "").strip().lower()
+        raw.append((label, stem, ProfileOption(label=label, slug=slug, topology=topo or "—", status=status)))
+    # §2b dogfood r2 (maintainer): the label is topology/engine/model-quant
+    # (+ the spec-dec facet above) — a serving-stem tail duplicated the path axes
+    # and read as a second slug.  The stem is appended SOLELY to disambiguate
+    # genuine collisions that survive even the spec facet (two slugs sharing all
+    # axes AND drafter, e.g. fp8-mtp vs turbo).
+    counts: dict[str, int] = {}
+    for label, _stem, _o in raw:
+        counts[label] = counts.get(label, 0) + 1
+    out = [
+        ProfileOption(
+            label=(f"{label}  ·  {stem}" if (counts[label] > 1 and stem) else label),
+            slug=o.slug, topology=o.topology, status=o.status,
+        )
+        for (label, stem, o) in raw
+    ]
+    out.sort(key=lambda o: (_TOPO_ORDER.get(o.topology, 99), o.label))
+    return out
+
+
+def funnel_recommended(
+    options: list["ProfileOption"], defaults: Optional[list[dict]] = None
+) -> Optional[str]:
+    """§2b follow-up (live dogfood 2026-07-05): the funnel surfaces ONE
+    visible recommendation — the old rig-topology default picked a DUAL slug
+    for a 5 GiB gguf on a 2-card rig, which reads as 'the UI wants me on two
+    cards'.  Rule: the SMALLEST fitting topology wins (options are already
+    size-floored + topology-sorted, so that's the first group — the cheapest
+    config that holds the artifact); within it, prefer the registry's own
+    curated default for the (family, topology), else the first functional-
+    status option, else the group's first.  Pure."""
+    if not options:
+        return None
+    topo = options[0].topology
+    group = [o for o in options if o.topology == topo]
+    curated = _curated_default_map(defaults)
+    for o in group:
+        prefix = o.slug.split("/", 1)[0]
+        fam = _canon_engine_family(prefix) or prefix
+        if curated.get((fam, topo)) == o.slug:
+            return o.slug
+    for o in group:
+        if _status_is_functional(o.status):
+            return o.slug
+    return group[0].slug
 
 
 def _curated_default_map(
@@ -451,12 +687,14 @@ class HelpScreen(ModalScreen):
     # The producer Bring & Validate lane section — rendered ONLY on producer.
     _LANE_SECTION = """\
 [bold]Bring & Validate[/bold] (producer lane — the ① → ⑤ pipeline)
-  ① Bring:   fit-check an HF model (pull.sh --dry-run)
-  ② Serve:   [cyan]⏎[/cyan]/[cyan]g[/cyan] generate a compose + serve it untested (reconcile-gated)
+  ① Bring:   fit-check an HF model   [cyan]s[/cyan] Continue → ② Serve (weights on disk)   [cyan]D[/cyan] download weights
+  ② Serve:   [cyan]⏎[/cyan]/[cyan]g[/cyan] serve untested (Route-C = your weights · else catalog reproduction)
   ③ Gate:    [cyan]⏎[/cyan] launch validation step (gated)   [cyan]F[/cyan] full battery report.sh --full (~43-min · confirm · uses serving model)
-  ④ Measure: [cyan]⏎[/cyan] open report   [cyan]m[/cyan] vs catalog bar (read · flags protocol)   [cyan]s[/cyan] submit to localmaxxing (gated · never auto)
-  ⑤ Promote: [cyan]P[/cyan] ▸ Promote a fit-checked model to the catalog (scaffold + gated write)
-  [cyan]v[/cyan] ▸ Evaluate the running target via c3t (confirm-gated · mock-only this phase)
+  ④ Measure: [cyan]⏎[/cyan] open report   [cyan]m[/cyan] vs catalog bar (read)   [cyan]s[/cyan] submit to localmaxxing (gated · never auto)
+  ⑤ Promotion Preview: [cyan]P[/cyan] scaffold preview [yellow](preview only — no catalog write yet)[/yellow]
+  [cyan]v[/cyan] ▸ Evaluate via c3t [yellow](preview / mock this phase)[/yellow]
+  [cyan]Ctrl+n[/cyan] New bring — clear ①/② state and start over
+  Happy path: [cyan]2[/cyan] → paste repo → Inspect → Fit-check → [cyan]D[/cyan]? → [cyan]s[/cyan] → ⏎ Serve → ③ Gate → ④ Measure → [cyan]P[/cyan]
 """
 
     def __init__(self, *, surface: str = "consumer", **kwargs):
@@ -497,10 +735,12 @@ class HelpScreen(ModalScreen):
             "[bold]Run & Operate · Catalog[/bold]",
             "  [cyan]⏎[/cyan] serve selected slug (reconcile-gated confirm; F to Force the teardown)",
             "  [cyan]d[/cyan] set-default   [cyan]D[/cyan] clear-default",
-            "  [cyan]O[/cyan] ▸ Optimize for my card (v0.10.0 seam — not available yet)",
+            "  [cyan]O[/cyan] ▸ Optimize for my card [yellow](coming soon — v0.10.0)[/yellow]",
+            "",
             "[bold]Run & Operate · Orchestration[/bold]",
             "  [cyan]⏎[/cyan] switch scene   [cyan]k[/cyan] stop THIS model   [cyan]b[/cyan] restart serving   [cyan]n[/cyan] switch model (→ Catalog tab)   (writes gated)",
             "  [cyan]o[/cyan] stop ALL (tears down the whole estate)   [cyan]c[/cyan] power cap… (default 230W / clear / custom W)   (all gated)",
+            "  [cyan]N[/cyan] new pod (run several models on GPU subsets — name · slug · GPU set, fit-checked + gated)",
             "[bold]Run & Operate · Containers[/bold]",
             "  [cyan]l[/cyan] logs   [cyan]t[/cyan] top (read)   [cyan]s[/cyan] restart   [cyan]x[/cyan] stop   [cyan]X[/cyan] rm   (writes gated)",
             "[bold]Run & Operate · Doctor[/bold]  — is it serving correctly?",
@@ -528,8 +768,13 @@ class HelpScreen(ModalScreen):
             "",
             "[bold]Status glyphs[/bold]",
             "",
-            "  ✅ production   ⚠️  caveats   🧪 experimental",
-            "  🐣 incubating  👁️  preview   ⏸️  upstream-gated   🗑️  deprecated",
+            "  ✅ production   [orange1]✔[/orange1] caveats   🧪 experimental",
+            "  🐣 incubating  👀 preview   🚧 upstream-gated   🚫 deprecated",
+            "",
+            "[bold]Spec Dec column[/bold] (default drafter)",
+            "",
+            "  MTP built-in head · MTP·gguf ext GGUF drafter · MTP·asst ext assistant",
+            "  DFlash ext drafter · ngram · — none",
             "",
             "[bold]Fit glyphs (local card)[/bold]",
             "",
@@ -549,6 +794,14 @@ class HelpScreen(ModalScreen):
 # ── Run · Catalog ─────────────────────────────────────────────────────────
 
 
+# Catalog model-scope dropdown — a "model name only" filter (toggle-hidden, [\\]).
+# The model→slugs grouping the flat variant table drops is restored ALWAYS by the
+# table's "model" column + group-by-model sort (the switch.sh --list view); this
+# dropdown just narrows to one model.  The sentinel = "no scope" (all lanes show).
+_ALL_MODELS_VALUE = "__all_models__"
+_ALL_MODELS_LABEL = "All models"
+
+
 class CatalogPane(Container):
     """Catalog tab: DataTable populated from the enriched registry catalog."""
 
@@ -560,6 +813,15 @@ class CatalogPane(Container):
         height: 1;
         color: $text-muted;
         padding: 0 1;
+    }
+    CatalogPane #catalog-model-select {
+        height: 3;
+        width: 1fr;
+        margin: 0 1;
+        display: none;
+    }
+    CatalogPane #catalog-model-select.visible {
+        display: block;
     }
     CatalogPane #catalog-filter {
         height: 3;
@@ -574,7 +836,12 @@ class CatalogPane(Container):
     }
     CatalogPane #catalog-preview {
         height: auto;
-        max-height: 6;
+        /* F2 — the border eats 2 rows, so max-height 6 capped content at 4
+           lines and a WRAPPING caveat line clipped (the dual-fast case).
+           8 fits the 3 base lines + a caveat wrapped to 2-3; anything
+           pathological scrolls instead of silently clipping. */
+        max-height: 8;
+        overflow-y: auto;
         border: solid $primary;
         padding: 0 1;
         margin: 0 1;
@@ -589,6 +856,18 @@ class CatalogPane(Container):
 
     def compose(self) -> ComposeResult:
         yield Label("Loading catalog…", id="catalog-status")
+        # Model-scope dropdown — a "model name only" filter.  TOGGLE-HIDDEN like
+        # the text filter ([\\] reveals it) so it stays out of the Tab/focus chain;
+        # an always-visible focusable Select destabilised the suite.  The model
+        # grouping is shown ALWAYS via the table's "model" column + group-by-model
+        # sort (the switch.sh --list view); this dropdown is just the scope filter.
+        # Seeded with "All models"; populate() refills it in registry order.
+        yield Select(
+            [(_ALL_MODELS_LABEL, _ALL_MODELS_VALUE)],
+            id="catalog-model-select",
+            value=_ALL_MODELS_VALUE,
+            allow_blank=False,
+        )
         yield Input(placeholder="filter slug / topology / engine / model / status… (space = AND)", id="catalog-filter")
         table: DataTable = DataTable(id="catalog-table", zebra_stripes=True)
         table.cursor_type = "row"
@@ -603,7 +882,7 @@ class CatalogPane(Container):
             id="catalog-preview",
         )
         yield Label(
-            "[dim]\\[/] filter   \\[⏎] serve   \\[e] explain   "
+            "[dim]\\[\\\\] model   \\[/] filter   \\[⏎] serve   \\[e] explain   "
             "\\[d] set-default   \\[D] clear-default[/dim]",
             id="catalog-hint",
         )
@@ -617,13 +896,30 @@ class CatalogPane(Container):
         # fit verdict is a pick-the-serve decision input, shown when you ⏎ a row).
         # Fit is STILL computed (it feeds the pop-up + the serving-row exemption);
         # it just no longer occupies a Catalog column.
-        table.add_columns("slug", "topology", "engine", "ctx", "TPS (our rig)", "8pk (our rig)", "status")
+        # Column budget, left→right: identity (model · slug) → config the user
+        # picks by (weights · kv · spec) → money (ctx · TPS · 8pk) → topology/engine
+        # (largely slug-redundant, fold first on a narrow terminal) → status.
+        # `spec` groups with weights/kv (the serving-config facets): which drafter
+        # (MTP / MTP·gguf / MTP·asst / DFlash / — none) the slug enables by default.
+        # Status is deliberately LAST: its glyph is the one emoji-width column, so
+        # putting it at the tail means nothing follows it to misalign (belt +
+        # braces with the VS16-free glyphs in _STATUS_GLYPH).
+        # "(rig)" keeps the our-rig provenance at 4 chars ("our rig" cost 8 more).
+        table.add_columns("model", "slug", "weights", "kv", "spec", "ctx", "TPS (rig)", "8pk (rig)", "topo", "engine", "status")
         # Full enriched catalog, and the current filter substring.
         self._entries: list[CatalogEntry] = []
         self._filter: str = ""
+        # Model-scope dropdown selection ("" = all models); AND-combined with _filter.
+        self._model_filter: str = ""
+        # [h] toggle: hide 🗑️ deprecated slugs by default (mirrors `switch.sh --list`).
+        self._show_deprecated: bool = False
+        # Distinct model names (registry order) backing the dropdown — refreshed on load.
+        self._models: list[str] = []
         # N3: the slug currently live-serving (from the estate's matched_slug),
         # so its Run-catalog row carries a "● serving" badge.  "" → none serving.
         self._serving_slug: str = ""
+        # F9: the match grade for _serving_slug ("identity" | "shape" | "").
+        self._serving_confidence: str = ""
         # A6: live per-GPU free-VRAM (GB) from the last estate poll, used to
         # DOWNGRADE a "● fits-clean" glyph that would actually OOM right now (e.g.
         # GPU0 holding ComfyUI).  None → unknown (the fit column is then labelled
@@ -655,11 +951,34 @@ class CatalogPane(Container):
             self._entries = []
             table.clear()
             status_label.update(f"[red]Catalog error:[/red] {error}")
-            table.add_row("—", "—", "—", "—", "—", "—", "—")
+            table.add_row("—", "—", "—", "—", "—", "—", "—", "—", "—", "—")
             return
 
         self._entries = list(entries)
+        self._refresh_model_options()
         self._render_rows()
+
+    def _refresh_model_options(self) -> None:
+        """Refill the model-scope dropdown with the DISTINCT model names in
+        registry order (first-seen — same source switch.sh --list groups by), an
+        "All models" sentinel first.  Uses _set_select_options so the programmatic
+        refill doesn't fire Select.Changed (which would re-trigger the filter).
+        Preserves the current scope if that model still exists, else falls to All."""
+        models: list[str] = []
+        for e in self._entries:
+            if e.model and e.model not in models:
+                models.append(e.model)
+        self._models = models
+        options = [(_ALL_MODELS_LABEL, _ALL_MODELS_VALUE)] + [(m, m) for m in models]
+        keep = self._model_filter if self._model_filter in models else _ALL_MODELS_VALUE
+        if self._model_filter and self._model_filter not in models:
+            self._model_filter = ""  # the scoped model vanished from the catalog
+        try:
+            _set_select_options(
+                self.query_one("#catalog-model-select", Select), options, default=keep
+            )
+        except Exception:
+            pass
 
     def _render_rows(self) -> None:
         status_label = self.query_one("#catalog-status", Label)
@@ -668,47 +987,95 @@ class CatalogPane(Container):
 
         rows = self._filtered_entries()
         serving = (self._serving_slug or "").strip()
+        prev_model: Optional[str] = None  # blank-on-repeat → the switch.sh --list grouped look
         for e in rows:
-            # source provenance — flag a coarse markdown scrape so a measurement
-            # from BENCHMARKS.md is never mistaken for a structured record.
-            meas_src = e.measurement.source
+            # Measured columns come from the SHIPPED BASELINE (registry-emit
+            # join) — the BENCHMARKS.md scrape is gone from the catalog path.
+            # Honesty marker: † = the row was measured on an OLDER engine pin
+            # than the slug currently runs (staleness guard §2.2; re-bench
+            # owed — full badge/overlay treatment lands in slice 2).
             tps = e.measurement.tps_label
-            if meas_src == "benchmarks.md" and tps != "—":
-                tps = f"{tps}*"
+            if e.measurement.stale is True and tps != "—":
+                tps = f"{tps}[yellow]†[/yellow]"
             # N3: mark the live-serving row so the running model is visible at a
             # glance in Run.  Driven by the estate's matched_slug.
             slug_cell = e.slug
             is_serving_row = bool(serving and e.slug == serving)
             if is_serving_row:
-                slug_cell = f"[green]●[/green] {e.slug} [green]serving[/green]"
+                if (self._serving_confidence or "") == "shape":
+                    # F9: port/substring match — what's serving merely has this
+                    # row's SHAPE (its port / a name fragment); it is NOT verified
+                    # to BE this slug.  Never claim "serving" for a guess.
+                    slug_cell = f"[yellow]👤[/yellow] {e.slug} [yellow]port in use[/yellow]"
+                else:
+                    slug_cell = f"[green]●[/green] {e.slug} [green]serving[/green]"
             else:
                 # Download UX — a glyph for the on-disk state: ⏳NN% downloading,
                 # ⬇ absent (not downloaded), ⚠ partial.  present/unknown → clean.
                 dg = _weights_glyph(e)
                 if dg:
                     slug_cell = f"{dg} {e.slug}"
+            # Model cell — shown on the FIRST row of each model group only (rows are
+            # grouped by model, registry order), blank on the repeats → the
+            # switch.sh --list "model header, then its slugs" look.
+            model_cell = f"[cyan]{e.model}[/cyan]" if e.model != prev_model else ""
+            prev_model = e.model
             # The fit glyph is NO LONGER a Catalog column (it moved into the serve
             # confirm pop-up — see ConfirmActionScreen._render_serve_card).  Fit is
             # STILL computed here for the serving-row exemption + the pop-up; we
             # just don't emit a fit cell.
             table.add_row(
+                model_cell,
                 slug_cell,
-                e.topology,
-                e.engine,
+                _weights_label(e),
+                _kv_label(e),
+                _spec_label(e),
                 e.ctx_label or "—",
                 tps,
                 e.measurement.quality_label,
-                _status_glyph(e.status),
+                e.topology,
+                e.engine,
+                Text.from_markup(_status_glyph(e.status)),
             )
 
         banner = f"[yellow]{self._model_dir_note}[/yellow]  ·  " if self._model_dir_note else ""
-        if self._filter:
+        # Surface an active model scope (dropdown) the same way the text filter is shown.
+        scope = f"model: [cyan]{self._model_filter}[/cyan]  ·  " if self._model_filter else ""
+        # [h] hint: N 🗑️ deprecated + M hardware-incompatible slugs hidden
+        # (both 0 when revealed — one toggle, one bucket).
+        dep_n = self._deprecated_hidden_count()
+        inc_n = self._incompatible_hidden_count()
+        _hidden_bits = []
+        if dep_n:
+            _hidden_bits.append(f"+{dep_n} deprecated")
+        if inc_n:
+            _hidden_bits.append(f"+{inc_n} incompatible-hw")
+        dep_note = (
+            f"  ·  [dim]{' · '.join(_hidden_bits)} hidden — h[/dim]"
+            if _hidden_bits else ""
+        )
+        if self._filter or self._model_filter:
+            tail = f"  ·  filter: {self._filter!r}" if self._filter else ""
             status_label.update(
-                f"{banner}{len(rows)} / {len(self._entries)} variants  ·  filter: {self._filter!r}"
+                f"{banner}{scope}{len(rows)} / {len(self._entries)} variants{tail}{dep_note}"
             )
         else:
-            star = "  ([dim]*[/dim] = BENCHMARKS.md scrape)" if self._has_md_scrape() else ""
-            status_label.update(f"{banner}{len(self._entries)} variants loaded from registry{star}")
+            stale_note = (
+                "  ([yellow]†[/yellow][dim] = measured on an older engine pin — re-bench owed[/dim])"
+                if self._has_stale_baseline()
+                else ""
+            )
+            # ⑂ legend — shown whenever any row's numbers come from a COMMUNITY
+            # SUBMISSION (rig-labelled, never the local bar) so the marker on the
+            # TPS cell is decodable without opening the slug detail card.
+            sub_note = (
+                "  ([dim]⑂ = community-submitted numbers (other rig) — not a local baseline[/dim])"
+                if self._has_submission_measurement()
+                else ""
+            )
+            status_label.update(
+                f"{banner}{len(self._entries)} variants loaded from registry{stale_note}{sub_note}{dep_note}"
+            )
 
         # #9/A8 — keep the preview strip in sync with the cursor after a (re-)render
         # (enrichment mutates fit/measurement in place; the preview must reflect it).
@@ -729,15 +1096,22 @@ class CatalogPane(Container):
             except Exception:
                 pass
 
-    def set_serving_slug(self, slug: str) -> None:
+    def set_serving_slug(self, slug: str, confidence: str = "") -> None:
         """N3: set (or clear, with "") the live-serving slug + re-render so the
         Run-catalog row badge stays fresh.  Cheap: only re-renders when the slug
         actually changed (so the periodic Operate poll doesn't churn the Run
-        table on every tick).  Cursor + filter preserved via refresh_enriched."""
+        table on every tick).  Cursor + filter preserved via refresh_enriched.
+
+        F9: ``confidence`` is the match grade ("identity" | "shape" | "") — a
+        shape match renders the row badge as a guess, never as "serving"."""
         new = (slug or "").strip()
-        if new == (self._serving_slug or "").strip():
+        new_conf = (confidence or "").strip()
+        if new == (self._serving_slug or "").strip() and new_conf == (
+            self._serving_confidence or ""
+        ):
             return
         self._serving_slug = new
+        self._serving_confidence = new_conf
         # Re-render only if rows are present (mount-order safe).
         if self._entries:
             self.refresh_enriched()
@@ -761,12 +1135,40 @@ class CatalogPane(Container):
         if self._entries:
             self.refresh_enriched()
 
-    def _has_md_scrape(self) -> bool:
-        return any(e.measurement.source == "benchmarks.md" for e in self._entries)
+    def _has_stale_baseline(self) -> bool:
+        return any(e.measurement.stale is True for e in self._entries)
+
+    def _has_submission_measurement(self) -> bool:
+        """Any loaded row whose numbers came from a community submission (the
+        ⑂-marked cells) — drives the ⑂ legend in the status line."""
+        return any(
+            getattr(e.measurement, "submission_rig", None) for e in self._entries
+        )
 
     def _filtered_entries(self) -> list[CatalogEntry]:
+        # Hide 🗑️ deprecated slugs by default (mirrors `switch.sh --list`); [h]
+        # reveals them. Hardware-INCOMPATIBLE slugs (fit verdict incompatible-hw —
+        # the registry's required_sm exceeds this rig's card, e.g. NVFP4 on
+        # Ampere) share the SAME bucket: hidden by default, [h] reveals. The
+        # verdict lands with async fit enrichment, so such rows may be visible
+        # briefly on first paint, then fold away on refresh_enriched.
+        pool = (
+            self._entries
+            if self._show_deprecated
+            else [
+                e for e in self._entries
+                if (e.status or "").strip().lower() != "deprecated"
+                and not self._hw_incompatible(e)
+            ]
+        )
+        # Model-scope dropdown first — AND-combined with the text filter below.
+        base = (
+            [e for e in pool if e.model == self._model_filter]
+            if self._model_filter
+            else pool
+        )
         if not self._filter:
-            return self._entries
+            return self._grouped_by_model(base)
         # Multi-word filter is AND-of-substrings: split the query on whitespace and
         # keep a row only when EVERY term is a (case-insensitive) substring of the
         # row's searchable text.  A single word reduces to the old contiguous
@@ -774,19 +1176,87 @@ class CatalogPane(Container):
         # before, when the whole query was tested as one contiguous substring).
         terms = self._filter.lower().split()
         if not terms:
-            return self._entries
+            return self._grouped_by_model(base)
         out: list[CatalogEntry] = []
-        for e in self._entries:
+        for e in base:
             hay = (
                 f"{e.slug} {e.topology} {e.engine} {e.model} {e.status} {e.source}"
             ).lower()
             if all(t in hay for t in terms):
                 out.append(e)
-        return out
+        return self._grouped_by_model(out)
+
+    def _grouped_by_model(self, entries: list[CatalogEntry]) -> list[CatalogEntry]:
+        """Stable group-by-model: a model's lanes sit together, models in registry
+        (first-seen) order — the switch.sh --list view.  Intra-model order kept,
+        so it stays consistent with the dropdown options and the cursor mapping."""
+        rank = {m: i for i, m in enumerate(self._models)}
+        return sorted(entries, key=lambda e: rank.get(e.model, len(rank)))
 
     def set_filter(self, text: str) -> None:
         self._filter = (text or "").strip()
         self._render_rows()
+
+    def set_model_filter(self, model: str) -> None:
+        """Scope the catalog to one model name ("" / the All sentinel = all models).
+        AND-combines with the text filter.  Re-renders (cursor resets to the top of
+        the now-narrowed set)."""
+        new = (model or "").strip()
+        if new in ("", _ALL_MODELS_VALUE):
+            new = ""
+        if new == self._model_filter:
+            return
+        self._model_filter = new
+        self._render_rows()
+
+    def toggle_deprecated(self) -> None:
+        """[h] show/hide 🗑️ deprecated slugs (hidden by default, mirroring
+        `switch.sh --list`).  Re-renders (cursor resets to the top of the
+        now-widened / narrowed set)."""
+        self._show_deprecated = not self._show_deprecated
+        self._render_rows()
+
+    @staticmethod
+    def _hw_incompatible(e: CatalogEntry) -> bool:
+        """This rig's card can't run the slug's kernels (kv-calc fit verdict
+        incompatible-hw — required_sm above the local card's SM)."""
+        try:
+            return getattr(e.fit, "verdict", "") == "incompatible-hw"
+        except Exception:
+            return False
+
+    def _incompatible_hidden_count(self) -> int:
+        """How many hardware-incompatible slugs are currently hidden (0 once
+        revealed via [h]; deprecated slugs are counted by their own counter,
+        not double-counted here)."""
+        if self._show_deprecated:
+            return 0
+        return sum(
+            1 for e in self._entries
+            if self._hw_incompatible(e)
+            and (e.status or "").strip().lower() != "deprecated"
+        )
+
+    def _deprecated_hidden_count(self) -> int:
+        """How many 🗑️ deprecated slugs are currently hidden (0 once revealed)."""
+        if self._show_deprecated:
+            return 0
+        return sum(
+            1 for e in self._entries if (e.status or "").strip().lower() == "deprecated"
+        )
+
+    def toggle_model_select(self) -> None:
+        """[\\] toggle the model-scope dropdown (hidden by default, like the text
+        filter): reveal + focus, or hide + refocus the table.  Hidden → out of the
+        Tab/focus chain.  Hiding keeps the scope (it shows in the model column +
+        status line); re-open and pick "All models" to clear it."""
+        sel = self.query_one("#catalog-model-select", Select)
+        if "visible" in sel.classes:
+            sel.remove_class("visible")
+            self.query_one("#catalog-table", DataTable).focus()
+        else:
+            sel.add_class("visible")
+            sel.focus()
 
     def selected_entry(self) -> Optional[CatalogEntry]:
         """The CatalogEntry under the table cursor, or None."""
@@ -842,10 +1312,55 @@ class CatalogPane(Container):
             f"  [bold]{entry.slug}[/bold]  [dim]·[/dim]  {entry.engine}"
             f"  [dim]·[/dim]  {_status_glyph(entry.status)} {entry.status or '—'}",
             f"  [bold]fit[/bold]  {fit_line}  [dim]({fit_basis})[/dim]",
-            f"  [bold]ctx[/bold]  {entry.ctx_label or '—'}"
-            f"   [bold]measured[/bold]  {entry.measurement.tps_label} TPS"
-            f"  ·  8pk {entry.measurement.quality_label}",
         ]
+        # Slice 2b — the measured line is the shipped BAR with its provenance;
+        # a stale bar gets an explicit detail line; THIS RIG's newest corpus
+        # record renders as "yours" for the at-a-glance rig-vs-bar read.
+        m = entry.measurement
+        bar_line = (
+            f"  [bold]ctx[/bold]  {entry.ctx_label or '—'}"
+            f"   [bold]bar[/bold]  {m.tps_label} TPS  ·  8pk {m.quality_label}"
+        )
+        b = getattr(entry.row, "baseline", None) or {}
+        if m.source == "baseline" and b:
+            prov = " · ".join(
+                str(x) for x in (b.get("date"), b.get("rig"), b.get("submitted_by")) if x
+            )
+            if prov:
+                bar_line += f"  [dim]({prov})[/dim]"
+        lines.append(bar_line)
+        if m.stale is True and b:
+            lines.append(
+                f"  [yellow]† bar measured on {b.get('engine_pin')} — "
+                f"current pin {b.get('current_pin')}; re-bench owed[/yellow]"
+            )
+        lm = entry.local_measurement
+        if lm is not None:
+            dec = f"{lm.decode_tps:.0f}" if lm.decode_tps is not None else "—"
+            yours = f"  [bold]yours[/bold]  ~{dec} decode"
+            if lm.quality_8pk:
+                yours += f"  ·  8pk {lm.quality_8pk}"
+            if lm.quality_8pk_think_on:
+                yours += f"  [dim]· on {lm.quality_8pk_think_on}[/dim]"
+            yours += f"  [dim]({lm.date} · this rig)[/dim]"
+            lines.append(yours)
+        # Slice 3 — cross-rig submissions: rig-labeled, tier-badged, NEVER
+        # merged into the bar (a 5090 number is not this rig's bar). A
+        # submission-only entry shows bar "—" with only these lines.
+        for rc, s in sorted((b.get("submissions") or {}).items()):
+            n = s.get("narr_tps")
+            c = s.get("code_tps")
+            tps = (f"{n:.0f}" if n is not None else "—") + "/" + (
+                f"{c:.0f}" if c is not None else "—")
+            sub = f"  [bold]⑂ {rc}[/bold]  {tps} TPS"
+            if s.get("quality_8pk"):
+                sub += f"  ·  8pk {s['quality_8pk']}"
+            sub += (
+                f"  [dim]({s.get('tier')} · {s.get('date')} · {s.get('submitted_by')})[/dim]"
+            )
+            if s.get("stale") is True:
+                sub += "  [yellow]†[/yellow]"
+            lines.append(sub)
         note = (entry.status_note or "").strip()
         if note:
             lines.append(f"  [bold]caveat[/bold]  [yellow]{note}[/yellow]")
@@ -861,16 +1376,23 @@ class CatalogPane(Container):
             inp.focus()
 
     def close_filter_if_open(self) -> bool:
-        """Esc/cancel: hide + clear the filter and refocus the table. Returns
-        True if a filter was actually open (so the app can swallow the Esc)."""
+        """Esc/cancel: hide the text filter and/or the model dropdown overlay and
+        refocus the table. Returns True if one was open (so the app swallows the
+        Esc). Hiding the model dropdown KEEPS the scope (only hides the control)."""
+        closed = False
+        sel = self.query_one("#catalog-model-select", Select)
+        if "visible" in sel.classes:
+            sel.remove_class("visible")
+            closed = True
         inp = self.query_one("#catalog-filter", Input)
         if "visible" in inp.classes:
             inp.remove_class("visible")
             inp.value = ""
             self.set_filter("")
+            closed = True
+        if closed:
             self.query_one("#catalog-table", DataTable).focus()
-            return True
-        return False
+        return closed
 
 
 # ── Copy-to-clipboard support (Batch 4) ──────────────────────────────────────────
@@ -1304,24 +1826,45 @@ class ConfirmActionScreen(ModalScreen):
                 "continues) · [cyan]k[/cyan] cancels the download[/dim]"
             )
         # mode "download"
+        # Hardware-incompatibility interstitial (still proceedable): the slug's
+        # kernels can't run on THIS rig's card (required_sm gate) — say so
+        # BEFORE the size/disk pitch so nobody downloads 20 GB expecting it to
+        # boot here. Download stays allowed (staging for another rig / a future
+        # GPU is legitimate).
+        _hw_warn = ""
+        fv = getattr(entry, "fit", None) if entry is not None else None
+        if fv is not None and getattr(fv, "verdict", "") == "incompatible-hw":
+            req = getattr(fv, "required_sm", None)
+            got = getattr(fv, "card_sm", None)
+            req_s = f"sm ≥ {req:g}" if req is not None else "a newer GPU architecture"
+            got_s = f" — this rig's card is sm_{got:g}" if got is not None else ""
+            _hw_warn = (
+                f"  [red]⊘ no compatible hardware detected[/red] — this slug requires "
+                f"[bold]{req_s}[/bold] (Hopper/Blackwell class){got_s}.\n"
+                "  [yellow]It will NOT boot on this machine.[/yellow] You can still "
+                "download the weights\n"
+                "  (e.g. to stage them for another rig), but serving here will be refused.\n\n"
+            )
         if w is None or not w.hf_repo:
             return (
                 f"  [bold]{slug}[/bold]\n\n"
+                f"{_hw_warn}"
                 "  [yellow]⚠ no direct download recipe[/yellow] — these weights are "
                 "manual (no HF repo wired).\n  See the model profile's manual_note."
             )
-        size = f"~{w.size_gb:.0f} GiB" if w.size_gb else "size unknown"
+        size = f"~{w.size_gb:.0f} GB" if w.size_gb else "size unknown"
         fits, free_gb, need_gb = self.app._data.weights_fits_disk(w)  # type: ignore[attr-defined]
         disk = (
-            f"  [green]● fits[/green] — {free_gb:.0f} GiB free / ~{need_gb:.0f} GiB needed"
+            f"  [green]● fits[/green] — {free_gb:.0f} GB free / ~{need_gb:.0f} GB needed"
             if fits else
-            f"  [red]✗ may not fit[/red] — {free_gb:.0f} GiB free / ~{need_gb:.0f} GiB needed"
+            f"  [red]✗ may not fit[/red] — {free_gb:.0f} GB free / ~{need_gb:.0f} GB needed"
         )
         warn = ""
         if (getattr(entry, "weights_state", "") or "") == WEIGHTS_PARTIAL:
             warn = "  [yellow]⚠ partial download on disk — Download resumes it[/yellow]\n"
         return (
             f"  [bold]{slug}[/bold]   [dim]weights not on disk[/dim]\n"
+            f"{_hw_warn}"
             f"  repo   [dim]{w.hf_repo}[/dim]   ({size})\n"
             f"{disk}\n"
             f"{warn}\n"
@@ -1370,6 +1913,16 @@ class ConfirmActionScreen(ModalScreen):
                 if fv.band_gb is not None:
                     fit_line += f" / {float(fv.band_gb):.1f} GiB band"
             lines.append(f"  [bold]fit[/bold]    {fit_line}")
+            if fv.verdict == "incompatible-hw":
+                req = fv.required_sm
+                got = fv.card_sm
+                req_s = f"sm ≥ {req:g}" if req is not None else "a newer GPU architecture"
+                got_s = f" — this rig's card is sm_{got:g}" if got is not None else ""
+                lines.append(
+                    f"  [red]⊘ no compatible hardware detected[/red] — requires "
+                    f"{req_s} (Hopper/Blackwell class){got_s}. "
+                    "[yellow]Serving here will NOT boot.[/yellow]"
+                )
             note = (entry.status_note or "").strip()
             if note:
                 lines.append(f"  [bold]caveat[/bold] [yellow]{note}[/yellow]")
@@ -1812,6 +2365,10 @@ class OperateOrchPane(Container):
                 yield Label("GPU1", classes="gpu-card-title")
                 yield Static("[dim]querying nvidia-smi…[/dim]", id="gpu1-bar")
             yield Static("[dim]reading estate…[/dim]", id="serving-line")
+            # C1 (#610 Phase C): pods (estate instances) grouped with their
+            # GPUs stacked + a placement health badge. Shown only when the
+            # estate file declares ≥1 pod; empty otherwise.
+            yield Static("", id="pod-view")
             yield Static("[dim]reading health.sh…[/dim]", id="doctor-line")
             yield Label("Scenes  [dim](⏎ to switch — gated)[/dim]", id="scene-heading")
             scene_table: DataTable = DataTable(
@@ -1883,6 +2440,7 @@ class OperateOrchPane(Container):
         self._populate_error(state)
         self._populate_gpus(state)
         self._populate_serving(state)
+        self._populate_pods(state)
         self._populate_doctor(state)
         self._populate_scenes(state.scenes)
         # #11-ext — re-render the scene preview every poll (NOT only when the scene
@@ -1929,12 +2487,24 @@ class OperateOrchPane(Container):
             line.update("[dim]○ no model serving[/dim]")
             return
         parts: list[str] = []
+        conf = (getattr(tgt, "match_confidence", "") or "").strip()
         if model:
             parts.append(f"[green]{model}[/green]")
         if slug:
-            parts.append(f"[dim]{slug}[/dim]")
+            if conf == "shape":
+                # F9: port/substring match — the slug is the matched SHAPE, not
+                # the verified identity of what's serving.  Say so.
+                parts.append(f"[yellow]👤[/yellow] [dim]on {slug} shape[/dim]")
+            else:
+                parts.append(f"[dim]{slug}[/dim]")
         if port:
-            parts.append(f"[dim]:{port}[/dim]")
+            # F3: the USABLE endpoint — full LAN URL + auth status, not a bare
+            # port. Same derivation as switch.sh's ready-line (services.lan_ip).
+            try:
+                lan = self.app._data.lan_ip()
+            except Exception:
+                lan = "localhost"
+            parts.append(f"http://{lan}:{port}/v1 [dim]· no auth · \\[u] copy[/dim]")
         elif url:
             parts.append(f"[dim]{url}[/dim]")
         head = "[green]▶[/green] Serving: " + "  ·  ".join(parts)
@@ -1989,6 +2559,53 @@ class OperateOrchPane(Container):
         if not bits:
             return ""
         return "\n   " + "  ·  ".join(bits)
+
+    def _populate_pods(self, state: EstateState) -> None:
+        """C1 (#610 Phase C): render the estate's PODS (instances) grouped —
+        each pod header (name · slug · :port · state · placement badge) with
+        its member GPUs stacked beneath, and a trailing 'free GPUs' line. Reads
+        the `active_estate.instances` block of the report-state poll (which now
+        carries the per-instance placement verdict, D3). With no pods yet it
+        still shows a one-line affordance ([N] new pod) so the feature is
+        discoverable on a fresh (empty-estate) setup."""
+        view = self.query_one("#pod-view", Static)
+        est = (getattr(state, "estate_report", None) or {}).get("active_estate") or {}
+        instances = est.get("instances") if isinstance(est, dict) else None
+        if not instances:
+            # Discoverability: no pods is the DEFAULT — surface the create key
+            # rather than rendering nothing (the feature was invisible before).
+            view.update("[bold]Pods[/bold]  [dim]none yet — [/dim][cyan]N[/cyan][dim] new pod (run several models on GPU subsets)[/dim]")
+            return
+        total_gpus = len(getattr(state, "gpus", []) or [])
+        claimed = {g for inst in instances for g in (inst.get("gpus") or [])}
+        free = sorted(i for i in range(total_gpus) if i not in claimed) if total_gpus else []
+        lines: list[str] = [f"[bold]Pods[/bold]  [dim]({len(instances)} · {len(claimed)}/{total_gpus or '?'} GPUs claimed)[/dim]"]
+        for inst in instances:
+            name = str(inst.get("name") or "?")
+            slug = str(inst.get("compose") or inst.get("slug") or "?")
+            port = inst.get("port")
+            running = inst.get("running")
+            gpus = inst.get("gpus") or []
+            placement = (inst.get("placement") or {}).get("placement", "unknown")
+            # State glyph + placement badge (the C1 health signal, fed by the
+            # Phase-A assertion via D3 — never renders requested-but-not-actual).
+            if running is True:
+                state_glyph = "[green]●[/green]"
+                badge = {
+                    "ok": "  [green]✓ placed[/green]",
+                    "mismatch": "  [red]⚠ PLACEMENT MISMATCH[/red]",
+                }.get(placement, "  [dim]placement …[/dim]")
+            elif running is False:
+                state_glyph, badge = "[dim]○[/dim]", "  [dim]down (plan)[/dim]"
+            else:
+                state_glyph, badge = "[yellow]◐[/yellow]", "  [yellow]liveness unknown[/yellow]"
+            port_s = f":{port}" if port else ""
+            lines.append(f"  {state_glyph} [bold]{name}[/bold]  [dim]{slug}{port_s}[/dim]{badge}")
+            # GPUs stacked under the pod header.
+            gpu_s = " ".join(f"GPU{g}" for g in gpus) if gpus else "[dim](none)[/dim]"
+            lines.append(f"      [dim]└─[/dim] {gpu_s}")
+        lines.append(f"  [dim]free: {('GPU' + ' GPU'.join(map(str, free))) if free else '(none)'}[/dim]")
+        view.update("\n".join(lines))
 
     def populate_power_cap(self, st: PowerCapState) -> None:
         # #10(a): cache the active cap per GPU so the GPU cards can annotate it.
@@ -2315,7 +2932,12 @@ class OperateContainersPane(Container):
         yield ct
         with TabbedContent(id="drill-tabs"):
             with TabPane("Logs", id="drill-tab-logs"):
-                yield LivePane(id="drill-logs")
+                # F8 — pane-specific idle copy (the shared LivePane default once
+                # leaked test-runner wording into this docker-logs drill).
+                yield LivePane(
+                    id="drill-logs",
+                    placeholder="Select a running container — its docker logs stream here.",
+                )
             with TabPane("Top", id="drill-tab-stats"):
                 yield Static("[dim]highlight a container (move cursor) or press [t] — docker top loads[/dim]", id="drill-stats")
             with TabPane("Config", id="drill-tab-config"):
@@ -2430,7 +3052,9 @@ class OperateContainersPane(Container):
                     c.kind,
                     c.engine or "—",
                     str(c.host_port) if c.host_port else "—",
-                    c.slug or "—",
+                    # F9: badge a port/substring (shape) match — the slug is a
+                    # guess for this container, not a verified identity.
+                    (f"👤 {c.slug}" if getattr(c, "match_confidence", "") == "shape" and c.slug else (c.slug or "—")),
                 )
         # FIX 1 — restore the cursor by key: if the selected container still
         # exists, move to its new index; if it's gone, clamp the OLD index; if the
@@ -2486,7 +3110,12 @@ class OperateContainersPane(Container):
             f"  [bold]Kind[/bold]       {con.kind}",
             f"  [bold]Port[/bold]       {con.host_port or '—'} → {con.internal_port or '—'}",
             f"  [bold]Engine[/bold]     {con.engine or '—'}",
-            f"  [bold]Slug[/bold]       {con.slug or '[dim]unmatched[/dim]'}",
+            f"  [bold]Slug[/bold]       "
+            + (
+                f"👤 {con.slug} [dim](shape match — port/substring, not an exact container)[/dim]"
+                if getattr(con, "match_confidence", "") == "shape" and con.slug
+                else (con.slug or "[dim]unmatched[/dim]")
+            ),
         ]
         if variant is not None:
             lines.append(f"  [bold]Compose[/bold]    [dim]{getattr(variant, 'compose_path', '') or '—'}[/dim]")
@@ -2562,6 +3191,12 @@ class ValidateRunPane(Container):
         max-height: 14;
         margin: 0 1 1 1;
     }
+    ValidateRunPane #run-target-banner {
+        padding: 0 1;
+        margin: 0 1 1 1;
+        color: $text;
+        text-style: bold;
+    }
     ValidateRunPane #run-step-preview {
         height: auto;
         max-height: 5;
@@ -2570,10 +3205,12 @@ class ValidateRunPane(Container):
         margin: 0 1 1 1;
         color: $text;
     }
-    ValidateRunPane #run-gotchas {
-        border: solid $warning;
-        padding: 0 1;
+    ValidateRunPane #run-gotchas-wrap {
         margin: 0 1 1 1;
+        height: auto;
+    }
+    ValidateRunPane #run-gotchas {
+        padding: 0 1;
         height: auto;
         color: $text-muted;
     }
@@ -2589,23 +3226,41 @@ class ValidateRunPane(Container):
     """
 
     def compose(self) -> ComposeResult:
-        yield Label("Run  [dim](⏎ launches the selected step — confirm-gated)[/dim]", id="run-heading")
+        # Phase 2 hierarchy: target → ladder → preview → LivePane → gotchas last.
+        yield Label(
+            "Gate  [dim](⏎ launches the selected step — confirm-gated)[/dim]",
+            id="run-heading",
+        )
+        yield Static(
+            "[dim]Target: (no serving model yet — finish ② Serve or start a catalog slug)[/dim]",
+            id="run-target-banner",
+        )
         t: DataTable = DataTable(id="run-ladder-table", zebra_stripes=True, show_cursor=True)
         t.cursor_type = "row"
         yield t
-        # N8 — a compact preview of the highlighted validation step: what it runs
-        # + its blurb (not only on ⏎-launch).  A pure LOCAL read off the ladder
-        # row — mirrors the catalog / scene / evidence highlight-preview pattern.
         yield Static(
             "[dim]highlight a step (move cursor) to preview what it runs[/dim]",
             id="run-step-preview",
         )
-        yield Static(_TUNE_GOTCHAS, id="run-gotchas")
-        yield LivePane(id="run-output")
+        yield LivePane(
+            id="run-output",
+            placeholder="Ready. Launch a validation run (⏎ on a step) — output streams here.",
+        )
+        from textual.widgets import Collapsible
+
+        with Collapsible(title="Reading the results — gotchas", collapsed=True, id="run-gotchas-wrap"):
+            yield Static(_TUNE_GOTCHAS, id="run-gotchas")
         yield Label(
-            "[dim]\\[⏎] launch selected (heavy — confirm) · streams below[/dim]",
+            "[dim]\\[⏎] launch selected (heavy — confirm) · streams above[/dim]",
             id="run-hint",
         )
+
+    def set_target_banner(self, text: str) -> None:
+        """Phase 2 — validation target line (model @ url · source)."""
+        try:
+            self.query_one("#run-target-banner", Static).update(text)
+        except Exception:
+            pass
 
     # A9: outcome glyph vocabulary — reuses DoctorPane's step_glyph language so a
     # cleared gate reads the same everywhere.  ·(unrun) / ⟳(running) / ✓ / ✗ / ⚠.
@@ -2928,11 +3583,45 @@ class DoctorPane(Container):
         body.update("\n".join(lines))
 
 
+def _age_label(secs: int) -> str:
+    """Compact 'how long ago' label for the F10 live/stale evidence rows."""
+    if secs < 60:
+        return f"{secs}s"
+    if secs < 3600:
+        return f"{secs // 60}m"
+    return f"{secs // 3600}h{(secs % 3600) // 60:02d}m"
+
+
+def _gate_ladder(et: EvidenceTag) -> str:
+    """F10 — one-line gate ladder for a live/incomplete run.
+
+    ``✓`` done (with duration) · ``▶`` the step running now · ``·`` not yet
+    reached.  Steps rendered positionally from GATE_STEPS; a step that was
+    skipped (--skip/--resume) simply never turns ✓ — the ▶ marker carries the
+    truth of what is actually executing."""
+    done = {s: secs for s, secs in et.steps_done}
+    parts: list[str] = []
+    for s in GATE_STEPS:
+        if s in done:
+            parts.append(f"[green]✓[/green]{s} [dim]{_age_label(int(done[s]))}[/dim]")
+        elif s == et.live_step:
+            parts.append(f"[yellow]▶{s}[/yellow]")
+        else:
+            parts.append(f"[dim]·{s}[/dim]")
+    return "  ".join(parts)
+
+
 class ValidateEvidencePane(Container):
     """Validate / Evidence tab: real ``results/rebench/<tag>/`` run list from
     ``evidence_list()``; ``⏎`` opens the paste-ready report (``evidence_report``)
     in a modal (reuses the history_view pattern), ``s`` stages the gated
-    submit-to-localmaxxing for the selected tag (confirm modal; never auto)."""
+    submit-to-localmaxxing for the selected tag (confirm modal; never auto).
+
+    F10 — doubles as the live gate-run OBSERVER: a tag dir with no REPORT.md is
+    a run in flight (badged ▶, ladder + live tail in the preview, 4s self
+    refresh) or an aborted one (⚠ incomplete).  Renders script-owned artifacts
+    only (timings.json + step logs) — works for CLI-launched runs, never
+    executes anything."""
 
     DEFAULT_CSS = """
     ValidateEvidencePane {
@@ -2969,21 +3658,22 @@ class ValidateEvidencePane(Container):
     """
 
     def compose(self) -> ComposeResult:
-        yield Label("Evidence", id="evidence-heading")
+        yield Label(
+            "Measure  [dim]— compare evidence to the catalog bar[/dim]",
+            id="evidence-heading",
+        )
         yield Label("Loading run tags…", id="evidence-status")
         et: DataTable = DataTable(id="evidence-table", zebra_stripes=True, show_cursor=True)
         et.cursor_type = "row"
         yield et
-        # N8 — a compact preview of the highlighted run tag (its numbers/summary
-        # on highlight, not only on ⏎-open): the artifacts present + the scraped
-        # TL;DR.  A pure LOCAL read off the EvidenceTag — mirrors the catalog /
-        # scene highlight-preview pattern.  The full report stays behind ⏎.
         yield Static(
             "[dim]highlight a run tag (move cursor) to preview its artifacts + TL;DR[/dim]",
             id="evidence-preview",
         )
         yield Label(
-            "[dim]\\[⏎] open report   \\[m] vs catalog bar   \\[s] submit to localmaxxing (gated · never auto)[/dim]",
+            "[dim]\\[⏎] open report   ·   "
+            "[bold]\\[m][/bold] vs catalog bar   ·   "
+            "[bold]\\[s][/bold] submit (gated · never auto)[/dim]",
             id="evidence-hint",
         )
 
@@ -2991,21 +3681,57 @@ class ValidateEvidencePane(Container):
         t = self.query_one("#evidence-table", DataTable)
         t.add_columns("tag", "date", "report", "internal", "soak", "TL;DR")
         self._tags: list[EvidenceTag] = []
+        # F10 — live gate-run observer: while a run is in flight the list
+        # re-reads itself so the ladder + tail stay fresh (a producer facing a
+        # silent 3-hr gate otherwise assumes a hang).  Paused whenever nothing
+        # is live — populate() resumes/pauses it from the data, so CLI-launched
+        # runs picked up by any refresh start the ticking too.
+        self._live_timer = self.set_interval(4.0, self._live_tick, pause=True)
+
+    def _live_tick(self) -> None:
+        """F10 — periodic re-read while a run is live (READ; observer only)."""
+        try:
+            self.app.load_evidence()  # type: ignore[attr-defined]
+        except Exception:
+            pass
 
     def populate(self, tags: list[EvidenceTag]) -> None:
         status = self.query_one("#evidence-status", Label)
         t = self.query_one("#evidence-table", DataTable)
+        saved_row = t.cursor_row  # F10: periodic refresh must not yank the cursor
         t.clear()
         self._tags = list(tags)
+        # F10 — tick only while a run is in flight.
+        try:
+            if any(et.live for et in tags):
+                self._live_timer.resume()
+            else:
+                self._live_timer.pause()
+        except Exception:
+            pass
         if not tags:
             status.update("[dim]no runs under results/rebench/[/dim]")
             t.add_row("[dim]—[/dim]", "—", "—", "—", "—", "—")
             return
         for et in tags:
             yn = lambda b: "[green]✓[/green]" if b else "[dim]·[/dim]"
+            tag_cell = et.tag
             tldr = (et.tldr[:48] + "…") if len(et.tldr) > 49 else (et.tldr or "—")
-            t.add_row(et.tag, et.date or "—", yn(et.has_report), yn(et.has_internal), yn(et.has_soak), tldr)
+            if et.live:
+                # F10 — a run in flight: badge the row + say what's running now.
+                tag_cell = f"[green]▶[/green] {et.tag}"
+                step = et.live_step or "starting"
+                tldr = f"[green]running[/green] — {step} · {len(et.steps_done)}/{len(GATE_STEPS)} steps done"
+            elif et.stale:
+                tag_cell = f"[yellow]⚠[/yellow] {et.tag}"
+                tldr = f"[yellow]incomplete[/yellow] [dim](no REPORT.md · quiet {_age_label(et.age_secs)})[/dim]"
+            t.add_row(tag_cell, et.date or "—", yn(et.has_report), yn(et.has_internal), yn(et.has_soak), tldr)
         status.update(f"{len(tags)} run tag(s) under results/rebench/")
+        try:
+            if t.row_count and saved_row > 0:
+                t.move_cursor(row=min(saved_row, t.row_count - 1), animate=False)
+        except Exception:
+            pass
         # N8 — keep the preview in sync with the cursor after a (re-)populate.
         try:
             self.render_preview(self.selected_tag())
@@ -3032,6 +3758,28 @@ class ValidateEvidencePane(Container):
             return
         from rich.markup import escape
 
+        if tag.live:
+            # F10 — a run in flight: the ladder + the active step's live tail.
+            lines = [
+                f"  [green]▶ RUNNING[/green]  [bold]{escape(tag.tag)}[/bold]"
+                f"  [dim]· last write {_age_label(tag.age_secs)} ago[/dim]",
+                f"  {_gate_ladder(tag)}",
+            ]
+            for tl in (tag.live_tail or "").splitlines()[-4:]:
+                lines.append(f"  [dim]│[/dim] {escape(tl)}")
+            if not tag.live_tail:
+                lines.append("  [dim]│ (no step output yet)[/dim]")
+            body.update("\n".join(lines))
+            return
+        if tag.stale:
+            lines = [
+                f"  [yellow]⚠ INCOMPLETE[/yellow]  [bold]{escape(tag.tag)}[/bold]"
+                f"  [dim]· no REPORT.md · quiet {_age_label(tag.age_secs)}[/dim]",
+                f"  {_gate_ladder(tag)}",
+                "  [dim]aborted or orphaned — re-run with --resume to continue from its artifacts[/dim]",
+            ]
+            body.update("\n".join(lines))
+            return
         yn = lambda b: "[green]✓[/green]" if b else "[dim]·[/dim]"
         lines = [
             f"  [bold]{escape(tag.tag)}[/bold]"
@@ -3385,6 +4133,81 @@ class SettingsScreen(ModalScreen):
         self.app.pop_screen()
 
 
+class PodCreateScreen(ModalScreen):
+    """C2 (#610 Phase C): compose a new pod (a model on a GPU set + port).
+    Collects name · slug · GPU set, then ``dismiss``es the params — the app
+    routes them through pod.sh create (which runs the D1 fit-vs-set +
+    validate_estate gates and refuses a bad set), matching the codebase rule
+    that a modal never touches the rig itself. dismiss: ``{"name","slug",
+    "gpus"}`` or ``None`` on cancel."""
+
+    DEFAULT_CSS = """
+    PodCreateScreen {
+        align: center middle;
+    }
+    PodCreateScreen > Vertical {
+        width: 84;
+        height: auto;
+        border: thick $accent;
+        background: $surface;
+        padding: 1 2;
+    }
+    PodCreateScreen .cc-title { text-style: bold; color: $accent; margin-bottom: 1; }
+    PodCreateScreen .cc-field { margin-top: 1; }
+    PodCreateScreen Input { margin-bottom: 1; }
+    """
+
+    BINDINGS = [
+        Binding("ctrl+s", "save", "Create", show=True, priority=True),
+        Binding("escape", "cancel", "Cancel", show=True),
+    ]
+
+    def __init__(self, free_gpus: list[int], slugs: list[str], **kwargs):
+        super().__init__(**kwargs)
+        self._free_gpus = free_gpus or []
+        self._slugs = slugs or []
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            yield Label("New pod", classes="cc-title")
+            yield Label("Name", classes="cc-field")
+            yield Input(placeholder="e.g. coder", id="cc-name")
+            yield Label("Model / slug", classes="cc-field")
+            yield Select(
+                [(s, s) for s in self._slugs],
+                allow_blank=True, id="cc-slug",
+            )
+            free = ",".join(str(g) for g in self._free_gpus)
+            yield Label(
+                f"GPUs  [dim](comma-separated indices; count must match the slug's TP. "
+                f"free now: {free or 'none'})[/dim]",
+                classes="cc-field",
+            )
+            yield Input(value=free, placeholder="e.g. 1,2", id="cc-gpus")
+            yield Label(
+                "[dim]Ctrl+S create · Esc cancel · the create is fit-checked against the "
+                "selected GPUs and confirmed before it writes[/dim]",
+                classes="cc-field",
+            )
+            yield Footer()
+
+    def action_save(self) -> None:
+        name = self.query_one("#cc-name", Input).value.strip()
+        slug_val = self.query_one("#cc-slug", Select).value
+        slug = "" if slug_val is Select.BLANK else str(slug_val).strip()
+        gpus = self.query_one("#cc-gpus", Input).value.strip()
+        if not (name and slug and gpus):
+            self.app.notify(
+                "Name, slug and GPUs are all required.",
+                title="New pod", severity="warning", timeout=4,
+            )
+            return
+        self.dismiss({"name": name, "slug": slug, "gpus": gpus})
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class PowerCapMenuScreen(ModalScreen):
     """[c] power-cap menu (Orchestration): apply the default 230W cap · clear the
     cap (uncap to hardware default) · set a custom wattage.  The choice is returned
@@ -3646,14 +4469,16 @@ class PromoteScaffoldScreen(ModalScreen):
     def compose(self) -> ComposeResult:
         with Vertical():
             yield Label(
-                f"Promote to catalog · {self._scaffold.model_id or self._scaffold.repo or '—'}",
+                f"⑤ Promotion Preview · "
+                f"{self._scaffold.model_id or self._scaffold.repo or '—'}  "
+                f"[yellow]preview only — no catalog write yet[/yellow]",
                 classes="promote-title",
             )
             with ScrollableContainer(id="promote-scroll"):
                 yield Static(self._body_text(), id="promote-body")
             with Horizontal(id="promote-btn-row"):
                 yield Button(
-                    "⏎ Stage write (gated · mock-only)",
+                    "⏎ Preview scaffold (no write)",
                     id="promote-stage-btn",
                     variant="warning",
                     disabled=not self._scaffold.computed,
@@ -3667,9 +4492,15 @@ class PromoteScaffoldScreen(ModalScreen):
         if s.error:
             return f"[red]cannot scaffold:[/red] {escape(s.error)}"
         lines: list[str] = []
-        lines.append("[dim]Design §3.5b — a SCAFFOLD + GATE, not a YAML IDE.  COMPUTED from the[/dim]")
-        lines.append("[dim]BYO pull-gate arch facts + the Evidence measured numbers.  Compute +[/dim]")
-        lines.append("[dim]preview ONLY — the write into scripts/ + guard run is gated & mock-only.[/dim]")
+        lines.append(
+            "[yellow]preview only — no catalog write yet[/yellow]"
+        )
+        lines.append(
+            "[dim]Design §3.5b — a SCAFFOLD + GATE, not a YAML IDE.  COMPUTED from the[/dim]"
+        )
+        lines.append(
+            "[dim]BYO pull-gate arch facts + Evidence numbers.  Preview only this phase.[/dim]"
+        )
         lines.append("")
         lines.append(f"  [bold]ModelProfile[/bold]  [cyan]{escape(s.profile_path)}[/cyan]")
         lines.append("")
@@ -3821,21 +4652,16 @@ class OptimizeScreen(ModalScreen):
 
 
 class UntestedComposePreviewScreen(ModalScreen):
-    """Preview a GENERATED compose VERBATIM, badged as an untested config
-    reproduction of a CATALOG slug, then a confirm to serve it through the
-    reconcile-gated path (producer lane ② Serve).
+    """Preview a GENERATED compose VERBATIM, then confirm to serve it (② Serve).
 
-    ⚠️  HONESTY (R3b-1): the previewed compose is a verbatim, UNTESTED reproduction
-    of the resolved CATALOG profile ``<slug>``'s compose — NOT the fit-checked
-    brought model's weights.  generate-compose.sh has no --repo / weight-swap yet;
-    that is a deferred follow-up.  The badge reads "untested config reproduction of
-    <slug>", not "your brought model".
+    Used for the **catalog-reproduction** path (non–Route-C / no swap compose):
+    an untested copy of the resolved CATALOG profile ``<slug>``'s compose —
+    brought weights are NOT mounted.  Route-C swap serves the brought weights
+    via apply-swap and does **not** open this modal.
 
-    Mission (generate-compose.sh locked decision #2): reproduce + flag, NEVER
-    repair — the compose is shown EXACTLY as generated; we do NOT fit-adapt it.
-    ``⏎`` hands the ``serve_generated`` ActionPlan to the app's reconcile gate
-    (the SAME ConfirmActionScreen every serve uses); ``Esc`` closes the preview
-    (and unlinks the temp compose, since it was NOT served)."""
+    Mission (generate-compose.sh): reproduce + flag, NEVER repair — compose shown
+    exactly as generated.  ``⏎`` → reconcile-gated serve; ``Esc`` closes (and
+    unlinks the temp compose if not served)."""
 
     DEFAULT_CSS = """
     UntestedComposePreviewScreen {
@@ -3890,20 +4716,19 @@ class UntestedComposePreviewScreen(ModalScreen):
 
         with Vertical():
             yield Label(
-                f"② Serve · [yellow]untested config reproduction of "
-                f"{self._slug}[/yellow]",
+                f"② Serve · [yellow]untested catalog reproduction of "
+                f"{self._slug}[/yellow]  [dim]· brought weights NOT mounted[/dim]",
                 classes="untested-title",
             )
             with ScrollableContainer(id="untested-scroll"):
                 header = (
-                    f"[yellow]⚠ This is an UNTESTED reproduction of the catalog\n"
-                    f"profile {escape(self._slug)}'s compose — NOT your brought\n"
-                    "model's weights (the bring-your-own weight-swap is a deferred\n"
-                    "follow-up).[/yellow]\n"
+                    f"[yellow]⚠ Untested reproduction of catalog profile "
+                    f"{escape(self._slug)}[/yellow]\n"
+                    "[yellow]Brought weights are NOT mounted — this tests the "
+                    "recipe, not your model.[/yellow]\n"
                     "[dim]Generated VERBATIM by generate-compose.sh — reproduce +\n"
-                    "flag, NEVER repair.  This compose is shown exactly as emitted;\n"
-                    "it is NOT fit-adapted.  Serving it claims the GPU → the confirm\n"
-                    "below runs the reconcile gate like every serve.[/dim]\n"
+                    "flag, NEVER repair.  Serving claims the GPU → reconcile gate\n"
+                    "on confirm (same path as every serve).[/dim]\n"
                     f"\n[dim]path:[/dim] {escape(self._compose_path)}\n\n"
                 )
                 yield Static(header + escape(self._compose_yaml), id="untested-body")
@@ -3964,15 +4789,21 @@ class UntestedComposePreviewScreen(ModalScreen):
 
 
 class LaneBringPane(Container):
-    """① Bring — the producer lane's fit-check entry, and (since the 2-mode merge)
-    the SINGLE bring-an-arbitrary-repo entry point in the app.
+    """① Bring — the producer lane's STAGED artifact-first funnel (design §2b,
+    maintainer UX 2026-07-05), and (since the 2-mode merge) the SINGLE
+    bring-an-arbitrary-repo entry point in the app.
 
-    REUSES ``byo_check`` (pull.sh --dry-run --json → ByoResult: supported? fits?
-    the swap_path route) as the lane's first stage: paste an HF repo / slug,
-    Fit-check, read the route + sibling_slug + quant_match.  (The standalone
-    Run · Bring-your-own tab + its ByoPane were removed in the merge — this pane's
-    widget IDs are the only fit-check widgets now.)  The cached ``_last_byo`` it
-    produces feeds ② Serve and ⑤ Promote."""
+    Staged reveal — nothing template-side shows until the artifact is known:
+      1. repo input + [Inspect] → deriver artifact inventory (READ; a
+         GGUF-only repo is a first-class bring, never unsupported-format);
+      2. GGUF discovered → ALL quant variants presented for the pick FIRST;
+      3. only then the slug Select appears — every catalog option passing the
+         artifact→engine compat filter (GGUF never sees vLLM; safetensors
+         never sees the llama.cpp family), labeled topology-first
+         (``topology/engine/model-quant · serving``), topology-floored by the
+         picked artifact's size vs the rig's VRAM;
+      4. Fit-check (the existing ``byo_check``) → ② Serve / ⑤ Promote arm.
+    The cached ``_last_byo`` it produces feeds ② Serve and ⑤ Promote."""
 
     DEFAULT_CSS = """
     LaneBringPane {
@@ -3984,21 +4815,52 @@ class LaneBringPane(Container):
         margin-bottom: 1;
     }
     LaneBringPane #lane-bring-input-row {
-        height: 3;
+        height: 4;
         margin-bottom: 1;
+    }
+    LaneBringPane #lane-bring-stage2-row {
+        height: auto;
+        margin-bottom: 1;
+    }
+    LaneBringPane .funnel-field {
+        width: auto;
+        height: auto;
+    }
+    LaneBringPane .funnel-field-grow {
+        width: 1fr;
+    }
+    LaneBringPane .funnel-field-title {
+        color: $text-muted;
+        height: 1;
     }
     LaneBringPane #lane-bring-url-input {
         width: 1fr;
     }
+    LaneBringPane #lane-bring-inspect-btn {
+        width: 13;
+        margin-left: 1;
+    }
+    LaneBringPane #lane-bring-gguf-select {
+        width: 36;
+    }
     LaneBringPane #lane-bring-profile-input {
-        width: 40;
+        width: 1fr;
         margin-left: 1;
     }
     LaneBringPane #lane-bring-profile-custom {
         width: 40;
         margin-left: 1;
     }
+    LaneBringPane #lane-bring-slug-card {
+        border: solid $secondary;
+        padding: 0 2;
+        margin-top: 1;
+        height: auto;
+    }
     LaneBringPane .profile-custom-hidden {
+        display: none;
+    }
+    LaneBringPane .funnel-hidden {
         display: none;
     }
     LaneBringPane #lane-bring-fit-btn {
@@ -4011,54 +4873,121 @@ class LaneBringPane(Container):
         margin-top: 1;
         height: auto;
     }
+    LaneBringPane #lane-bring-weights-line {
+        padding: 0 2;
+        margin-top: 1;
+        height: auto;
+    }
     LaneBringPane #lane-bring-hint {
         color: $text-muted;
         margin-top: 1;
     }
+    LaneBringPane #lane-bring-scroll {
+        height: 1fr;
+    }
+    LaneBringPane #lane-bring-continue-btn {
+        width: auto;
+        min-width: 20;
+        margin-top: 1;
+    }
+    LaneBringPane #lane-bring-gguf-select {
+        width: 1fr;
+        min-width: 20;
+    }
+    LaneBringPane #lane-bring-profile-input {
+        width: 1fr;
+        min-width: 28;
+    }
     """
 
     def compose(self) -> ComposeResult:
-        yield Label("① Bring — fit-check an HF model", id="lane-bring-heading")
-        with Horizontal(id="lane-bring-input-row"):
-            yield Input(
-                placeholder="org/Model  (e.g. unsloth/Qwen3-27B-abliterated-GGUF)",
-                id="lane-bring-url-input",
+        yield Label("① Bring — inspect an HF model", id="lane-bring-heading")
+        # Phase 2: scrollable dense post-fit state; stage-2 stacks vertically so
+        # GGUF + catalog config don't crush each other at ~100 cols.
+        with ScrollableContainer(id="lane-bring-scroll"):
+            with Horizontal(id="lane-bring-input-row"):
+                with Vertical(classes="funnel-field funnel-field-grow"):
+                    yield Label("HF repo", classes="funnel-field-title")
+                    yield Input(
+                        placeholder="org/Model  (e.g. unsloth/Qwen3-27B-abliterated-GGUF)",
+                        id="lane-bring-url-input",
+                    )
+                with Vertical(classes="funnel-field"):
+                    yield Label(" ", classes="funnel-field-title")
+                    yield Button(
+                        "Inspect", id="lane-bring-inspect-btn", variant="primary"
+                    )
+            # Stage 2/3 — HIDDEN until Inspect; Vertical stack (not cramped row).
+            with Vertical(id="lane-bring-stage2-row", classes="funnel-hidden"):
+                with Vertical(classes="funnel-field"):
+                    yield Label(
+                        "GGUF quant",
+                        id="lane-bring-gguf-title",
+                        classes="funnel-field-title funnel-hidden",
+                    )
+                    yield Select(
+                        [],
+                        prompt="— pick a GGUF quant —",
+                        allow_blank=True,
+                        id="lane-bring-gguf-select",
+                        classes="funnel-hidden",
+                    )
+                with Vertical(classes="funnel-field funnel-field-grow"):
+                    yield Label(
+                        "catalog config  (topology/engine/model-quant · ⭐ recommended)",
+                        id="lane-bring-profile-title",
+                        classes="funnel-field-title funnel-hidden",
+                    )
+                    yield Select(
+                        [("vllm/dual  ·  loading templates…", "vllm/dual")],
+                        value="vllm/dual",
+                        allow_blank=False,
+                        id="lane-bring-profile-input",
+                        classes="funnel-hidden",
+                    )
+                yield Input(
+                    placeholder="profile-like slug — e.g. ik-llama/iq4ks-mtp",
+                    id="lane-bring-profile-custom",
+                    classes="profile-custom-hidden",
+                )
+                with Horizontal(classes="funnel-field"):
+                    yield Button(
+                        "Fit-check",
+                        id="lane-bring-fit-btn",
+                        variant="primary",
+                        classes="funnel-hidden",
+                    )
+            # Verdict / next-action first after fit (phase 2 hierarchy).
+            yield Static(
+                "[dim]Enter an HF repo and Inspect — metadata only, no download. "
+                "Fit-check unlocks ② Serve.[/dim]",
+                id="lane-bring-result-card",
             )
-            # #6/A12 — same registry-derived (engine, topology) template Select as
-            # Run · BYO (populated by set_profile_options after the catalog loads).
-            yield Select(
-                [("vllm/dual  ·  loading templates…", "vllm/dual")],
-                value="vllm/dual",
-                allow_blank=False,
-                id="lane-bring-profile-input",
+            yield Static("", id="lane-bring-weights-line", classes="funnel-hidden")
+            yield Button(
+                "Continue → ② Serve  [s]",
+                id="lane-bring-continue-btn",
+                variant="success",
+                classes="funnel-hidden",
             )
-            # FIX 2 (escape hatch) — companion free-text override, hidden until the
-            # "✎ custom slug…" sentinel is chosen (same idiom as Run · BYO).
-            yield Input(
-                placeholder="profile-like slug — e.g. ik-llama/iq4ks-mtp",
-                id="lane-bring-profile-custom",
-                classes="profile-custom-hidden",
+            yield Static("", id="lane-bring-slug-card", classes="funnel-hidden")
+            yield Label(
+                "[dim]next: enter an HF repo and press Inspect[/dim]",
+                id="lane-bring-hint",
             )
-            yield Button("Fit-check", id="lane-bring-fit-btn", variant="primary")
-        yield Static(
-            "[dim]Stage ① of the Bring & Validate pipeline.  Enter an HF repo + a\n"
-            "profile-like slug, then Fit-check — pull.sh --dry-run (Path B, never\n"
-            "downloads).  A successful fit-check unlocks ② Serve (generate + serve\n"
-            "the untested compose) and ⑤ Promote.[/dim]",
-            id="lane-bring-result-card",
-        )
-        yield Label(
-            "[dim]Routes:  A = new curated profile   ·   B = serve-locally   ·   "
-            "C = reuse a sibling compose + swap weights\n"
-            "next: \\[2/]] ② Serve   ·   ③ Gate   ·   ④ Measure   ·   "
-            "\\[P] ⑤ Promote[/dim]",
-            id="lane-bring-hint",
-        )
 
     def set_checking(self, repo: str) -> None:
         self.query_one("#lane-bring-result-card", Static).update(
             f"[dim]Checking[/dim] [cyan]{repo}[/cyan] [dim](pull.sh --dry-run --json)…[/dim]"
         )
+        self.set_next_hint("[dim]next: fit-check running…[/dim]")
+
+    def set_inspecting(self, repo: str) -> None:
+        self.query_one("#lane-bring-result-card", Static).update(
+            f"[dim]Inspecting[/dim] [cyan]{repo}[/cyan] "
+            "[dim](deriver --inventory — HF metadata only, no download)…[/dim]"
+        )
+        self.set_next_hint("[dim]next: inspecting HF metadata…[/dim]")
 
     def set_profile_options(
         self, options: list[tuple[str, str]], default: Optional[str]
@@ -4069,16 +4998,231 @@ class LaneBringPane(Container):
             self.query_one("#lane-bring-profile-input", Select), options, default
         )
 
-    def populate(self, res: ByoResult) -> None:
+    def show_inventory(self, inv: "ArtifactInventory") -> None:
+        """Stage-1 verdict: render the inventory + reveal the matching stage-2
+        widgets.  GGUF → the quant Select (slugs stay hidden until the pick);
+        safetensors → straight to the slug stage (the app repopulates it)."""
         card = self.query_one("#lane-bring-result-card", Static)
-        card.update(_byo_result_text(res))
+        row = self.query_one("#lane-bring-stage2-row", Vertical)
+        gsel = self.query_one("#lane-bring-gguf-select", Select)
+        if inv.error:
+            card.update(f"[red]Inspect failed:[/red] {inv.error}")
+            row.add_class("funnel-hidden")
+            self.set_next_hint(
+                f"[red]next:[/red] [dim]fix Inspect "
+                f"({inv.error[:60]}{'…' if len(inv.error) > 60 else ''}) · "
+                f"check the repo id or \\[S] HF token[/dim]"
+            )
+            return
+        lines = [f"  [bold]{inv.repo}[/bold]   formats: [cyan]{', '.join(inv.formats) or '—'}[/cyan]"]
+        if inv.has_safetensors:
+            lines.append(
+                f"  [bold]safetensors[/bold]  {inv.safetensors_files} file(s), "
+                f"{inv.safetensors_size_gb:.1f} GiB"
+            )
+        if inv.has_gguf:
+            lines.append(
+                f"  [bold]gguf[/bold]  {len(inv.gguf_variants)} quant(s) discovered — "
+                "pick one below to see the matching slugs"
+            )
+        if inv.gguf_mmproj:
+            lines.append(f"  [dim]mmproj (vision projector): {', '.join(inv.gguf_mmproj)}[/dim]")
+        if inv.lineage_base_model:
+            lines.append(f"  [dim]base_model: {inv.lineage_base_model}[/dim]")
+        card.update("\n".join(lines))
+        row.remove_class("funnel-hidden")
+        if inv.has_gguf:
+            self.set_next_hint(
+                "[dim]next: pick a GGUF quant · then a catalog config · Fit-check[/dim]"
+            )
+        else:
+            self.set_next_hint(
+                "[dim]next: pick a catalog config · Fit-check (⏎)[/dim]"
+            )
+        gtitle = self.query_one("#lane-bring-gguf-title", Label)
+        if inv.has_gguf:
+            opts = [
+                (f"{v.quant}  ·  {v.size_gb:.1f} GiB" + (f" ({v.parts} parts)" if v.parts > 1 else ""), v.quant)
+                for v in inv.gguf_variants
+            ]
+            # Start BLANK — the pick is the USER's stage-2 decision (§2b-2);
+            # pre-selecting would fire the slug reveal without a genuine pick.
+            try:
+                with gsel.prevent(Select.Changed):
+                    gsel.set_options(opts)
+                    gsel.value = Select.BLANK
+            except Exception:
+                gsel.set_options(opts)
+            gsel.remove_class("funnel-hidden")
+            gtitle.remove_class("funnel-hidden")
+        else:
+            gsel.add_class("funnel-hidden")
+            gtitle.add_class("funnel-hidden")
+
+    def reveal_slug_stage(
+        self, options: list[tuple[str, str]], default: Optional[str]
+    ) -> None:
+        """Stage-3: populate + reveal the artifact-filtered slug Select and the
+        Fit-check button (§2b-3/4/5 — only now do engine/topology slugs show)."""
+        sel = self.query_one("#lane-bring-profile-input", Select)
+        _set_select_options(sel, options, default)
+        sel.remove_class("funnel-hidden")
+        self.query_one("#lane-bring-profile-title", Label).remove_class("funnel-hidden")
+        self.query_one("#lane-bring-fit-btn", Button).remove_class("funnel-hidden")
+        # Bug B (2026-07-09): when the §2b size floor leaves ONLY the ✎ custom-slug
+        # sentinel, _set_select_options pre-selects it under prevent(Select.Changed)
+        # — so the Changed-gated custom-Input reveal never fires and the escape
+        # hatch is unreachable (re-picking the already-selected sentinel is a no-op).
+        # Reveal the Input eagerly iff the sentinel is the sole option; keep it
+        # hidden (until a genuine pick) whenever real slugs exist.
+        real = [v for (_l, v) in options if v != PROFILE_CUSTOM_SENTINEL]
+        custom = self.query_one("#lane-bring-profile-custom", Input)
+        if real:
+            custom.add_class("profile-custom-hidden")
+        else:
+            custom.remove_class("profile-custom-hidden")
+
+    def hide_slug_stage(self) -> None:
+        self.query_one("#lane-bring-profile-input", Select).add_class("funnel-hidden")
+        self.query_one("#lane-bring-profile-title", Label).add_class("funnel-hidden")
+        self.query_one("#lane-bring-fit-btn", Button).add_class("funnel-hidden")
+        self.show_slug_details("")
+
+    def show_slug_details(self, markup: str) -> None:
+        """Dogfood r2 — the selected slug's detail card (ctx / status / port /
+        drafter / the bar).  Empty markup hides it."""
+        card = self.query_one("#lane-bring-slug-card", Static)
+        if markup:
+            card.update(markup)
+            card.remove_class("funnel-hidden")
+        else:
+            card.update("")
+            card.add_class("funnel-hidden")
+
+    def set_weights_line(self, markup: str) -> None:
+        """§2b-6/7 — the weights-state / download / handoff line under the
+        verdict card.  Empty markup hides it."""
+        line = self.query_one("#lane-bring-weights-line", Static)
+        if markup:
+            line.update(markup)
+            line.remove_class("funnel-hidden")
+        else:
+            line.update("")
+            line.add_class("funnel-hidden")
+
+    def set_next_hint(self, markup: str) -> None:
+        """Stateful bottom ``next:`` line (phase 1.3) — one honest next action."""
+        try:
+            self.query_one("#lane-bring-hint", Label).update(markup)
+        except Exception:
+            pass
+
+    def set_continue_visible(self, visible: bool) -> None:
+        """Phase 2 — focusable Continue → ② Serve after weights are on disk."""
+        try:
+            btn = self.query_one("#lane-bring-continue-btn", Button)
+            if visible:
+                btn.remove_class("funnel-hidden")
+            else:
+                btn.add_class("funnel-hidden")
+        except Exception:
+            pass
+
+    def populate(self, res: ByoResult, weights_present: Optional[bool] = None,
+                 downloading: bool = False) -> None:
+        card = self.query_one("#lane-bring-result-card", Static)
+        card.update(_byo_result_text(res, weights_present, downloading))
+        # Stateful next-hint: failure → repair; success → single valid next key.
+        can_continue = False
+        if getattr(res, "error", ""):
+            self.set_next_hint(
+                f"[red]next:[/red] [dim]fix the fit-check "
+                f"({res.error[:60]}{'…' if len(res.error) > 60 else ''}) · "
+                f"re-Inspect or pick another catalog config[/dim]"
+            )
+        elif downloading:
+            self.set_next_hint(
+                "[dim]next: wait for download · \\[k] cancels · then \\[s] → ② Serve[/dim]"
+            )
+        elif weights_present and (
+            getattr(res, "sibling_slug", "") or getattr(res, "profile_like", "")
+        ):
+            can_continue = True
+            self.set_next_hint(
+                "[green]next:[/green] [bold]\\[s][/bold] Continue → ② Serve  "
+                "[dim]·  \\[P] promotion preview[/dim]"
+            )
+        elif getattr(res, "sibling_slug", "") or getattr(res, "profile_like", ""):
+            self.set_next_hint(
+                "[green]next:[/green] [bold]\\[D][/bold] download weights  "
+                "[dim]· then \\[s] → ② Serve[/dim]"
+            )
+        else:
+            self.set_next_hint(
+                "[dim]next: no servable target resolved — try another catalog "
+                "config or route[/dim]"
+            )
+        self.set_continue_visible(can_continue)
 
 
-def _byo_result_text(res: ByoResult) -> str:
+def _byo_result_text(res: ByoResult, weights_present: Optional[bool] = None,
+                     downloading: bool = False) -> str:
     """Render a ByoResult into the verdict card text (shared by Run · BYO + the
-    producer lane's ① Bring stage)."""
+    producer lane's ① Bring stage).
+
+    ``weights_present`` (probed once by the caller) makes the Route-C next-step
+    honest: on disk → point at ② Serve (no download); absent → the [D] download
+    affordance.  ``None`` = unknown → keep the download prompt (safe default)."""
     if res.error:
         return f"[red]Fit-check failed:[/red] {res.error}"
+    # Route-C swap (a curated-arch fine-tune → serve via the sibling's recipe with
+    # the brought weights): the engine verdict is "no-fit-model" because the generic
+    # fit-math can't PRICE a curated-hybrid arch — but the OUTCOME is servable. A red
+    # "not eligible / no-fit-model" headline + "② Serve armed with <sibling>" read as
+    # a self-contradicting dead-end (and named the wrong model). Reframe: green
+    # "✓ Servable", the [D] next-step names the BROUGHT model, raw verdict dimmed for
+    # debugging. Non-swap cases (eligible / Route A / B / plain no-fit) fall through.
+    if str(res.route).upper() == "C" and res.sibling_slug:
+        brought = res.repo.rsplit("/", 1)[-1]
+        mtp = ("[dim]MTP dropped — no head in this checkpoint[/dim]"
+               if res.drop_spec_config
+               else "[dim]MTP kept — head present[/dim]")
+        # Presence-aware next-step: [D] emits the serve compose, so when the
+        # weights are already on disk it must NOT read as "download" — point
+        # straight at ② Serve (which emits the compose itself, no download).  And
+        # while a [D] download is IN FLIGHT, suppress the re-offer entirely (#617).
+        if downloading:
+            next_step = (
+                f"  [cyan]⏳ downloading {brought}…[/cyan] "
+                f"[dim](in progress — \\[k] cancels)[/dim]"
+            )
+        elif weights_present:
+            next_step = (
+                f"  [green]✓ weights on disk[/green] — [green]press[/green] "
+                f"[bold]\\[s][/bold] [green]to continue to ② Serve[/green] "
+                f"[dim](serves {brought} — no download)[/dim]"
+            )
+        else:
+            # [D] downloads only — serve is a separate stage ([s] / ②). Never
+            # attach "serve" to the download key (UI/UX phase 1.3).
+            next_step = (
+                f"  [green]→ Press[/green] [bold]\\[D][/bold] "
+                f"[green]to download weights[/green] [bold]{brought}[/bold] "
+                f"[dim]· then \\[s] for ② Serve[/dim]"
+            )
+        return "\n".join([
+            f"  [bold]{res.repo}[/bold]",
+            f"  [green]✓ Servable[/green] — a fine-tune of [green]{res.sibling_slug}[/green]",
+            f"  [bold]arch[/bold]  [cyan]{res.arch or '—'}[/cyan]",
+            "",
+            f"  [dim]How it serves:[/dim] reuses [green]{res.sibling_slug}[/green]'s proven "
+            "recipe (chat template, tools, spec-dec) with your weights.",
+            f"  {mtp}",
+            "",
+            next_step,
+            f"  [dim]engine verdict: {res.fit_verdict or 'no-fit-model'} → Route-C swap "
+            "(generic fit-math can't price a curated-hybrid arch)[/dim]",
+        ])
     lines: list[str] = []
     elig = "[green]eligible[/green]" if res.eligible else "[red]not eligible[/red]"
     lines.append(f"  [bold]{res.repo}[/bold]   {elig}")
@@ -4090,13 +5234,16 @@ def _byo_result_text(res: ByoResult) -> str:
     }.get(res.fit_verdict, res.fit_verdict or "—")
     lines.append(f"  [bold]fit[/bold]      {fitc}")
     if res.route:
+        # Phase 3 — outcome-first headings; A/B/C kept as dim metadata.
+        route_u = str(res.route).upper()
         route_label = {
-            "A": "Route A — author a new curated profile",
-            "B": "Route B — serve locally (no catalog entry)",
-            "C": "Route C — reuse a sibling compose + swap weights",
-        }.get(str(res.route).upper(), f"Route {res.route}")
+            "A": "Needs a catalog profile",
+            "B": "Local-only serve",
+            "C": "Can serve now (reuse sibling recipe)",
+            "G": "Can serve now (GGUF · llama.cpp family)",
+        }.get(route_u, f"Route {res.route}")
         lines.append("")
-        lines.append(f"  [bold]{route_label}[/bold]")
+        lines.append(f"  [bold]{route_label}[/bold]  [dim](route {route_u})[/dim]")
         if res.sibling_slug:
             lines.append(f"    • reuse compose for [green]{res.sibling_slug}[/green]")
         if res.quant_match:
@@ -4118,28 +5265,43 @@ def _byo_result_text(res: ByoResult) -> str:
     return "\n".join(lines)
 
 
+# ② Serve override-editor dropdown presets (dropdowns to prevent typos — the
+# resolved slug's own default is folded in at arm-time if it's not here; a trailing
+# "✎ custom…" sentinel reveals a free-text Input for any value not in the list).
+_OV_CTX = ["16384", "32768", "65536", "81920", "98304", "131072", "196608", "262144"]
+# The FULL vLLM 0.24.0 --kv-cache-dtype set (ground truth from EngineArgs), ordered
+# by relevance: fp8 family · int8/nvfp4 · turboquant family · raw dtypes.
+_OV_KV = [
+    "fp8_e5m2", "fp8_e4m3", "fp8", "fp8_per_token_head", "fp8_inc", "fp8_ds_mla",
+    "int8_per_token_head", "nvfp4",
+    "turboquant_4bit_nc", "turboquant_3bit_nc", "turboquant_k3v4_nc", "turboquant_k8v4",
+    "bfloat16", "float16", "auto",
+]
+_OV_UTIL = ["0.80", "0.85", "0.88", "0.90", "0.92", "0.95"]
+# SPEC value stays on/off (the compose's ${SPEC} gate); the label shows the real
+# drafter (set at arm-time from SPEC_DRAFTER) so it's not an uninformative "on".
+_OV_SPEC = ["on", "off"]
+_OV_CUSTOM = "__ov_custom__"   # sentinel: reveals the companion free-text Input
+
+
 class LaneServePane(Container):
-    """② Serve — generate a minimal compose for the resolved CATALOG profile, then
-    serve it (untested) through the reconcile-gated path (R3b-1, the critical new
-    link).
+    """② Serve — serve the fit-checked target untested (reconcile-gated).
 
-    ⚠️  HONESTY (R3b-1): this serves a verbatim, UNTESTED reproduction of the
-    resolved CATALOG slug's compose (the Route-C sibling, else the profile-like the
-    fit-check ran against) — NOT the brought model's weights.  generate-compose.sh
-    has no --repo / weight-swap yet; the full brought-model serve is a deferred
-    follow-up.
+    Two paths after ① Bring:
+      · **Route-C** — brought weights via the sibling recipe (apply-swap /
+        emit-only); override editor may show.
+      · **Other routes** — untested catalog-compose reproduction (generate-compose
+        → preview modal); brought weights are NOT mounted.
 
-    After a successful ① Bring fit-check, ⏎ here (action_serve_untested) runs
-    ``generate-compose.sh`` for the resolved catalog slug, previews the compose
-    VERBATIM badged "untested config reproduction of <slug>", and a confirm serves
-    it through the SAME reconcile gate every serve uses (the generated compose
-    CLAIMS the GPU).  Mission: reproduce + flag, never repair — the compose is
-    shown as generated, NOT fit-adapted."""
+    ⏎ / [g] → ``action_serve_untested``.  Mission: reproduce + flag, never repair."""
 
     DEFAULT_CSS = """
     LaneServePane {
         height: 1fr;
         padding: 1 2;
+    }
+    LaneServePane #lane-serve-scroll {
+        height: 1fr;
     }
     LaneServePane #lane-serve-heading {
         text-style: bold;
@@ -4148,102 +5310,350 @@ class LaneServePane(Container):
     LaneServePane #lane-serve-body {
         border: solid $primary;
         padding: 1 2;
+        margin-top: 0;
+        height: auto;
+        max-height: 12;
+    }
+    LaneServePane #lane-serve-actions {
+        height: auto;
         margin-top: 1;
-        height: 1fr;
+    }
+    LaneServePane #lane-serve-btn {
+        width: auto;
+        min-width: 18;
     }
     LaneServePane #lane-serve-hint {
         color: $text-muted;
         margin-top: 1;
     }
+    LaneServePane #lane-serve-ov-wrap {
+        margin-top: 1;
+        height: auto;
+    }
+    LaneServePane #lane-serve-overrides {
+        height: auto;
+        padding: 0 1;
+    }
+    LaneServePane #lane-serve-ov-title { margin-bottom: 1; }
+    LaneServePane #lane-serve-ov-preview { color: $text-muted; margin-bottom: 1; }
+    LaneServePane .ov-row { height: 3; margin-bottom: 0; }
+    LaneServePane .ov-lbl { width: 12; content-align: left middle; height: 3; }
+    LaneServePane .ov-row Input, LaneServePane .ov-row Select { width: 1fr; }
+    LaneServePane .ov-custom-hidden { display: none; }
+    LaneServePane .funnel-hidden { display: none; }
+    LaneServePane #lane-serve-details {
+        color: $text-muted;
+        margin-top: 1;
+        height: auto;
+    }
     """
 
     def compose(self) -> ComposeResult:
-        yield Label("② Serve — reproduce + serve the resolved catalog compose (untested)", id="lane-serve-heading")
-        yield Static(
-            "[dim]Stage ② of the Bring & Validate pipeline.\n"
-            "\n"
-            "Run ① Bring first to fit-check a model.  Then ⏎ here generates a\n"
-            "minimal compose (generate-compose.sh — reproduce + flag, never\n"
-            "repair) for the RESOLVED CATALOG slug (the Route-C sibling, else the\n"
-            "profile-like the fit-check ran against), previews it VERBATIM, and\n"
-            "serves it through the reconcile-gated confirm (the generated compose\n"
-            "claims the GPU like any serve).\n"
-            "\n"
-            "[yellow]Note: this serves an UNTESTED reproduction of the catalog\n"
-            "profile's compose — NOT your brought model's weights.  The bring-your-\n"
-            "own weight-swap (generate-compose.sh --repo) is a deferred follow-up.\n"
-            "[/yellow][/dim]",
-            id="lane-serve-body",
-        )
-        yield Label(
-            "[dim]\\[⏎] generate + preview + serve (reconcile-gated · untested)[/dim]",
-            id="lane-serve-hint",
-        )
+        from textual.widgets import Collapsible
+
+        # Phase 2 wireframe: target card → primary Serve → collapsed overrides → details.
+        with ScrollableContainer(id="lane-serve-scroll"):
+            yield Label(
+                "② Serve — arm from ① Bring, then serve untested",
+                id="lane-serve-heading",
+            )
+            yield Static(
+                "[dim]Run ① Bring first to fit-check a model.\n"
+                "Route-C → your weights via sibling recipe · "
+                "other routes → catalog-compose reproduction.[/dim]",
+                id="lane-serve-body",
+            )
+            with Horizontal(id="lane-serve-actions", classes="funnel-hidden"):
+                yield Button(
+                    "Serve  ⏎",
+                    id="lane-serve-btn",
+                    variant="warning",
+                )
+                yield Label(
+                    "  [dim]reconcile-gated · claims the GPU · 👤 untested[/dim]",
+                    id="lane-serve-btn-note",
+                )
+            with Collapsible(
+                title="Overrides (optional · sibling defaults)",
+                collapsed=True,
+                id="lane-serve-ov-wrap",
+                classes="funnel-hidden",
+            ):
+                yield Vertical(
+                    Label(
+                        "[dim]defaults from the resolved slug · ✎ custom… for any value[/dim]",
+                        id="lane-serve-ov-title",
+                    ),
+                    Static("", id="lane-serve-ov-preview"),
+                    Horizontal(Label("served as", classes="ov-lbl"),
+                               Input(id="ov-served-name"), classes="ov-row"),
+                    Horizontal(Label("ctx", classes="ov-lbl"),
+                               Select([(v, v) for v in _OV_CTX] + [("✎ custom…", _OV_CUSTOM)],
+                                      id="ov-ctx", allow_blank=False),
+                               Input(placeholder="custom ctx", id="ov-ctx-custom",
+                                     classes="ov-custom-hidden"),
+                               classes="ov-row"),
+                    Horizontal(Label("KV cache", classes="ov-lbl"),
+                               Select([(v, v) for v in _OV_KV] + [("✎ custom…", _OV_CUSTOM)],
+                                      id="ov-kv", allow_blank=False),
+                               Input(placeholder="custom KV dtype", id="ov-kv-custom",
+                                     classes="ov-custom-hidden"),
+                               classes="ov-row"),
+                    Horizontal(Label("spec-dec", classes="ov-lbl"),
+                               Select([(v, v) for v in _OV_SPEC], id="ov-spec", allow_blank=False),
+                               classes="ov-row"),
+                    Horizontal(Label("VRAM util", classes="ov-lbl"),
+                               Select([(v, v) for v in _OV_UTIL] + [("✎ custom…", _OV_CUSTOM)],
+                                      id="ov-util", allow_blank=False),
+                               Input(placeholder="custom util", id="ov-util-custom",
+                                     classes="ov-custom-hidden"),
+                               classes="ov-row"),
+                    id="lane-serve-overrides",
+                )
+            yield Static(
+                "[dim]untested config — reproduce + flag, never repair[/dim]",
+                id="lane-serve-details",
+            )
+            yield Label(
+                "[dim]\\[⏎] / Serve button · reconcile-gated · 👤 untested[/dim]",
+                id="lane-serve-hint",
+            )
 
     def set_status(self, text: str) -> None:
         self.query_one("#lane-serve-body", Static).update(text)
 
-    def set_armed(self, byo: "Optional[ByoResult]") -> None:
-        """N9 — pre-arm ② Serve from the cached ① Bring fit-check: show the
-        resolved servable catalog target so ⏎ here serves it WITHOUT re-entering
-        ① Bring.  Pure render off the cached ByoResult (no I/O).  When there's no
-        usable fit-check yet, restore the calm "run ① Bring first" placeholder."""
+    def set_armed(
+        self, byo: "Optional[ByoResult]",
+        overrides_defaults: Optional[dict] = None,
+        *,
+        host_port: Optional[int] = None,
+    ) -> None:
+        """N9 — pre-arm ② Serve from the cached ① Bring fit-check.
+
+        Phase 2: target card (name · recipe · port · 👤) on top; Serve button
+        revealed when armed; overrides collapsed under Collapsible (Route-C only).
+        ``host_port`` is the sibling/catalog default (honest current emit port —
+        B19 free-port isolation is deferred)."""
         body = self.query_one("#lane-serve-body", Static)
+        heading = self.query_one("#lane-serve-heading", Label)
+        try:
+            actions = self.query_one("#lane-serve-actions")
+            ov_wrap = self.query_one("#lane-serve-ov-wrap")
+        except Exception:
+            actions = ov_wrap = None
+        port_s = f":{host_port}" if host_port else ":?"
         if byo is None or getattr(byo, "error", ""):
+            if actions is not None:
+                actions.add_class("funnel-hidden")
+            if ov_wrap is not None:
+                ov_wrap.add_class("funnel-hidden")
+            heading.update("② Serve — arm from ① Bring, then serve untested")
             body.update(
-                "[dim]Stage ② of the Bring & Validate pipeline.\n"
-                "\n"
-                "Run ① Bring first to fit-check a model.  Then ⏎ here generates +\n"
-                "previews + serves the resolved catalog compose (reconcile-gated,\n"
-                "untested).[/dim]"
+                "[dim]Run ① Bring first to fit-check a model.  Then Serve / ⏎ "
+                "boots the resolved target (reconcile-gated · 👤 untested).[/dim]"
             )
             return
-        slug = (
-            getattr(byo, "sibling_slug", "")
-            or getattr(byo, "profile_like", "")
-        )
+        if actions is not None:
+            actions.remove_class("funnel-hidden")
+        route = str(getattr(byo, "route", "") or "").upper()
+        sibling = getattr(byo, "sibling_slug", "")
         repo = getattr(byo, "repo", "") or "—"
-        lines = [
-            "[green]● armed from ① Bring[/green] — ⏎ serves the resolved catalog compose (untested):",
-            "",
-            f"  [bold]brought[/bold]   [cyan]{repo}[/cyan]",
-        ]
-        if slug:
-            lines.append(f"  [bold]serves[/bold]    [green]{slug}[/green]  [dim](resolved catalog profile)[/dim]")
+        brought = repo.rsplit("/", 1)[-1]
+        if route == "C" and sibling and overrides_defaults:
+            self._populate_overrides(overrides_defaults)
+            if ov_wrap is not None:
+                ov_wrap.remove_class("funnel-hidden")
         else:
-            lines.append(
-                "  [yellow]no servable catalog target resolved[/yellow] — the fit-check found "
-                "no sibling/profile slug (the bring-your-own weight-swap is a deferred follow-up)."
-            )
-        lines.append("")
-        lines.append(
-            "[yellow]Note: serves an UNTESTED reproduction of the catalog profile's "
-            "compose — NOT your brought model's weights.[/yellow]"
-        )
+            if ov_wrap is not None:
+                ov_wrap.add_class("funnel-hidden")
+        if route == "C" and sibling:
+            heading.update("② Serve · 👤 untested")
+            lines = [
+                f"[green]Serving[/green]  [bold]{brought}[/bold]  "
+                "[dim]· 👤 untested[/dim]",
+                f"  [bold]recipe[/bold]   [green]{sibling}[/green]  "
+                f"[dim]· port {port_s}[/dim]",
+                f"  [bold]repo[/bold]     [cyan]{repo}[/cyan]",
+                "  [dim]your weights via sibling recipe "
+                "(chat-template · tools · spec-dec)[/dim]",
+            ]
+        else:
+            slug = sibling or getattr(byo, "profile_like", "")
+            if slug:
+                heading.update("② Serve · catalog reproduction · 👤 untested")
+                lines = [
+                    f"[yellow]Serving[/yellow]  catalog reproduction of "
+                    f"[bold]{slug}[/bold]",
+                    f"  [yellow]⚠ brought weights NOT mounted[/yellow]  "
+                    f"[dim]· port {port_s}[/dim]",
+                    f"  [bold]brought[/bold]  [cyan]{repo}[/cyan]",
+                    "  [dim]tests the recipe, not your model[/dim]",
+                ]
+            else:
+                if actions is not None:
+                    actions.add_class("funnel-hidden")
+                heading.update("② Serve — no servable target yet")
+                lines = [
+                    f"  [bold]brought[/bold]  [cyan]{repo}[/cyan]",
+                    "  [yellow]no servable catalog target resolved[/yellow]",
+                ]
         body.update("\n".join(lines))
+
+    def _populate_overrides(self, d: dict) -> None:
+        """Pre-fill the editor from the resolved slug's defaults + engine.  KV
+        options come from the ENGINE (not a generic vLLM list); SPEC shows the
+        real drafter; a "✎ custom…" tail reaches anything else.  Each dropdown
+        folds in the slug's own value if it isn't already a preset."""
+        try:
+            self.query_one("#ov-served-name", Input).value = str(d.get("SERVED_NAME", ""))
+        except Exception:
+            pass
+        # Preview: engine + the values this serve can override (the slug's defaults).
+        try:
+            drafter = d.get("SPEC_DRAFTER") or (
+                "on" if str(d.get("SPEC")) == "on" else "off")
+            self.query_one("#lane-serve-ov-preview", Static).update(
+                f"[dim]engine[/dim] [cyan]{d.get('ENGINE') or '—'}[/cyan]   "
+                f"[dim]· ctx[/dim] {d.get('MAX_MODEL_LEN', '?')}   "
+                f"[dim]· KV[/dim] {d.get('KV_CACHE_DTYPE', '?')}   "
+                f"[dim]· spec[/dim] {drafter}   "
+                f"[dim]· util[/dim] {d.get('GPU_MEMORY_UTILIZATION', '?')}"
+            )
+        except Exception:
+            pass
+        kv_opts = list(d.get("KV_OPTIONS") or _OV_KV)               # engine-declared
+        for wid, key, presets, custom in (
+            ("#ov-ctx", "MAX_MODEL_LEN", [(v, v) for v in _OV_CTX], True),
+            ("#ov-kv", "KV_CACHE_DTYPE", [(v, v) for v in kv_opts], True),
+            ("#ov-util", "GPU_MEMORY_UTILIZATION", [(v, v) for v in _OV_UTIL], True),
+        ):
+            try:
+                sel = self.query_one(wid, Select)
+                val = str(d.get(key, "")).strip()
+                opts = list(presets)
+                if val and val not in [o[1] for o in opts]:
+                    opts = [(val, val)] + opts          # fold in the slug's default
+                if custom:
+                    opts = opts + [("✎ custom…", _OV_CUSTOM)]
+                sel.set_options(opts)
+                sel.value = val if val in [o[1] for o in opts] else opts[0][1]
+            except Exception:
+                pass
+        # spec-dec: the dropdown lists the ENGINE's supported drafters + off; the
+        # VALUE is the drafter METHOD (or "off").  collect maps method→SPEC=on +
+        # DRAFTER_METHOD, off→SPEC=off (the swap entrypoint parameterizes the method).
+        try:
+            drafters = list(d.get("DRAFTER_OPTIONS") or [])
+            # fallback (engine not resolvable) → a plain on/off "on" option
+            cur = d.get("SPEC_METHOD") or (drafters[0] if drafters else "on")
+            spec_n = d.get("SPEC_N") or ""
+            spec_opts = [
+                ((f"{m} n={spec_n}" if (m == cur and spec_n) else m), m)
+                for m in drafters
+            ] or [("on", "on")]
+            spec_opts.append(("off — no spec-dec", "off"))
+            sel = self.query_one("#ov-spec", Select)
+            sel.set_options(spec_opts)
+            method_vals = [o[1] for o in spec_opts]
+            sel.value = (cur if (str(d.get("SPEC")) == "on" and cur in method_vals)
+                         else "off")
+        except Exception:
+            pass
+
+    def collect_overrides(self) -> dict:
+        """Read the editor fields → env overrides for the serve.  Only non-empty
+        values are returned (empty = keep the compose's own default).  A dropdown
+        on "✎ custom…" reads its companion free-text Input.  Returns ``{}`` when
+        the editor is hidden (non-Route-C serve — no override surface)."""
+        out: dict = {}
+        try:
+            wrap = self.query_one("#lane-serve-ov-wrap")
+            if wrap.has_class("funnel-hidden"):
+                return {}
+        except Exception:
+            try:
+                if self.query_one("#lane-serve-overrides", Vertical).has_class(
+                    "funnel-hidden"
+                ):
+                    return {}
+            except Exception:
+                return {}
+        try:
+            name = self.query_one("#ov-served-name", Input).value.strip()
+            if name:
+                out["SERVED_NAME"] = name
+        except Exception:
+            pass
+        for wid, key, custom_id in (
+            ("#ov-ctx", "MAX_MODEL_LEN", "#ov-ctx-custom"),
+            ("#ov-kv", "KV_CACHE_DTYPE", "#ov-kv-custom"),
+            ("#ov-util", "GPU_MEMORY_UTILIZATION", "#ov-util-custom"),
+        ):
+            try:
+                v = self.query_one(wid, Select).value
+                if v == _OV_CUSTOM and custom_id:
+                    cv = self.query_one(custom_id, Input).value.strip()
+                    if cv:
+                        out[key] = cv
+                elif v not in (None, Select.BLANK, _OV_CUSTOM):
+                    out[key] = str(v)
+            except Exception:
+                pass
+        # spec-dec: the dropdown value is the drafter METHOD (or "off").  off →
+        # SPEC=off; a method → SPEC=on + DRAFTER_METHOD (the swap entrypoint's
+        # ${DRAFTER_METHOD} rebuilds --speculative-config for that drafter).
+        try:
+            sv = self.query_one("#ov-spec", Select).value
+            if sv == "off":
+                out["SPEC"] = "off"
+            elif sv not in (None, Select.BLANK):
+                out["SPEC"] = "on"
+                out["DRAFTER_METHOD"] = str(sv)
+        except Exception:
+            pass
+        return out
 
 
 class LanePromotePane(Container):
-    """⑤ Promote — promote the fit-checked + measured model into the catalog.
+    """⑤ Promotion Preview / Scaffold — checklist + scaffold action.
 
-    Hosts the [P] promote affordance relocated out of Run · Catalog (R3b-1).  The
-    action (``action_promote_catalog`` → PromoteScaffoldScreen) is unchanged and
-    producer-gated; this stage is its home in the lane."""
+    Hosts [P] / the Preview button → PromoteScaffoldScreen.  Write remains
+    mock-only this phase (preview badge is persistent)."""
 
     DEFAULT_CSS = """
     LanePromotePane {
         height: 1fr;
         padding: 1 2;
     }
+    LanePromotePane #lane-promote-scroll { height: 1fr; }
     LanePromotePane #lane-promote-heading {
         text-style: bold;
         margin-bottom: 1;
     }
-    LanePromotePane #lane-promote-body {
+    LanePromotePane #lane-promote-badge {
+        color: $warning;
+        margin-bottom: 1;
+    }
+    LanePromotePane #lane-promote-prereqs {
         border: solid $primary;
         padding: 1 2;
-        margin-top: 1;
-        height: 1fr;
+        margin-bottom: 1;
+        height: auto;
+    }
+    LanePromotePane #lane-promote-will {
+        border: solid $primary-darken-2;
+        padding: 1 2;
+        margin-bottom: 1;
+        height: auto;
+        color: $text-muted;
+    }
+    LanePromotePane #lane-promote-actions {
+        height: auto;
+        margin-bottom: 1;
+    }
+    LanePromotePane #lane-promote-btn {
+        width: auto;
+        min-width: 22;
     }
     LanePromotePane #lane-promote-hint {
         color: $text-muted;
@@ -4252,21 +5662,93 @@ class LanePromotePane(Container):
     """
 
     def compose(self) -> ComposeResult:
-        yield Label("⑤ Promote — scaffold a curated catalog entry", id="lane-promote-heading")
-        yield Static(
-            "[dim]Final stage of the Bring & Validate pipeline.\n"
-            "\n"
-            "Once the model is fit-checked (① Bring), served (② Serve), gated\n"
-            "(③ Gate) and measured (④ Measure), \\[P] computes a SCAFFOLD + GATE:\n"
-            "a ModelProfile YAML skeleton + a compose_registry entry COMPUTED from\n"
-            "the BYO arch facts + Evidence numbers, previewed before the gated\n"
-            "(mock-only this phase) write into scripts/ + the guard suite.[/dim]",
-            id="lane-promote-body",
-        )
-        yield Label(
-            "[dim]\\[P] compute + preview the catalog-promotion scaffold (gated write)[/dim]",
-            id="lane-promote-hint",
-        )
+        with ScrollableContainer(id="lane-promote-scroll"):
+            yield Label(
+                "⑤ Promotion Preview / Scaffold",
+                id="lane-promote-heading",
+            )
+            yield Static(
+                "[yellow]preview only — no catalog write yet[/yellow]",
+                id="lane-promote-badge",
+            )
+            yield Static(
+                "[bold]Prerequisites[/bold]\n"
+                "  [dim]·[/dim] fit-checked\n"
+                "  [dim]·[/dim] weights on disk\n"
+                "  [dim]·[/dim] served (②)\n"
+                "  [dim]·[/dim] gated (③)\n"
+                "  [dim]·[/dim] measured vs bar (④)",
+                id="lane-promote-prereqs",
+            )
+            yield Static(
+                "[bold]Will scaffold[/bold]\n"
+                "  [dim]models/&lt;model&gt;/… profile YAML · compose_registry entry · "
+                "compat rows[/dim]\n"
+                "  [dim](run ① Bring fit-check first)[/dim]",
+                id="lane-promote-will",
+            )
+            with Horizontal(id="lane-promote-actions"):
+                yield Button(
+                    "Preview scaffold  P",
+                    id="lane-promote-btn",
+                    variant="warning",
+                    disabled=True,
+                )
+            yield Label(
+                "[dim]\\[P] / button — preview only · no catalog write this phase[/dim]",
+                id="lane-promote-hint",
+            )
+
+    def set_prereqs(
+        self,
+        *,
+        fit: bool,
+        weights: bool,
+        served: bool,
+        gated: bool,
+        measured: bool,
+        byo=None,
+    ) -> None:
+        """Phase 2 — green/grey checklist + enable Preview when fit is present."""
+        def g(ok: bool, label: str) -> str:
+            return (
+                f"  [green]✓[/green] {label}"
+                if ok
+                else f"  [dim]○[/dim] {label}"
+            )
+        lines = [
+            "[bold]Prerequisites[/bold]",
+            g(fit, "fit-checked"),
+            g(weights, "weights on disk"),
+            g(served, "served (②)"),
+            g(gated, "gated (③)"),
+            g(measured, "measured vs bar (④)"),
+        ]
+        try:
+            self.query_one("#lane-promote-prereqs", Static).update("\n".join(lines))
+        except Exception:
+            pass
+        will = ["[bold]Will scaffold[/bold]"]
+        if byo is not None and not getattr(byo, "error", ""):
+            repo = getattr(byo, "repo", "") or "—"
+            sib = getattr(byo, "sibling_slug", "") or getattr(byo, "profile_like", "") or "—"
+            will.append(f"  [dim]from[/dim] [cyan]{repo}[/cyan]")
+            will.append(f"  [dim]recipe-like[/dim] [green]{sib}[/green]")
+            will.append(
+                "  [dim]models/&lt;id&gt;.yml · compose_registry _entry · "
+                "compat rows[/dim]"
+            )
+        else:
+            will.append("  [dim](run ① Bring fit-check first)[/dim]")
+        try:
+            self.query_one("#lane-promote-will", Static).update("\n".join(will))
+        except Exception:
+            pass
+        try:
+            btn = self.query_one("#lane-promote-btn", Button)
+            btn.disabled = not fit
+        except Exception:
+            pass
 
 
 # ── Mode switcher (left rail) ─────────────────────────────────────────────────────
@@ -4335,13 +5817,30 @@ class RailStatus(Static):
             lines.append(f"{bar} GPU{i} {used:.0f}/{total:.0f}G")
         lines.append("")
         if state.matched_slug:
-            lines.append(f"model   {state.matched_slug}")
+            # F9: a port/substring registry match is a SHAPE guess, not a verified
+            # identity — a brought model on a sibling's port masquerades as the
+            # sibling otherwise.  Lead with the PROBED served id + 👤 badge and
+            # demote the slug to "shape"; only an exact-container match may claim
+            # the slug as the identity.
+            _conf = (getattr(state.target, "match_confidence", "") or "") if state.target is not None else ""
+            _served = (getattr(state.target, "model", "") or "").strip() if state.target is not None else ""
+            if _conf == "shape":
+                lines.append(f"model   {_served or state.matched_slug} 👤")
+                if _served:
+                    lines.append(f"[dim]shape   {state.matched_slug}[/dim]")
+            else:
+                lines.append(f"model   {state.matched_slug}")
         elif state.target is not None and getattr(state.target, "model", ""):
             lines.append(f"model   {state.target.model}")
         dr = state.doctor
         if dr.reachable:
             glyph = "[green]●[/green]" if dr.serving else "[yellow]○[/yellow]"
             lines.append(f"{glyph} {dr.summary}")
+            # F3: the endpoint, compactly (the rail is ~30 cols — the FULL URL
+            # lives on the Orchestration serving card; [u] copies it anywhere).
+            _port = getattr(state.target, "host_port", 0) or 0
+            if _port:
+                lines.append(f"[dim]api :{_port}/v1 · \\[u] copy[/dim]")
         elif dr.booting:
             lines.append("[yellow]⏳[/yellow] booting…")
         else:
@@ -4683,6 +6182,8 @@ _PALETTE_COMMANDS: tuple[tuple[str, str, str], ...] = (
     ("primary_action", "Serve selected / primary action", "⏎ — serve the selected slug (reconcile-gated)"),
     ("explain", "Explain selected slug", "Catalog — detail + cross-rig benchmarks"),
     ("filter_catalog", "Filter catalog", "Catalog — filter by slug / engine / status"),
+    ("toggle_catalog_deprecated", "Show/hide deprecated", "Catalog — reveal 🗑️ deprecated slugs (hidden by default)"),
+    ("copy_endpoint", "Copy the serving API URL", "Run & Operate — copy http://<lan>:<port>/v1 for your agent/client (no auth by default)"),
     ("set_default", "Set default", "Catalog — pin the selected slug as model default"),
     ("clear_default", "Clear default", "Catalog — clear the model default pin"),
     ("optimize_card", "Optimize for my card", "Catalog — v0.10.0 seam (not available yet)"),
@@ -4691,6 +6192,7 @@ _PALETTE_COMMANDS: tuple[tuple[str, str, str], ...] = (
     ("serving_restart", "Restart serving", "Orchestration — restart the serving container (gated)"),
     ("serving_switch", "Switch model", "Orchestration — flip to the Catalog tab to pick another"),
     ("estate_off", "Stop ALL (estate down)", "Orchestration — tear down the whole estate (gated)"),
+    ("new_pod", "New pod…", "Orchestration — compose a new pod (model + GPU set), fit-checked + gated"),
     ("power_cap", "Power cap…", "Orchestration — power-cap menu: default 230W / clear / custom W (gated)"),
     ("power_cap_sweep", "Power cap sweep", "Doctor — sweep power caps + bench at each (gated)"),
     ("container_logs", "Container logs", "Containers — stream the selected container's logs"),
@@ -4705,8 +6207,8 @@ _PALETTE_COMMANDS: tuple[tuple[str, str, str], ...] = (
     # Producer lane (Bring & Validate) — filtered out on the lean surface.
     ("serve_untested", "Serve untested (② Serve)", "Producer lane — generate a compose + serve it untested"),
     ("measure_vs_bar", "Compare vs catalog bar (④ Measure)", "Producer lane — read · flags protocol"),
-    ("evaluate_target", "Evaluate running target", "Producer lane — c3t evaluate (confirm-gated)"),
-    ("promote_catalog", "Promote to catalog (⑤ Promote)", "Producer lane — scaffold + gated write"),
+    ("evaluate_target", "Evaluate running target (preview)", "Producer lane — c3t evaluate (mock this phase)"),
+    ("promote_catalog", "Promotion scaffold preview (⑤)", "Producer lane — preview only, no catalog write yet"),
 )
 
 # The producer-only subset — kept in sync with ``CockpitApp._PRODUCER_ONLY`` (a
@@ -4797,9 +6299,10 @@ class CockpitApp(App):
         Binding("q", "quit", "Quit", show=True),
         Binding("question_mark", "help", "Help", show=True),
         Binding("r", "refresh", "Refresh", show=True),
-        # Sub-tab cycle — shown only in modes that have sub-tabs (check_action gates).
+        # Sub-tab cycle — shown when the mode has sub-tabs (check_action gates).
+        # show=True so `]` surfaces in the footer on the producer lane (phase 1.3).
         Binding("left_square_bracket", "prev_subtab", "Prev tab", show=False),
-        Binding("right_square_bracket", "next_subtab", "Next tab", show=False),
+        Binding("right_square_bracket", "next_subtab", "Next tab", show=True),
         # Arrow-key focus descent (keyboard-nav enhancement):
         #   [down] on the tab bar → descend INTO the active tab's primary list.
         #     A NON-priority binding: the tab bar (ContentTabs) does NOT consume
@@ -4832,23 +6335,31 @@ class CockpitApp(App):
         Binding("S", "settings", "Settings", show=True),
         # Context-sensitive — check_action enables/shows them only in the right mode.
         Binding("slash", "filter_catalog", "Filter", show=False),
+        Binding("backslash", "toggle_catalog_model", "Model", show=False),
+        Binding("h", "toggle_catalog_deprecated", "Deprecated", show=False),
+        Binding("u", "copy_endpoint", "API URL", show=False),
         Binding("e", "explain", "Explain", show=False),
         # 2-mode merge: [1] = merged Run & Operate, [2] = Bring & Validate lane.
         Binding("1", "mode_run", "Run & Operate", show=True),
         Binding("2", "mode_validate", "Bring & Validate", show=True),
+        # Footer description is rewritten live by `_sync_footer_labels` (Fit-check /
+        # Serve / Launch step / …) — "Select" is only the class default.
         Binding("enter", "primary_action", "Select", show=True),
         # Catalog (Run) — default pin management (.env write, gated=no GPU).
         Binding("d", "set_default", "Set default", show=False),
         Binding("D", "clear_default", "Clear default", show=False),
         # Operate · Containers — logs (read) + restart/stop (gated writes).
-        # [s] is context-sensitive: restart (Operate · Containers) vs submit
-        # (Validate · Evidence) — routed by mode/tab in action_s_key.
+        # [s] is context-sensitive: restart (Containers) · Continue → ② Serve
+        # (① Bring) · submit (④ Measure) — routed in action_s_key; description
+        # rewritten by `_sync_footer_labels`.  show=True so check_action can surface
+        # it when the action is live (phase 1.3).
         Binding("l", "container_logs", "Logs", show=False),
-        Binding("s", "s_key", "Restart / Submit", show=False),
+        Binding("s", "s_key", "Restart / Submit", show=True),
         Binding("x", "container_stop", "Stop", show=False),
         Binding("X", "container_rm", "Remove", show=False),
         # Operate · Orchestration — stop all (estate down, gated write).
         Binding("o", "estate_off", "Stop all", show=False),
+        Binding("N", "new_pod", "New pod", show=False),
         # Operate · Orchestration — power-cap menu (default / clear / custom W).
         Binding("c", "power_cap", "Power cap", show=False),
         # Operate · Doctor — power-cap sweep (heavy A/B bench; gated rig write).
@@ -4856,18 +6367,28 @@ class CockpitApp(App):
         # Operate · Containers / Validate — context-sensitive read keys.
         Binding("t", "context_t", "Top / Sort", show=False),
         # Phase 5 — the three v2 hooks:
-        #   [v] Operate · evaluate the running target via c3t (confirm-gated, mock-only)
-        #   [P] Run · promote the BYO model to the catalog (scaffold + gated write)
-        #   [O] Run · optimize for my card (dormant v0.10.0 seam)
-        Binding("v", "evaluate_target", "Evaluate", show=False),
-        Binding("P", "promote_catalog", "Promote", show=False),
+        #   [v] Evaluate via c3t (mock this phase — label says so)
+        #   [P] Promotion scaffold preview (no live catalog write this phase)
+        #   [O] Optimize for my card (dormant v0.10.0 seam)
+        Binding("v", "evaluate_target", "Evaluate (preview)", show=False),
+        Binding("P", "promote_catalog", "Scaffold preview", show=False),
         # R3b-1 — producer lane ② Serve: generate a compose + serve it untested
         # (also reachable via ⏎ on the ② Serve stage).
         Binding("g", "serve_untested", "Serve untested", show=False),
-        Binding("O", "optimize_card", "Optimize", show=False),
+        Binding("O", "optimize_card", "Optimize (soon)", show=False),
+        # Phase 3 — start over / new bring (clear ① cache + disarm ②).
+        Binding("ctrl+n", "new_bring", "New bring", show=False),
         # R3b-2 — producer lane ④ Measure: compare the selected tag's measured
         # numbers to the curated catalog bar (READ · producer-only).
         Binding("m", "measure_vs_bar", "vs catalog bar", show=False),
+        # Funnel §2b-6 — ① Bring: download the fit-checked repo's weights.
+        # show=True — check_action surfaces it only when a fit-check is ready.
+        Binding("D", "bring_download", "Download weights", show=True),
+        # [k] cancels an in-flight ① Bring download.  Shares "k" with serving_stop;
+        # check_action gates it to mode 1 + a live download so they're disjoint
+        # (same duplicate-key + check_action pattern as the modal's k=stop /
+        # k=cancel_download).
+        Binding("k", "bring_cancel_download", "Cancel download", show=True),
         # R3b-2 — producer lane: the ~43-min FULL validation battery
         # (report.sh --full) — confirm-gated, bg-streamed, producer-only, uses the
         # serving model (claims no GPU); NEVER auto-fired.
@@ -5023,6 +6544,11 @@ class CockpitApp(App):
     _CONTEXT_KEYS: dict[str, tuple[set[int], Optional[set[str]]]] = {
         # Merged mode 0 · Catalog tab
         "filter_catalog":   ({0}, {"tab-catalog"}),  # Catalog
+        "toggle_catalog_deprecated": ({0}, {"tab-catalog"}),  # Catalog — [h] hide/show deprecated
+        # [u] copy the serving API URL — the endpoint is rig-global, so it's
+        # live on EVERY merged-mode tab (F3; guards inside the action when
+        # nothing is serving).
+        "copy_endpoint":    ({0}, {"tab-catalog", "tab-orchestration", "tab-containers", "tab-doctor"}),
         "explain":          ({0}, {"tab-catalog"}),  # Catalog (guards inside action)
         "set_default":      ({0}, {"tab-catalog"}),  # Catalog
         "clear_default":    ({0}, {"tab-catalog"}),  # Catalog
@@ -5039,6 +6565,7 @@ class CockpitApp(App):
         "full_report":      ({0, 1}, {"tab-doctor", "tab-run"}),
         # Merged mode 0 · Orchestration tab
         "estate_off":       ({0}, {"tab-orchestration"}),
+        "new_pod":      ({0}, {"tab-orchestration"}),
         "power_cap":        ({0}, {"tab-orchestration"}),
         # power-cap sweep lives on Doctor now (a tuning/diagnostic bench, not a
         # live-estate control) — prune was removed from the cockpit entirely.
@@ -5127,6 +6654,39 @@ class CockpitApp(App):
         if self._surface != "producer" and action in self._PRODUCER_ONLY:
             return False
 
+        # [k] cancels an in-flight ① Bring download — enabled ONLY in mode 1 with
+        # a live download, so the shared "k" falls through to serving_stop
+        # everywhere else (mode 1 is producer-only, so no surface leak).
+        if action == "bring_cancel_download":
+            # Cancelable when this session started a download (tracker) OR a
+            # disk-truth download lock is live for the fit-checked repo (a
+            # prior session / bare pull.sh — the tracker can't see it). #617.
+            return self._active_mode == 1 and (
+                bool(self._active_bring_download())
+                or self._bring_disk_download()[1] is not None
+            )
+
+        # [D] Bring download — only on ① Bring after a successful fit-check
+        # (and not while already downloading).  Disjoint from Catalog [D]
+        # clear_default via mode+tab.  Phase 1.3: show=True + this gate.
+        if action == "bring_download":
+            if self._active_mode != 1 or self._active_validate_tab() != "tab-bring":
+                return False
+            byo = self._last_byo
+            if byo is None or getattr(byo, "error", ""):
+                return False
+            repo = getattr(byo, "repo", "") or ""
+            if repo and (
+                repo in self._active_bring_download()
+                or self._data.bring_download_in_progress(repo) is not None
+            ):
+                return False
+            # Offer [D] when weights are absent/unknown; hide when already on disk
+            # (next step is [s] Continue).
+            if repo and self._data.bring_weights_present(repo):
+                return False
+            return True
+
         # Arrow-key focus descent (tab bar ↔ primary list).  These are gated here —
         # BEFORE _ALWAYS_ON — so the result is fully controlled (neither is in
         # _ALWAYS_ON / _PRODUCER_ONLY).  show=False, so the bool only governs whether
@@ -5206,7 +6766,8 @@ class CockpitApp(App):
             if self._active_mode == 0:
                 return self._current_subtab() == "tab-containers"
             if self._active_mode == 1:
-                return self._active_validate_tab() == "tab-evidence"
+                # ① Bring (advance → ② Serve) + ④ Measure (submit-to-localmaxxing)
+                return self._active_validate_tab() in ("tab-bring", "tab-evidence")
             return False
 
         # Sub-tab cycle keys: both modes have sub-tabs (merged 0 = 4 tabs; lane 1
@@ -5280,6 +6841,63 @@ class CockpitApp(App):
             return True
         return False
 
+    def _relabel_binding(self, action: str, description: str) -> None:
+        """Rewrite a BINDING description in place (footer label). Same pattern as
+        ConfirmActionScreen's Start/Stop relabel — per-instance copy only."""
+        import dataclasses
+
+        try:
+            for bindings in self._bindings.key_to_bindings.values():
+                for i, b in enumerate(bindings):
+                    if b.action == action and b.description != description:
+                        bindings[i] = dataclasses.replace(b, description=description)
+                        return
+        except Exception:
+            pass
+
+    def _sync_footer_labels(self) -> None:
+        """Phase 1.3 — mirror the live meaning of context keys in the footer.
+
+        Relabels ``primary_action`` (⏎) and ``s_key`` (s) for the current mode/tab.
+        Visibility still comes from check_action + Binding.show; this only updates
+        the description strings."""
+        # ── ⏎ primary ────────────────────────────────────────────────────────
+        enter_label = "Select"
+        if self._active_mode == 0:
+            tab = self._current_subtab()
+            if tab == "tab-catalog":
+                enter_label = "Serve"
+            elif tab == "tab-orchestration":
+                enter_label = "Switch scene"
+        elif self._active_mode == 1:
+            tab = self._active_validate_tab()
+            enter_label = {
+                "tab-bring": "Fit-check",
+                "tab-serve": "Serve",
+                "tab-run": "Launch step",
+                "tab-evidence": "Open report",
+                "tab-promote": "Scaffold preview",
+            }.get(tab or "", "Select")
+        self._relabel_binding("primary_action", enter_label)
+
+        # ── s (Continue / Submit / Restart) ───────────────────────────────────
+        s_label = "Restart / Submit"
+        if self._active_mode == 0 and self._current_subtab() == "tab-containers":
+            s_label = "Restart"
+        elif self._active_mode == 1:
+            vtab = self._active_validate_tab()
+            if vtab == "tab-bring":
+                s_label = "Continue → ② Serve"
+            elif vtab == "tab-evidence":
+                s_label = "Submit"
+        self._relabel_binding("s_key", s_label)
+
+        # ── ] next tab (producer-friendly label on the lane) ──────────────────
+        if self._active_mode == 1:
+            self._relabel_binding("next_subtab", "Next stage")
+        else:
+            self._relabel_binding("next_subtab", "Next tab")
+
     def __init__(self, repo_root: Path, *, data: Optional[CockpitData] = None,
                  surface: str = "producer", **kwargs):
         super().__init__(**kwargs)
@@ -5309,6 +6927,9 @@ class CockpitApp(App):
         self._target_slug: str = ""
         self._target_model: str = ""
         self._target_url: str = ""
+        # F9: the slug match GRADE ("identity" | "shape" | "") from the last
+        # estate poll — a shape match must never be presented as an identity.
+        self._target_confidence: str = ""
         # Phase 5: the SHARED ServingTarget OBJECT from the last estate poll —
         # held by identity so the c3t Evaluate hand-off passes the SAME dataclass
         # instance c3t speaks (design §4/§6.6), not a reconstructed copy.
@@ -5341,6 +6962,10 @@ class CockpitApp(App):
         # Phase 5: the last BYO fit-check result (Run · BYO) — the arch facts
         # the Promote-to-catalog scaffold computes from.
         self._last_byo: Optional[ByoResult] = None
+        # Bring funnel (§2b): the last stage-1 inventory + the user's GGUF pick
+        # — drive the staged reveal + the artifact→engine/topology filters.
+        self._last_inventory: Optional[ArtifactInventory] = None
+        self._funnel_gguf_pick: str = ""
         # Phase R / R2b: failure context for the [!] problem report — captured AT
         # a failed serve in dispatch_action (the slug + the boot-log lines that
         # were streamed into the serve-live pane) so problem_report can assemble
@@ -5454,7 +7079,8 @@ class CockpitApp(App):
                     # the user can flip to Orchestration (SAME mode) to watch.
                     # Hidden until ⏎ on a Catalog row stages a serve and the
                     # reconcile-gated confirm commits.
-                    yield LivePane(id="serve-live")
+                    # Hidden until a serve streams — no idle placeholder.
+                    yield LivePane(id="serve-live", placeholder="")
 
                 # Mode 1 — Bring & Validate (producer lane).  Renumbered 2→1 in the
                 # 2-mode merge.  An ORDERED, numbered pipeline reusing the
@@ -5476,7 +7102,7 @@ class CockpitApp(App):
                             yield ValidateRunPane(id="validate-run-pane")
                         with TabPane("④ Measure", id="tab-evidence"):
                             yield ValidateEvidencePane(id="validate-evidence-pane")
-                        with TabPane("⑤ Promote", id="tab-promote"):
+                        with TabPane("⑤ Promotion Preview", id="tab-promote"):
                             yield LanePromotePane(id="lane-promote-pane")
         # #5 — a Tab-traversable footer so keyboard users can reach the footer
         # affordances (in addition to the hotkeys).
@@ -5510,6 +7136,8 @@ class CockpitApp(App):
         # FIX 1 — sync the base-footer suppression to the initial (modal-free)
         # stack so it starts visible.
         self._sync_base_footer_visibility()
+        # Phase 1.3 — seed footer labels (Serve / etc.) for the boot mode/tab.
+        self._sync_footer_labels()
         # MUST-FIX 1 — boot with focus on mode 0's primary list (#catalog-table),
         # NOT the tab bar.  Textual auto-focuses the ContentTabs (a Tabs subclass)
         # at startup BEFORE the startup tab-catalog TabActivated fires, and FIX B's
@@ -5628,6 +7256,28 @@ class CockpitApp(App):
             self.query_one("#operate-orch-pane", OperateOrchPane).refresh_gpu_cards(gpus)
         except Exception:
             pass
+        # F3b: readiness fast-flip. api_booting only clears when the HEAVY
+        # docker+health batch re-runs — so "⏳ booting" outlived actual readiness
+        # by a poll cycle (audit: ≥25s stale). While booting, piggyback a CHEAP
+        # direct /v1/models probe on this fast tick; on 200, pull the next heavy
+        # poll forward (burst regime) so every "booting" surface flips promptly.
+        # Bounded: fires ONLY in the booting state, 1.5s timeout, best-effort.
+        state = getattr(self, "_last_estate_state", None)
+        if state is not None and getattr(state.doctor, "booting", False):
+            url = (getattr(state.target, "url", "") or "").strip()
+            if not url:
+                port = getattr(state.target, "host_port", 0) or 0
+                url = f"http://localhost:{port}" if port else ""
+            if url:
+                try:
+                    import httpx
+                    async with httpx.AsyncClient(timeout=1.5) as client:
+                        r = await client.get(f"{url.rstrip('/')}/v1/models")
+                    if r.status_code == 200:
+                        import time as _t
+                        self._docker_burst_until = _t.monotonic() + 6.0
+                except Exception:
+                    pass
 
     def _docker_poll_due(self) -> bool:
         """Whether THIS tick runs the heavy docker+host batch, by regime: burst (within
@@ -6016,6 +7666,7 @@ class CockpitApp(App):
         tgt = state.target
         self._target_model = getattr(tgt, "model", "") or ""
         self._target_url = getattr(tgt, "url", "") or ""
+        self._target_confidence = getattr(tgt, "match_confidence", "") or ""
         # Hold the SHARED ServingTarget object (by identity) for the c3t Evaluate
         # hand-off — design §4/§6.6 requires passing the SAME dataclass instance.
         self._target_obj = tgt
@@ -6126,7 +7777,7 @@ class CockpitApp(App):
         # the Run marker fresh.
         try:
             cat = self.query_one("#catalog-pane", CatalogPane)
-            cat.set_serving_slug(self._target_slug)
+            cat.set_serving_slug(self._target_slug, self._target_confidence)
             # A6: feed the Run catalog the LIVE per-GPU free-VRAM so a
             # "fits-clean" row that would OOM right now (e.g. GPU0 holding
             # ComfyUI) is downgraded.  Derived from THIS poll's GpuInfo
@@ -6261,6 +7912,185 @@ class CockpitApp(App):
 
     # ── BYO fit-check ────────────────────────────────────────────────────────────────
 
+    def _trigger_lane_inspect(self) -> None:
+        """[Inspect] / ⏎ on the ① Bring repo input: stage-1 of the funnel —
+        the deriver artifact inventory (§2b-1).  Nothing template-side shows
+        until this succeeds."""
+        try:
+            repo = self.query_one("#lane-bring-url-input", Input).value.strip()
+        except Exception:
+            return
+        if not repo:
+            self.notify("Enter an HF repo (org/Model).", title="① Bring", severity="warning", timeout=3)
+            return
+        self.run_bring_inspect(repo)
+
+    def _known_gpu_vram_gb(self) -> Optional[float]:
+        """Best-known per-card VRAM (GiB) from the last estate poll — the MIN
+        across cards (heterogeneous rigs: the smallest card dictates the pool,
+        mirroring the launcher's het-clamp).  None before the first poll —
+        the funnel then applies NO size floor (never guess-hide)."""
+        st = self._last_estate_state
+        gpus = getattr(st, "gpus", None) if st is not None else None
+        if not gpus:
+            return None
+        totals = [g.mem_total_mib for g in gpus if getattr(g, "mem_total_mib", 0) > 0]
+        return (min(totals) / 1024.0) if totals else None
+
+    def _funnel_options_for(
+        self, artifact_format: str, artifact_gb: Optional[float]
+    ) -> list[tuple[str, str]]:
+        """The stage-3 slug options for the current artifact (§2b-3/4/5):
+        compat-filtered, topology-floored by size vs the rig, topology-first
+        labels, sentinel appended."""
+        opts = funnel_slug_options(
+            self._variants or [],
+            artifact_format,
+            artifact_gb=artifact_gb,
+            vram_gb=self._known_gpu_vram_gb(),
+            gpu_count=self._known_gpu_count(),
+        )
+        return profile_select_options(opts)
+
+    def _reveal_funnel_slugs(
+        self, artifact_format: str, artifact_gb: Optional[float]
+    ) -> None:
+        vram = self._known_gpu_vram_gb()
+        gpus = self._known_gpu_count()
+        opts = funnel_slug_options(
+            self._variants or [],
+            artifact_format,
+            artifact_gb=artifact_gb,
+            vram_gb=vram,
+            gpu_count=gpus,
+        )
+        # ONE visible recommendation (§2b follow-up): smallest fitting
+        # topology + curated engine preference — starred AND pre-selected;
+        # the full filtered list stays reachable below it.
+        rec = funnel_recommended(
+            opts, list(getattr(self._data, "catalog_defaults", None) or [])
+        )
+        pairs = [
+            ((f"⭐ {label}" if value == rec else label), value)
+            for (label, value) in profile_select_options(opts)
+        ]
+        try:
+            pane = self.query_one("#lane-bring-pane", LaneBringPane)
+            pane.reveal_slug_stage(pairs, rec)
+            # Dogfood r2 — the pre-selected recommendation's details show
+            # immediately (updates ride on_select_changed thereafter).
+            pane.show_slug_details(self._funnel_slug_details(rec) if rec else "")
+            # Bug A (2026-07-09): the §2b size floor can hide EVERY slug — a 54G
+            # bf16 repo on a 48G rig — leaving only the ✎ sentinel with NO
+            # explanation.  Surface an honest verdict, distinguishing "too big for
+            # the rig" (compat slugs exist but all exceed VRAM) from "no compatible
+            # recipe" (artifact→engine compat matched nothing at all).
+            if not opts:
+                unfloored = funnel_slug_options(self._variants or [], artifact_format)
+                if unfloored and artifact_gb:
+                    total = (vram or 0) * (gpus or 0)
+                    rig = (
+                        f"{gpus}×{vram:.0f}={total:.0f} GB total"
+                        if (vram and gpus) else "your rig's VRAM"
+                    )
+                    pane.set_next_hint(
+                        f"[yellow]⚠ won't fit[/yellow] — these weights "
+                        f"(~{artifact_gb:.0f} GB) exceed every topology on {rig}. "
+                        f"Bring a smaller quant (an FP8 build, or a GGUF) — "
+                        f"or ✎ custom slug to point at one by hand."
+                    )
+                else:
+                    pane.set_next_hint(
+                        "[yellow]no catalog recipe matches this artifact[/yellow] "
+                        "— use ✎ custom slug to point at one by hand."
+                    )
+        except Exception:
+            pass
+
+    def _funnel_slug_details(self, slug: str) -> str:
+        """Dogfood r2 — the SELECTED catalog slug's key facts for the Bring
+        pane's detail card: status · ctx · port · drafter · vision · the
+        shipped bar (with the staleness dagger).  Pure read of the cached
+        variants (the baseline dict rides each row via the emit join)."""
+        row = next(
+            (v for v in (self._variants or []) if getattr(v, "slug", "") == slug),
+            None,
+        )
+        if row is None:
+            return ""
+        status = (getattr(row, "status", "") or "").strip()
+        lines = [
+            f"  [bold]{slug}[/bold]  [dim]·[/dim]  {_status_glyph(status)} {status or '—'}"
+            f"  [dim]·[/dim]  ctx {getattr(row, 'ctx_label', '') or '—'}"
+            f"  [dim]·[/dim]  port {getattr(row, 'port', '') or '—'}"
+        ]
+        drafter = str(getattr(row, "drafter", "") or "")
+        vision = bool(getattr(row, "vision", False))
+        facets = []
+        if drafter:
+            facets.append(f"drafter {drafter}")
+        if vision:
+            facets.append("vision")
+        if facets:
+            lines.append(f"  [dim]{' · '.join(facets)}[/dim]")
+        b = getattr(row, "baseline", None) or {}
+        n, c = b.get("narr_tps"), b.get("code_tps")
+        if n is not None or c is not None:
+            tps = (f"{n:.0f}" if n is not None else "—") + "/" + (
+                f"{c:.0f}" if c is not None else "—")
+            bar = f"  [bold]bar[/bold]  {tps} TPS"
+            if b.get("quality_8pk"):
+                bar += f"  ·  8pk {b['quality_8pk']}"
+            prov = " · ".join(str(x) for x in (b.get("date"), b.get("rig")) if x)
+            if prov:
+                bar += f"  [dim]({prov})[/dim]"
+            if b.get("stale") is True:
+                bar += "  [yellow]† re-bench owed[/yellow]"
+            lines.append(bar)
+        # Cross-rig submissions — rig-labeled, NEVER merged into the bar (a 4-card /
+        # 5090 number isn't this rig's bar). This is what surfaces submission-only
+        # slugs (e.g. multi-fast: 4-card, no on-rig bar) in the detail card.
+        for rc, s in sorted((b.get("submissions") or {}).items()):
+            sn, sc = s.get("narr_tps"), s.get("code_tps")
+            stps = (f"{sn:.0f}" if sn is not None else "—") + "/" + (
+                f"{sc:.0f}" if sc is not None else "—")
+            sub = f"  [bold]⑂ {rc}[/bold]  {stps} TPS"
+            if s.get("quality_8pk"):
+                sub += f"  ·  8pk {s['quality_8pk']}"
+            sub += (
+                f"  [dim]({s.get('tier')} · {s.get('date')} · {s.get('submitted_by')})[/dim]"
+            )
+            lines.append(sub)
+        note = (getattr(row, "status_note", "") or "").strip()
+        if note:
+            lines.append(f"  [yellow]caveat: {note}[/yellow]")
+        return "\n".join(lines)
+
+    @work(exclusive=True, group="byo")
+    async def run_bring_inspect(self, repo: str) -> None:
+        """Stage-1 INSPECT worker: deriver artifact inventory → staged reveal.
+        GGUF present → quant pick first (slugs stay hidden); safetensors →
+        straight to the compat-filtered slug stage."""
+        lane_pane = None
+        try:
+            lane_pane = self.query_one("#lane-bring-pane", LaneBringPane)
+            lane_pane.set_inspecting(repo)
+        except Exception:
+            lane_pane = None
+        inv = await self._data.bring_inspect(repo)
+        self._last_inventory = inv
+        self._funnel_gguf_pick = ""
+        if lane_pane is not None:
+            lane_pane.show_inventory(inv)
+        if inv.error:
+            return
+        if inv.has_safetensors:
+            # §2b-1: the safetensors set is the artifact — slugs reveal now.
+            self._reveal_funnel_slugs("safetensors", inv.safetensors_size_gb or None)
+        elif lane_pane is not None:
+            # GGUF-only: slugs stay hidden until the quant pick (§2b-2).
+            lane_pane.hide_slug_stage()
+
     @work(exclusive=True, group="byo")
     async def run_byo_check(self, repo: str, profile_like: str) -> None:
         # The fit-check is the producer lane's ① Bring stage (the standalone Run ·
@@ -6296,19 +8126,452 @@ class CockpitApp(App):
             except Exception:
                 pass
             return
-        res = await self._data.byo_check(repo, profile_like)
+        # Phase 4 route-G: GGUF pick → bypass vLLM/safetensors deriver.
+        # Budget = 24 GiB × topology cards of the chosen sibling (dual/multi).
+        gguf_quant, gguf_gb = self._funnel_gguf_selection()
+        if gguf_quant:
+            cards = self._data.topology_cards_for_profile(profile_like)
+            res = self._data.byo_check_gguf(
+                repo,
+                profile_like,
+                quant=gguf_quant,
+                size_gb=gguf_gb or 0.0,
+                card_vram_gb=24.0 * max(1, cards),
+            )
+        else:
+            res = await self._data.byo_check(repo, profile_like)
         # Cache the arch facts for the lane ② Serve + the Promote scaffold (Phase 5).
         self._last_byo = res
+        # Probe on-disk ONCE (skip on a fit-check error) — feeds BOTH the verdict
+        # card's presence-aware next-step and the weights-line below, so they can't
+        # disagree (the [D]-when-already-present contradiction).
+        weights_present = bool(
+            not getattr(res, "error", "")
+            and self._data.bring_weights_present(repo)
+        )
+        # #617: a re-run fit-check (or refresh) must SEE an in-flight [D] download
+        # for this repo — render "⏳ downloading" + suppress the [D] re-offer,
+        # rather than the stale disk verdict that invites a second 20+ GB fetch.
+        # Two sources: the in-memory tracker (this session) OR disk truth (the
+        # pull-dir download lock) — the latter survives a c3 restart AND sees a
+        # download started outside this session (a bare pull.sh --apply-swap).
+        disk_dl = self._data.bring_download_in_progress(repo)
+        downloading = (repo in self._active_bring_download()) or bool(disk_dl)
         if lane_pane is not None:
-            lane_pane.populate(res)
+            lane_pane.populate(res, weights_present, downloading=downloading)
         # N9 — carry the fit-check result forward: pre-arm ② Serve with the
         # resolved target so the producer pipeline flows ① → ② without re-entry.
         try:
-            self.query_one("#lane-serve-pane", LaneServePane).set_armed(
-                res if not getattr(res, "error", "") else None
+            armed_byo = res if not getattr(res, "error", "") else None
+            self._arm_serve_pane(armed_byo)
+        except Exception:
+            pass
+        # §2b-6/7 — weights state after a successful fit-check: on disk → the
+        # ② Serve handoff is explicit; absent → the [D] download affordance.
+        if lane_pane is not None:
+            if getattr(res, "error", ""):
+                lane_pane.set_weights_line("")
+            elif downloading:
+                pct = (disk_dl or {}).get("pct")
+                pcts = f" (resuming {pct}%)" if isinstance(pct, int) else ""
+                lane_pane.set_weights_line(
+                    f"  [cyan]⏳ downloading{pcts}…[/cyan] [dim](in progress — leave "
+                    "it running; \\[k] cancels)[/dim]"
+                )
+            elif weights_present:
+                lane_pane.set_weights_line(
+                    "  [green]✓ weights on disk[/green] — "
+                    "[green]→ ② Serve[/green] [dim](press \\[s] to continue)[/dim]"
+                )
+            else:
+                lane_pane.set_weights_line(
+                    "  [yellow]weights not on disk[/yellow] — press [bold]\\[D][/bold] "
+                    "to download via pull.sh [dim](SHA-verified, streams here; "
+                    "disk write only, no GPU claim)[/dim]"
+                )
+        # Footer: surface [s] Continue / [D] Download after a fit-check (1.3).
+        try:
+            self._sync_footer_labels()
+            self.refresh_bindings()
+        except Exception:
+            pass
+
+    def _active_bring_download(self) -> dict:
+        """repo → {handle, profile_like, apply_swap} for an in-flight ① Bring
+        [D] download (lazy).  Repo-keyed so a re-run fit-check / refresh can SEE
+        the download in flight — the parity gap with the catalog
+        ``_active_downloads`` that produced BOTH #617 dogfood bugs: the
+        'apply-swap did not complete' false-negative (verdict raced the marker)
+        and the re-offer-[D] double-download (fit-check was blind to the run)."""
+        d = getattr(self, "_bring_downloads", None)
+        if d is None:
+            d = {}
+            self._bring_downloads = d
+        return d
+
+    def _bring_disk_download(self):
+        """``(repo, info)`` when a disk-truth download lock is live for the
+        CURRENTLY fit-checked repo, else ``(None, None)``.  Lets [k] cancel a
+        download this session's in-memory tracker can't see — one started
+        before a c3 restart or by a bare ``pull.sh --apply-swap`` (#617)."""
+        byo = self._last_byo
+        repo = getattr(byo, "repo", "") if byo is not None else ""
+        if not repo:
+            return None, None
+        info = self._data.bring_download_in_progress(repo)
+        return (repo, info) if info is not None else (None, None)
+
+    def _kill_bring_pid(self, pid) -> None:
+        """Best-effort kill of a disk-detected download holder (its PID from
+        the pull-dir lock).  Tries the process GROUP first (takes the `hf`
+        child too), then the bare PID.  A leaked lock self-heals via the
+        downloader's stale-reclaim regardless."""
+        import os as _os
+        import signal as _sig
+        try:
+            pid = int(pid)
+        except (TypeError, ValueError):
+            return
+        if pid <= 0:
+            return
+        try:
+            _os.killpg(_os.getpgid(pid), _sig.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError):
+            try:
+                _os.kill(pid, _sig.SIGTERM)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+
+    def action_bring_download(self) -> None:
+        """[D] — §2b-6: download the fit-checked repo's weights (the REAL
+        pull.sh run — Path B fetch into the pull dir).  Guarded on a successful
+        fit-check; a disk write with no GPU claim, so the key press is the
+        confirm (same discipline as the catalog Download)."""
+        if self._active_mode != 1:
+            return
+        byo = self._last_byo
+        if byo is None or getattr(byo, "error", ""):
+            self.notify(
+                "Run ① Bring fit-check first — nothing to download.",
+                title="Download", severity="warning", timeout=4,
+            )
+            return
+        repo = getattr(byo, "repo", "")
+        # No-op if a download for this repo is already in flight — mirrors the
+        # catalog Download's "No-op if already downloading this slug"; stops a
+        # second 20+ GB fetch of the same repo (#617).  [k] cancels.
+        if repo in self._active_bring_download():
+            self.notify(
+                f"Already downloading {repo} — press [k] to cancel.",
+                title="Download", timeout=4,
+            )
+            return
+        # Disk-truth guard: a download from a PRIOR c3 session or a bare
+        # pull.sh holds the pull-dir lock but isn't in this session's tracker —
+        # still must not stack a duplicate (#617).  [k] cancels it.
+        _disk = self._data.bring_download_in_progress(repo)
+        if _disk is not None:
+            self.notify(
+                f"Already downloading {repo} (pid {_disk.get('pid')}) — "
+                "press [k] to cancel.",
+                title="Download", timeout=4,
+            )
+            return
+        if self._data.bring_weights_present(repo):
+            self.notify("Weights already on disk.", title="Download", timeout=3)
+            return
+        # Phase 3 B23 — disk-fit + size preflight (reuse catalog weights_fits_disk).
+        size_gb = self._bring_expected_size_gb()
+        fits, free_gb, need_gb = True, 0.0, 0.0
+        if size_gb and size_gb > 0:
+            from club3090_cockpit.data import WeightsMeta
+
+            meta = WeightsMeta(hf_repo=repo, size_gb=float(size_gb))
+            fits, free_gb, need_gb = self._data.weights_fits_disk(meta)
+        try:
+            pane = self.query_one("#lane-bring-pane", LaneBringPane)
+            size_s = f"~{size_gb:.0f} GB" if size_gb else "size unknown"
+            if size_gb and size_gb > 0:
+                disk_s = (
+                    f"[green]● fits[/green] {free_gb:.0f} free / ~{need_gb:.0f} need"
+                    if fits else
+                    f"[red]✗ may not fit[/red] {free_gb:.0f} free / ~{need_gb:.0f} need"
+                )
+            else:
+                disk_s = "[dim]disk check skipped (size unknown)[/dim]"
+            pane.set_weights_line(
+                f"  [cyan]↓ downloading[/cyan] [bold]{repo}[/bold]  ({size_s})\n"
+                f"  {disk_s}  [dim]· \\[k] cancels · \\[S] HF token if gated[/dim]"
             )
         except Exception:
             pass
+        if size_gb and size_gb > 0 and not fits:
+            self.notify(
+                f"Disk may be tight ({free_gb:.0f} GB free / ~{need_gb:.0f} needed) "
+                "— starting anyway; free space or change Model Dir [S] if it fails.",
+                title="Download", severity="warning", timeout=8,
+            )
+        # One download at a time (shared runner + exclusive worker): starting a
+        # new repo supersedes any prior in-flight entry (the old worker's await is
+        # cancelled), so clear stale keys — otherwise an abandoned repo could stick
+        # as "already downloading" and block a later re-download of it.
+        self._active_bring_download().clear()
+        # Register synchronously so a fast re-press / re-fit-check sees it at once
+        # (the worker fills in the real handle).  Popped on terminal completion or
+        # [k] cancel.
+        self._active_bring_download()[repo] = {
+            "handle": None,
+            "profile_like": getattr(byo, "profile_like", ""),
+            "apply_swap": bool(getattr(byo, "route", "") == "C"),
+            "size_gb": size_gb,
+        }
+        self.run_bring_download_worker(repo, getattr(byo, "profile_like", ""))
+        self._sync_jobs_chip()
+
+    def _funnel_gguf_selection(self) -> tuple[str, Optional[float]]:
+        """``(quant, size_gb)`` for the ① Bring GGUF pick, or ``("", None)``."""
+        inv = getattr(self, "_last_inventory", None)
+        if inv is None or not getattr(inv, "has_gguf", False):
+            return "", None
+        try:
+            pane = self.query_one("#lane-bring-pane", LaneBringPane)
+            sel = pane.query_one("#lane-bring-gguf-select", Select)
+            q = sel.value
+            if q in (None, Select.BLANK):
+                return "", None
+            for v in inv.gguf_variants:
+                if v.quant == q:
+                    return str(q), float(v.size_gb or 0) or None
+            return str(q), None
+        except Exception:
+            return "", None
+
+    def _gguf_download_includes(self) -> list[str]:
+        """hf-download ``--include`` patterns for the picked GGUF quant: the main
+        quant file(s) + the vision mmproj + a quant-matched external MTP drafter (if
+        the repo ships one).  Empty when this isn't a GGUF bring (→ pull.sh path).
+        A GGUF repo has no config.json, so pull.sh aborts unsupported-format."""
+        quant, _ = self._funnel_gguf_selection()
+        inv = getattr(self, "_last_inventory", None)
+        if not quant or inv is None or not getattr(inv, "has_gguf", False):
+            return []
+        pats: list[str] = []
+        for v in getattr(inv, "gguf_variants", []):
+            if v.quant == quant:
+                pats += list(getattr(v, "files", []) or [f"*{quant}*.gguf"])
+                break
+        else:
+            pats.append(f"*{quant}*.gguf")
+        pats += list(getattr(inv, "gguf_mmproj", []))     # vision projector(s)
+        pats.append(f"*mtp*{quant}*.gguf")                # external MTP drafter if present
+        seen: set = set()
+        return [p for p in pats if p and not (p in seen or seen.add(p))]
+
+    def _bring_expected_size_gb(self) -> Optional[float]:
+        """Best-effort size from last Inspect inventory (safetensors total or GGUF pick)."""
+        q, gb = self._funnel_gguf_selection()
+        if q and gb:
+            return gb
+        inv = getattr(self, "_last_inventory", None)
+        if inv is None:
+            return None
+        try:
+            if getattr(inv, "has_gguf", False) and getattr(inv, "gguf_variants", None):
+                sizes = [float(v.size_gb) for v in inv.gguf_variants if v.size_gb]
+                return max(sizes) if sizes else None
+            if getattr(inv, "safetensors_size_gb", 0):
+                return float(inv.safetensors_size_gb)
+        except Exception:
+            return None
+        return None
+
+    def action_bring_cancel_download(self) -> None:
+        """[k] — cancel the in-flight ① Bring download (kills the pull.sh / hf
+        process group via the runner's SIGINT→TERM→KILL, same path as the catalog
+        cancel).  check_action gates this to mode 1 + an active download so the
+        shared [k] falls through to serving_stop everywhere else."""
+        dls = self._active_bring_download()
+        if dls:
+            # In-session download → cancel via the runner (SIGINT→TERM→KILL).
+            repo = next(iter(dls))
+            dls.pop(repo, None)
+            self._cancel_bring_download()
+        else:
+            # Disk-detected download (prior session / bare pull.sh) → kill the
+            # lock holder PID directly; the downloader's stale-reclaim frees the
+            # lock. (#617)
+            repo, info = self._bring_disk_download()
+            if info is None:
+                return
+            self._kill_bring_pid(info.get("pid"))
+        try:
+            self.query_one("#lane-bring-pane", LaneBringPane).set_weights_line(
+                "  [yellow]download cancelled[/yellow] — press [bold]\\[D][/bold] to restart"
+            )
+        except Exception:
+            pass
+        self.notify(f"Cancelled download of {repo}.", title="Download", timeout=3)
+        self._sync_jobs_chip()
+
+    def action_new_bring(self) -> None:
+        """Phase 3 — Ctrl+n: clear ①/② funnel state and start over (no disk wipe)."""
+        if self._active_mode != 1:
+            return
+        self._last_byo = None
+        self._bring_swap_compose = ""
+        self._last_inventory = None
+        try:
+            self.query_one("#lane-serve-pane", LaneServePane).set_armed(None)
+        except Exception:
+            pass
+        try:
+            pane = self.query_one("#lane-bring-pane", LaneBringPane)
+            pane.query_one("#lane-bring-url-input", Input).value = ""
+            pane.set_weights_line("")
+            pane.set_continue_visible(False)
+            pane.show_slug_details("")
+            pane.set_next_hint(
+                "[dim]next: enter an HF repo and press Inspect[/dim]"
+            )
+            pane.query_one("#lane-bring-result-card", Static).update(
+                "[dim]Enter an HF repo and Inspect — metadata only, no download. "
+                "Fit-check unlocks ② Serve.[/dim]"
+            )
+            try:
+                pane.query_one("#lane-bring-stage2-row", Vertical).add_class(
+                    "funnel-hidden"
+                )
+            except Exception:
+                pass
+        except Exception:
+            pass
+        try:
+            self.query_one("#validate-tabs", TabbedContent).active = "tab-bring"
+        except Exception:
+            pass
+        self._sync_footer_labels()
+        self.refresh_bindings()
+        self.notify(
+            "Bring state cleared — weights on disk kept. Paste a new HF repo.",
+            title="New bring", timeout=4,
+        )
+
+    def _sync_jobs_chip(self) -> None:
+        """Phase 3 B8 — header subtitle for active long jobs (download / full report)."""
+        parts: list[str] = []
+        dls = self._active_bring_download()
+        if dls:
+            repo = next(iter(dls))
+            short = repo.rsplit("/", 1)[-1]
+            parts.append(f"⏳ downloading {short} · [k] cancels")
+        if getattr(self, "_full_report_running", False):
+            parts.append("⏳ report.sh --full · ③ Gate")
+        base = "wired"
+        if self._surface == "consumer":
+            base = f"{base} · ▸ LEAN"
+        self.sub_title = f"{base} · {' · '.join(parts)}" if parts else base
+
+    @work(group="bring-download-ctl")
+    async def _cancel_bring_download(self) -> None:
+        await self._data.cancel_weights_download()
+
+    @work(exclusive=True, group="bring-download")
+    async def run_bring_download_worker(self, repo: str, profile_like: str) -> None:
+        """§2b-6/7 — stream the pull.sh download into the weights line, poll to
+        TRUE completion, then hand the verdict off an AUTHORITATIVE disk re-stat
+        (not the captured apply-swap marker).  Mirrors the catalog run_download's
+        robustness so #617's two bugs can't recur: (a) the tracker keeps the run
+        visible to a concurrent re-fit-check; (b) the verdict is derived from
+        weights-present, so a Route-C download whose weights landed but whose
+        marker was missed reads as ✓ (→ ② Serve emit-only), NOT a false failure."""
+        import asyncio
+        lane_pane = None
+        try:
+            lane_pane = self.query_one("#lane-bring-pane", LaneBringPane)
+        except Exception:
+            pass
+
+        from rich.markup import escape
+
+        def _on_line(line: str) -> None:
+            if lane_pane is not None:
+                clipped = line.strip()[-100:]
+                try:
+                    lane_pane.set_weights_line(
+                        f"  [cyan]⏳ downloading[/cyan] [dim]{escape(clipped)}[/dim] "
+                        "[dim](\\[k] cancels)[/dim]"
+                    )
+                except Exception:
+                    pass
+
+        # Route-C fine-tune → apply-swap: pull.sh downloads the brought weights
+        # AND emits a serve-locally clone of the sibling compose (--model at the
+        # weights). Any other route is the plain Path-B fetch.
+        apply_swap = bool(
+            self._last_byo is not None
+            and getattr(self._last_byo, "route", "") == "C"
+        )
+        self._bring_swap_compose = ""
+        gguf_includes = self._gguf_download_includes()
+        handle = await self._data.run_bring_download(
+            repo, profile_like, apply_swap=apply_swap,
+            gguf_includes=gguf_includes or None, on_line=_on_line,
+        )
+        # Attach the real handle to the tracker entry (registered synchronously in
+        # action_bring_download).  If it's already gone, we were cancelled before
+        # the spawn returned — bail without rendering.
+        info = self._active_bring_download().get(repo)
+        if info is None:
+            return
+        info["handle"] = handle
+        # Poll to true completion (catalog run_download pattern) so the tracker —
+        # and thus the "⏳ downloading" fit-check render — stays live for the whole
+        # fetch, not just the initial await.
+        try:
+            while not handle.done.is_set():
+                try:
+                    await asyncio.wait_for(handle.done.wait(), timeout=2.0)
+                except asyncio.TimeoutError:
+                    continue
+        except Exception:
+            pass
+        # Superseded (exclusive-worker replacement) or [k]-cancelled → the tracker
+        # no longer holds this repo.  Do NOT render a stale verdict; the owner of
+        # the newer state renders instead.
+        if repo not in self._active_bring_download():
+            self._sync_jobs_chip()
+            return
+        self._active_bring_download().pop(repo, None)
+        self._sync_jobs_chip()
+        if lane_pane is None:
+            return
+        # AUTHORITATIVE: disk truth (re-stat) wins over the exit code / marker race.
+        present = self._data.bring_weights_present(repo)
+        swap_compose = self._data.last_swap_compose() if apply_swap else ""
+        if apply_swap and swap_compose:
+            self._bring_swap_compose = swap_compose
+            lane_pane.set_weights_line(
+                "  [green]✓ weights + swap compose ready[/green] — "
+                "[green]→ ② Serve[/green] [dim](serves the brought model)[/dim]"
+            )
+        elif present and apply_swap:
+            # Weights DID land but no compose was captured — NOT a failure: ② Serve
+            # re-emits the swap compose from the present weights (apply-swap
+            # --emit-only, no re-download).  #617.
+            lane_pane.set_weights_line(
+                "  [green]✓ weights downloaded[/green] — [green]→ ② Serve[/green] "
+                "[dim](press \\[s]; emits the swap compose from disk — no re-download)[/dim]"
+            )
+        elif present:
+            lane_pane.set_weights_line(
+                "  [green]✓ weights downloaded[/green] — "
+                "[green]→ ② Serve[/green] [dim](press \\[s] to continue)[/dim]"
+            )
+        else:
+            lane_pane.set_weights_line(
+                "  [red]download did not complete[/red] — weights not on disk; "
+                "check the pull.sh output [dim](re-press \\[D] to retry)[/dim]"
+            )
 
     # ── Explain ──────────────────────────────────────────────────────────────────────
 
@@ -6712,6 +8975,7 @@ class CockpitApp(App):
             pass
         self._active_mode = index
         # Refresh the footer so bindings shown/hidden update immediately.
+        self._sync_footer_labels()
         self.refresh_bindings()
         # Move focus to the mode's primary interactive widget so context
         # keys and ⏎ act on the right thing immediately.
@@ -6924,6 +9188,36 @@ class CockpitApp(App):
 
     # ── Batch 4 · copy-to-clipboard + horizontal scroll ──────────────────────────
 
+    def _serving_endpoint_url(self) -> str:
+        """F3: the serving endpoint URL (``http://<lan>:<port>/v1``) from the
+        CACHED estate state — '' when nothing is serving / port unknown. Same
+        LAN-IP derivation as switch.sh's ready-line (services.lan_ip)."""
+        state = getattr(self, "_last_estate_state", None)
+        port = getattr(getattr(state, "target", None), "host_port", 0) or 0
+        if not port:
+            return ""
+        try:
+            lan = self._data.lan_ip()
+        except Exception:
+            lan = "localhost"
+        return f"http://{lan}:{port}/v1"
+
+    def action_copy_endpoint(self) -> None:
+        """[u] — copy the serving API URL (the "point your agent here" string).
+        No-ops with a notify when nothing is serving."""
+        url = self._serving_endpoint_url()
+        if not url:
+            self.notify(
+                "No model serving — nothing to point an agent at yet.",
+                title="API URL", severity="warning", timeout=3,
+            )
+            return
+        self.copy_to_clipboard(url)
+        self.notify(
+            f"Copied API URL: {url}  (OpenAI-compatible · no auth)",
+            title="API URL", severity="information", timeout=4,
+        )
+
     def action_copy_context(self) -> None:
         """[Y] — yank the contextually-relevant text to the system clipboard.
 
@@ -7022,8 +9316,37 @@ class CockpitApp(App):
                 payload = ""
             if payload:
                 return payload, "details"
+        # 2.5 (F4) — the live-log pane the user is looking at (Containers Logs
+        # drill / ③ Gate output).  RichLog-family widgets don't implement text
+        # selection (Top/Config are selectable Statics), so [Y] copies the
+        # pane's streamed tail.  An idle pane has an empty tail (placeholders
+        # aren't buffered) → falls through to the row-primary copy below.
+        pane, label = self._visible_live_pane()
+        if pane is not None:
+            tail = pane.tail_text()
+            if tail:
+                return tail, label
         # 3. the highlighted row's primary id on the active table.
         return self._active_row_primary()
+
+    def _visible_live_pane(self) -> tuple[Optional[LivePane], str]:
+        """F4 — the LivePane the user is currently LOOKING at, if any: the
+        Containers Logs drill or the ③ Gate run output.  Main screen only (a
+        modal on top owns [Y] via its own binding / copyable_text).  The
+        transient #serve-live pane is deliberately NOT routed: it shares the
+        screen with the primary tables, whose [Y]-copies-the-slug semantics
+        are established."""
+        if len(self.screen_stack) > 1:
+            return None, ""
+        try:
+            tab = self._current_subtab()
+            if tab == "tab-containers" and self._active_drill_tab() == "drill-tab-logs":
+                return self.query_one("#drill-logs", LivePane), "log tail"
+            if tab == "tab-run":
+                return self.query_one("#run-output", LivePane), "run-output tail"
+        except Exception:
+            pass
+        return None, ""
 
     def _active_row_primary(self) -> tuple[str, str]:
         """The most-pasteable id of the highlighted row on the active primary
@@ -7105,6 +9428,22 @@ class CockpitApp(App):
         if self._active_mode == 0 and self._current_subtab() == "tab-catalog":
             try:
                 self.query_one("#catalog-pane", CatalogPane).toggle_filter()
+            except Exception:
+                pass
+
+    def action_toggle_catalog_model(self) -> None:
+        """[\\] toggles the model-scope dropdown (merged mode 0 · Catalog tab)."""
+        if self._active_mode == 0 and self._current_subtab() == "tab-catalog":
+            try:
+                self.query_one("#catalog-pane", CatalogPane).toggle_model_select()
+            except Exception:
+                pass
+
+    def action_toggle_catalog_deprecated(self) -> None:
+        """[h] show/hide 🗑️ deprecated slugs (merged mode 0 · Catalog tab)."""
+        if self._active_mode == 0 and self._current_subtab() == "tab-catalog":
+            try:
+                self.query_one("#catalog-pane", CatalogPane).toggle_deprecated()
             except Exception:
                 pass
 
@@ -7234,7 +9573,7 @@ class CockpitApp(App):
           primary action.)"""
         tab = self._active_validate_tab()
         if tab == "tab-bring":
-            self._trigger_lane_bring()
+            self._trigger_lane_bring()          # ⏎ ALWAYS fit-checks (advance = [s])
         elif tab == "tab-serve":
             self.action_serve_untested()
         elif tab == "tab-run":
@@ -7243,6 +9582,42 @@ class CockpitApp(App):
             self._open_evidence_report()
         elif tab == "tab-promote":
             self.action_promote_catalog()
+
+    def _bring_advance_to_serve(self) -> None:
+        """[s] on ① Bring — advance to the pre-armed ② Serve, but ONLY when the
+        fit-checked target is servable AND its weights are on disk.  ⏎ stays
+        fit-check; [s] is the explicit "proceed" (the reported "⏎ re-ran the
+        fit-check" fix — a dedicated key, not an overload).  Guards:
+          - no servable fit-check yet → ask the user to fit-check (⏎) first;
+          - weights absent → [D] download is the next step, not ② Serve."""
+        byo = self._last_byo
+        servable = bool(
+            byo is not None
+            and not getattr(byo, "error", "")
+            and (getattr(byo, "sibling_slug", "") or getattr(byo, "profile_like", ""))
+        )
+        if not servable:
+            self.notify(
+                "Fit-check a model first (⏎ on ① Bring).",
+                title="② Serve", severity="warning", timeout=3,
+            )
+            return
+        if not self._data.bring_weights_present(getattr(byo, "repo", "")):
+            self.notify(
+                "Weights not on disk yet — press [D] to download first.",
+                title="② Serve", severity="warning", timeout=4,
+            )
+            return
+        self._advance_to_serve()
+
+    def _advance_to_serve(self) -> None:
+        """Advance the Bring & Validate lane from ① Bring to the pre-armed
+        ② Serve stage (⏎'s "proceed" after a successful fit-check).  ② Serve was
+        armed by the fit-check's set_armed, so ⏎ there serves straightaway."""
+        try:
+            self.query_one("#validate-tabs", TabbedContent).active = "tab-serve"
+        except Exception:
+            pass
 
     def _run_validation_selected(self) -> None:
         """Stage the selected Run step as a confirm-gated validation launch."""
@@ -7269,6 +9644,18 @@ class CockpitApp(App):
             tag = None
         if tag is None:
             self.notify("No run tag selected.", title="Evidence", severity="warning", timeout=3)
+            return
+        if tag.live:
+            # F10 — report generation WRITES REPORT.md into the tag dir; doing
+            # that mid-run would corrupt the observer's completed/live signal
+            # (and the observer never executes against a run in flight).
+            self.notify(
+                "Run in flight — REPORT.md generates when it completes. "
+                "Watch the ladder + live tail in the preview below the list.",
+                title="Evidence",
+                severity="information",
+                timeout=5,
+            )
             return
         # The screen loads its own report on mount (run_evidence_report), so the
         # set_report query resolves against a fully-mounted modal.
@@ -7480,11 +9867,17 @@ class CockpitApp(App):
     def action_s_key(self) -> None:
         """[s] is context-sensitive:
           - merged mode 0 · Containers : gated `docker restart <name>`.
+          - Bring & Validate · ① Bring  : advance to the armed ② Serve (weights on disk).
           - Bring & Validate · ④ Measure : gated submit-to-localmaxxing for the tag.
         Other contexts ignore it."""
-        if self._active_mode == 1 and self._active_validate_tab() == "tab-evidence":
-            self.action_evidence_submit()
-            return
+        if self._active_mode == 1:
+            tab = self._active_validate_tab()
+            if tab == "tab-bring":
+                self._bring_advance_to_serve()
+                return
+            if tab == "tab-evidence":
+                self.action_evidence_submit()
+                return
         self.action_container_restart()
 
     def action_container_restart(self) -> None:
@@ -7732,8 +10125,18 @@ class CockpitApp(App):
     async def run_measure_vs_bar(self, screen: "MeasureVsBarScreen", tag: str) -> None:
         """Compute the measured-vs-bar comparison for a tag (READ) + push it to
         the modal.  No GPU / network / write — pure filesystem reads + the
-        benchmarks explorer."""
-        vsbar = await self._data.measure_vs_bar(tag, variants=self._variants or None)
+        benchmarks explorer.
+
+        Friction #9: when a ① Bring fit-check ran this session, its swap_path
+        sibling rides along as the CLASS-bar fallback — a NEW model has no
+        same-model bar by definition."""
+        byo = self._last_byo
+        class_hint = ""
+        if byo is not None and not getattr(byo, "error", ""):
+            class_hint = getattr(byo, "sibling_slug", "") or ""
+        vsbar = await self._data.measure_vs_bar(
+            tag, variants=self._variants or None, class_hint=class_hint
+        )
         try:
             screen.set_result(vsbar)
         except Exception:
@@ -7792,17 +10195,23 @@ class CockpitApp(App):
             if live is not None:
                 live.append_line(text)
 
-        await self._data.run_full_validation_report(
-            model=self._target_model or None,
-            url=self._target_url or None,
-            on_line=_on_line,
-        )
-        self.notify(
-            "report.sh --full launched (~43-min battery).",
-            title="Full report",
-            severity="information",
-            timeout=4,
-        )
+        self._full_report_running = True
+        self._sync_jobs_chip()
+        try:
+            await self._data.run_full_validation_report(
+                model=self._target_model or None,
+                url=self._target_url or None,
+                on_line=_on_line,
+            )
+            self.notify(
+                "report.sh --full finished (or mock-returned).",
+                title="Full report",
+                severity="information",
+                timeout=4,
+            )
+        finally:
+            self._full_report_running = False
+            self._sync_jobs_chip()
 
     # ── Phase R / R2b · Consumer share-back (READ paste-ready + outward submit) ────
 
@@ -7888,10 +10297,57 @@ class CockpitApp(App):
         if tag is None:
             self.notify("No run tag selected.", title="Evidence", severity="warning", timeout=3)
             return
+        if tag.live or tag.stale:
+            # F10 — an in-flight run has incomplete artifacts; an aborted one
+            # has no REPORT.md.  Neither is submittable evidence.
+            self.notify(
+                "This run has no completed REPORT.md — submit when the gate finishes.",
+                title="Evidence",
+                severity="warning",
+                timeout=4,
+            )
+            return
         plan = self._data.submit_bench(tag.tag)
         self.push_screen(ConfirmActionScreen(plan))
 
     # ── Operate · Orchestration: power cap (gated rig write) ────────────────────────────
+
+    def _pod_free_gpus(self) -> list[int]:
+        """Host GPU indices not already claimed by an estate pod — the hint
+        the New-pod modal prefills. Best-effort off the last estate poll."""
+        st = getattr(self, "_last_estate_state", None)
+        if st is None:
+            return []
+        total = len(getattr(st, "gpus", []) or [])
+        est = (getattr(st, "estate_report", None) or {}).get("active_estate") or {}
+        instances = est.get("instances") if isinstance(est, dict) else None
+        claimed = {g for inst in (instances or []) for g in (inst.get("gpus") or [])}
+        return [i for i in range(total) if i not in claimed]
+
+    def action_new_pod(self) -> None:
+        """[n] in Operate · Orchestration: open the New-pod modal (C2, #610).
+        Collects name · slug · GPU set; the create routes through pod.sh
+        create (D1 fit + validate_estate) via the standard confirm gate. NEVER
+        auto-fired."""
+        if self._active_mode != 0 or self._active_operate_tab() != "tab-orchestration":
+            return
+        slugs = sorted({r.slug for r in (self._variants or []) if getattr(r, "slug", "")})
+        if not slugs:
+            self.notify("No catalog slugs loaded yet — try again after the estate poll.",
+                        title="New pod", severity="warning", timeout=4)
+            return
+        self.push_screen(
+            PodCreateScreen(self._pod_free_gpus(), slugs),
+            self._on_pod_create,
+        )
+
+    def _on_pod_create(self, result) -> None:
+        """Modal dismiss → build the pod.sh create WRITE + route through the
+        confirm gate. ``result`` is ``{"name","slug","gpus"}`` or ``None``."""
+        if not result:
+            return
+        plan = self._data.pod_create_plan(result["name"], result["gpus"], result["slug"])
+        self.push_screen(ConfirmActionScreen(plan))
 
     def action_power_cap(self) -> None:
         """[c] in Operate · Orchestration: open the power-cap MENU — apply the
@@ -8115,13 +10571,18 @@ class CockpitApp(App):
         """[g] / ⏎ in the Bring & Validate lane ② Serve: serve an untested
         REPRODUCTION of the resolved CATALOG profile's compose (R3b-1).
 
-        ⚠️  HONESTY (R3b-1 fix): this does NOT serve the brought model's weights.
-        ``generate-compose.sh`` has no --repo / weights-swap, so ② Serve generates
-        + serves a verbatim reproduction of the *resolved catalog slug*'s compose
-        (the Route-C sibling, else the profile-like the fit-check ran against) —
-        the BYO repo / quant_match / drop_spec_config are NOT applied.  The full
-        brought-model serve (pull-to-disk + a generate-compose.sh --repo extension)
-        is a DEFERRED follow-up.
+        Three modes, by route:
+        • Route-C with the brought weights on disk — serves the BYO weights via
+          the sibling recipe: the [D] weight-swap compose if one was emitted,
+          else emitted now with do_download=False.  The brought weights ARE
+          served (this path is wired, not deferred).
+        • Route-G (brought GGUF) with weights on disk — emits an llama.cpp-family
+          compose pointing --model at the downloaded .gguf (mmproj / MTP drafter
+          wired when present) and serves that.
+        • Otherwise (no brought weights to swap in) — serves an untested verbatim
+          reproduction of the *resolved catalog slug*'s compose (the Route-C
+          sibling, else the profile-like the fit-check ran against).  Here the
+          BYO repo / quant_match / drop_spec_config are NOT applied.
 
         Requires a successful ① Bring fit-check first (the cached ``_last_byo``).
         If no servable catalog slug resolves we do NOT fall back to a generic
@@ -8141,27 +10602,99 @@ class CockpitApp(App):
                 timeout=4,
             )
             return
-        # The CATALOG slug whose compose we reproduce: the Route-C sibling, else
-        # the profile-like the fit-check was run against.  We do NOT swap in the
-        # brought model's weights (no --repo on generate-compose.sh yet) and we do
-        # NOT fall back to a generic profile — if neither resolves, this route has
-        # no servable target yet (the bring-your-own weight-swap is a pending
-        # follow-up).
+        # Route-C apply-swap: if the [D] download emitted a serve-locally clone of
+        # the sibling compose (--model at the BROUGHT weights + MTP per the head),
+        # serve THAT directly — not a reproduction of the sibling's own catalog
+        # compose. This is the bring-your-own weight-swap, now wired.
+        swap_compose = getattr(self, "_bring_swap_compose", "")
+        if swap_compose and getattr(self._last_byo, "route", "") == "C":
+            self._serve_generated_compose(swap_compose)
+            return
+        # Route-C with the weights ALREADY on disk but no swap compose emitted yet
+        # (the user went straight to ② Serve because [D] was hidden — weights
+        # present): emit the serve-locally clone NOW with do_download=False (no
+        # download), then serve it.  This is the present-weights path that needs no
+        # [D] step — the "② Serve owns the compose emission" half of the UX fix.
+        if (
+            getattr(self._last_byo, "route", "") == "C"
+            and getattr(self._last_byo, "sibling_slug", "")
+            and self._data.bring_weights_present(getattr(self._last_byo, "repo", ""))
+        ):
+            self.run_bring_emit_and_serve(
+                getattr(self._last_byo, "repo", ""),
+                getattr(self._last_byo, "profile_like", ""),
+            )
+            return
+        # Phase 4 route-G: GGUF weights on disk → emit llama.cpp-family compose.
+        if (
+            str(getattr(self._last_byo, "route", "") or "").upper() == "G"
+            and self._data.bring_weights_present(getattr(self._last_byo, "repo", ""))
+        ):
+            self.run_gguf_emit_and_serve()
+            return
+        # Otherwise (non-swap route, or the swap download hasn't run) the CATALOG
+        # slug whose compose we reproduce: the Route-C sibling, else the
+        # profile-like the fit-check was run against.  We do NOT fall back to a
+        # generic profile — if neither resolves, this route has no servable
+        # target yet.
         slug = (
             getattr(self._last_byo, "sibling_slug", "")
             or getattr(self._last_byo, "profile_like", "")
         )
         if not slug:
             self.notify(
-                "② Serve has no servable catalog target yet — the fit-check "
-                "resolved no sibling/profile slug, and the bring-your-own "
-                "weight-swap is a pending follow-up.",
+                "② Serve has no servable target yet — the fit-check resolved "
+                "no sibling recipe or catalog profile to serve. Re-run ① Bring "
+                "against a repo that matches a catalog profile.",
                 title="② Serve",
                 severity="warning",
                 timeout=5,
             )
             return
         self.generate_and_preview_compose(slug)
+
+    @work(exclusive=True, group="bring-emit-serve")
+    async def run_bring_emit_and_serve(self, repo: str, profile_like: str) -> None:
+        """② Serve for a Route-C brought model whose weights are ALREADY on disk:
+        emit the serve-locally swap compose WITHOUT downloading (pull.sh
+        --apply-swap --emit-only), then hand it to the reconcile-gated serve.
+        This is the present-weights path — no [D] download step needed."""
+        lane_pane = None
+        try:
+            lane_pane = self.query_one("#lane-serve-pane", LaneServePane)
+            lane_pane.set_status(
+                "[dim]Emitting serve compose[/dim] "
+                "[dim](apply-swap --emit-only — weights on disk, no download)…[/dim]"
+            )
+        except Exception:
+            pass
+        from rich.markup import escape
+
+        def _on_line(line: str) -> None:
+            if lane_pane is not None:
+                try:
+                    lane_pane.set_status(f"[dim]{escape(line.strip()[-100:])}[/dim]")
+                except Exception:
+                    pass
+
+        self._bring_swap_compose = ""
+        handle = await self._data.run_bring_download(
+            repo, profile_like, apply_swap=True, emit_only=True, on_line=_on_line
+        )
+        try:
+            await handle.done.wait()
+        except Exception:
+            pass
+        swap_compose = self._data.last_swap_compose()
+        if not swap_compose:
+            self.notify(
+                "② Serve: apply-swap --emit-only produced no compose — see the log. "
+                "You can still press [D] to download + emit.",
+                title="② Serve", severity="warning", timeout=6,
+            )
+            return
+        self._bring_swap_compose = swap_compose
+        self._serve_generated_compose(swap_compose)
 
     @work(exclusive=True, group="generate-compose")
     async def generate_and_preview_compose(self, slug: str) -> None:
@@ -8202,6 +10735,210 @@ class CockpitApp(App):
             )
         )
 
+    def _armed_overrides_defaults(self, byo) -> Optional[dict]:
+        """② Serve override-editor pre-fill for a Route-C armed model (else None,
+        which keeps the editor hidden — the editor rides the swap compose's env)."""
+        if (
+            byo is None
+            or getattr(byo, "error", "")
+            or str(getattr(byo, "route", "") or "").upper() != "C"
+            or not getattr(byo, "sibling_slug", "")
+        ):
+            return None
+        try:
+            return self._data.serve_override_defaults(
+                getattr(byo, "profile_like", ""), getattr(byo, "repo", "")
+            )
+        except Exception:
+            return None
+
+    def _host_port_for_slug(self, slug: str) -> Optional[int]:
+        """Sibling/catalog default host port (phase 2 honesty — not a free BYO port)."""
+        if not slug:
+            return None
+        try:
+            pane = self.query_one("#catalog-pane", CatalogPane)
+            for e in getattr(pane, "_entries", []) or []:
+                if e.slug == slug and getattr(e, "port", 0):
+                    return int(e.port)
+        except Exception:
+            pass
+        for v in self._variants or []:
+            if getattr(v, "slug", "") == slug and getattr(v, "port", 0):
+                return int(v.port)
+        return None
+
+    def _arm_serve_pane(self, byo) -> None:
+        """Arm ② Serve with route-aware card + catalog port (B19 free-port deferred)."""
+        port = None
+        if byo is not None and not getattr(byo, "error", ""):
+            slug = (
+                getattr(byo, "sibling_slug", "")
+                or getattr(byo, "profile_like", "")
+            )
+            port = self._host_port_for_slug(slug)
+        self.query_one("#lane-serve-pane", LaneServePane).set_armed(
+            byo,
+            self._armed_overrides_defaults(byo),
+            host_port=port,
+        )
+
+    @work(exclusive=True, group="gguf-emit-serve")
+    async def run_gguf_emit_and_serve(self) -> None:
+        """Phase 4 route-G: emit a GGUF-engine compose pointing at on-disk .gguf."""
+        byo = self._last_byo
+        if byo is None:
+            return
+        repo = getattr(byo, "repo", "")
+        profile = getattr(byo, "profile_like", "") or getattr(byo, "sibling_slug", "")
+        quant = getattr(byo, "quant_match", "") or ""
+        pull = self._data.bring_pull_dir(repo)
+        # Prefer a file matching the quant token; else any .gguf.
+        weights_file = ""
+        try:
+            cands = sorted(pull.glob("**/*.gguf"))
+            for p in cands:
+                if quant and quant.lower() in p.name.lower() and "mmproj" not in p.name.lower():
+                    weights_file = str(p)
+                    break
+            if not weights_file:
+                for p in cands:
+                    if "mmproj" not in p.name.lower():
+                        weights_file = str(p)
+                        break
+        except Exception:
+            weights_file = ""
+        if not weights_file:
+            self.notify(
+                "No .gguf on disk yet — press [D] to download the selected quant.",
+                title="② Serve", severity="warning", timeout=5,
+            )
+            return
+        mmproj = ""
+        mtp_draft = ""
+        try:
+            for p in pull.glob("**/*mmproj*.gguf"):
+                mmproj = str(p)
+                break
+            # Brought-repo MTP draft (e.g. migtissera Tess: main + mtp-*.gguf).
+            main_name = Path(weights_file).name.lower()
+            for p in pull.glob("**/*mtp*.gguf"):
+                n = p.name.lower()
+                if "mmproj" in n:
+                    continue
+                if n == main_name:
+                    continue  # main weights already named *mtp*
+                # Prefer files that look like a separate draft head.
+                if n.startswith("mtp") or "-mtp-" in n or n.startswith("mtp-"):
+                    mtp_draft = str(p)
+                    break
+                if "mtp" in n and quant and quant.lower() not in n:
+                    mtp_draft = str(p)
+                    break
+            if not mtp_draft:
+                for p in pull.glob("**/mtp-*.gguf"):
+                    if "mmproj" not in p.name.lower():
+                        mtp_draft = str(p)
+                        break
+        except Exception:
+            pass
+        served = repo.rsplit("/", 1)[-1]
+        # No external drafter? The main gguf may still carry an EMBEDDED MTP head
+        # (nextn) — activate it with --spec-type and no draft model.  (bartowski /
+        # unsloth builds embed it; migtissera ships an external mtp-*.gguf instead.)
+        embedded_mtp = bool(weights_file) and not mtp_draft and \
+            self._data.gguf_has_embedded_mtp(weights_file)
+        res = self._data.emit_gguf_compose(
+            profile,
+            weights_file,
+            served_name=served,
+            mmproj_host_file=mmproj,
+            mtp_draft_host_file=mtp_draft,
+            embedded_mtp=embedded_mtp,
+        )
+        if res.get("error") or not res.get("compose_path"):
+            self.notify(
+                f"GGUF compose emit failed: {res.get('error') or 'no path'}",
+                title="② Serve", severity="warning", timeout=6,
+            )
+            return
+        self._bring_swap_compose = res["compose_path"]
+        try:
+            self.query_one("#lane-serve-pane", LaneServePane).set_status(
+                f"[green]✓ GGUF compose[/green] for [cyan]{quant or served}[/cyan] — "
+                f"serving via [green]{profile}[/green] recipe"
+            )
+        except Exception:
+            pass
+        self._serve_generated_compose(res["compose_path"])
+
+    def _refresh_gate_target_banner(self) -> None:
+        """Phase 2 — ③ Gate target line from live estate / BYO context."""
+        try:
+            pane = self.query_one("#validate-run-pane", ValidateRunPane)
+        except Exception:
+            return
+        model = (self._target_model or "").strip()
+        url = (self._target_url or "").strip()
+        slug = (self._target_slug or "").strip()
+        byo = self._last_byo
+        brought = ""
+        if byo is not None and not getattr(byo, "error", ""):
+            brought = (getattr(byo, "repo", "") or "").rsplit("/", 1)[-1]
+        if url or model:
+            src = "from ② Serve" if brought else "Catalog"
+            who = model or slug or brought or "serving"
+            pane.set_target_banner(
+                f"Target: [cyan]{who}[/cyan]  @  [green]{url or '—'}[/green]  "
+                f"[dim]· {src}[/dim]"
+            )
+        else:
+            pane.set_target_banner(
+                "[dim]Target: (no serving model yet — finish ② Serve or start a "
+                "catalog slug)[/dim]"
+            )
+
+    def _refresh_promote_prereqs(self) -> None:
+        """Phase 2 — ⑤ prerequisites checklist from live funnel state."""
+        try:
+            pane = self.query_one("#lane-promote-pane", LanePromotePane)
+        except Exception:
+            return
+        byo = self._last_byo
+        fit_ok = bool(byo is not None and not getattr(byo, "error", ""))
+        weights_ok = False
+        if fit_ok:
+            try:
+                weights_ok = self._data.bring_weights_present(
+                    getattr(byo, "repo", "") or ""
+                )
+            except Exception:
+                weights_ok = False
+        served_ok = bool(self._target_url or self._target_model)
+        gated_ok = False
+        try:
+            run = self.query_one("#validate-run-pane", ValidateRunPane)
+            gated_ok = any(
+                st in ("passed", "warn")
+                for st in (getattr(run, "_outcomes", {}) or {}).values()
+            )
+        except Exception:
+            pass
+        measured_ok = False
+        try:
+            ev = self.query_one("#validate-evidence-pane", ValidateEvidencePane)
+            measured_ok = bool(getattr(ev, "_tags", None))
+        except Exception:
+            pass
+        pane.set_prereqs(
+            fit=fit_ok,
+            weights=weights_ok,
+            served=served_ok,
+            gated=gated_ok,
+            measured=measured_ok,
+            byo=byo,
+        )
+
     def _serve_generated_compose(self, compose_path: str) -> None:
         """Stage the serve of a GENERATED compose through the reconcile gate.
 
@@ -8212,7 +10949,14 @@ class CockpitApp(App):
         # entry staged by a PRIOR catalog serve so that stale slug can NEVER drive
         # a false "✓ serving <that model>" via _serve_slug_for / failure capture.
         self._staged_entry = None
-        plan = self._data.serve_generated(compose_path)
+        # ② Serve override editor — collect the field values (empty when the editor
+        # is hidden / non-Route-C).  They ride on plan.env → the compose's ${VAR}.
+        overrides = {}
+        try:
+            overrides = self.query_one("#lane-serve-pane", LaneServePane).collect_overrides()
+        except Exception:
+            overrides = {}
+        plan = self._data.serve_generated(compose_path, overrides or None)
         self.push_screen(ConfirmActionScreen(plan))
 
     # ── Phase 5 · Hook 2: Promote the BYO model to the catalog (design §3.5b) ──────────
@@ -8351,6 +11095,7 @@ class CockpitApp(App):
         We only apply focus for the TabbedContent that belongs to the *active* mode
         panel.  Events from mode panels that are currently hidden (display:none) are
         ignored so startup/background activations don't steal focus."""
+        self._sync_footer_labels()
         self.refresh_bindings()
         # Nested Operate·Containers drill-tabs (Logs/Top/Config): load the newly
         # active tab's content for the selected container, then stop — these are
@@ -8369,7 +11114,17 @@ class CockpitApp(App):
         # resolved target is shown WITHOUT re-entering ① Bring (the pipeline flows).
         if tab_id == "tab-serve":
             try:
-                self.query_one("#lane-serve-pane", LaneServePane).set_armed(self._last_byo)
+                self._arm_serve_pane(self._last_byo)
+            except Exception:
+                pass
+        if tab_id == "tab-run":
+            try:
+                self._refresh_gate_target_banner()
+            except Exception:
+                pass
+        if tab_id == "tab-promote":
+            try:
+                self._refresh_promote_prereqs()
             except Exception:
                 pass
         # Only respond to tabs that belong to the current mode's active panel.
@@ -8442,6 +11197,47 @@ class CockpitApp(App):
             sel_id = event.select.id
         except Exception:
             return
+        # ② Serve override editor — the "✎ custom…" sentinel reveals + focuses the
+        # companion free-text Input (any value the engine dropdown doesn't list,
+        # e.g. turboquant_4bit_nc); any real pick hides it again.
+        if sel_id in ("ov-ctx", "ov-kv", "ov-util"):
+            try:
+                inp = self.query_one(f"#{sel_id}-custom", Input)
+                if event.value == _OV_CUSTOM:
+                    inp.remove_class("ov-custom-hidden")
+                    inp.focus()
+                else:
+                    inp.add_class("ov-custom-hidden")
+            except Exception:
+                pass
+            return
+        if sel_id == "catalog-model-select":
+            val = event.value
+            try:
+                self.query_one("#catalog-pane", CatalogPane).set_model_filter(
+                    "" if val in (Select.BLANK, _ALL_MODELS_VALUE) else str(val)
+                )
+            except Exception:
+                pass
+            return
+        if sel_id == "lane-bring-gguf-select":
+            # §2b-2 — the GGUF quant pick: only NOW do the matching slugs
+            # appear, topology-floored by THIS variant's size (§2b size rule:
+            # hide topologies whose VRAM can't hold the weights; never hide
+            # larger ones — small-quant-on-many-GPUs is legitimate).
+            val = event.value
+            if val is None or val is Select.BLANK:
+                return
+            self._funnel_gguf_pick = str(val)
+            inv = self._last_inventory
+            size = None
+            if inv is not None:
+                for v in inv.gguf_variants:
+                    if v.quant == self._funnel_gguf_pick:
+                        size = v.size_gb or None
+                        break
+            self._reveal_funnel_slugs("gguf", size)
+            return
         if sel_id != "lane-bring-profile-input":
             return
         new_val = event.value
@@ -8457,6 +11253,16 @@ class CockpitApp(App):
                 custom.focus()
             else:
                 custom.add_class("profile-custom-hidden")
+        except Exception:
+            pass
+        # Dogfood r2 — the detail card follows the selection (a custom-slug
+        # sentinel has no catalog row → hide).
+        try:
+            pane = self.query_one("#lane-bring-pane", LaneBringPane)
+            if new_val == PROFILE_CUSTOM_SENTINEL or new_val in (None, Select.BLANK):
+                pane.show_slug_details("")
+            else:
+                pane.show_slug_details(self._funnel_slug_details(str(new_val)))
         except Exception:
             pass
         # Before the registry-derived default has been applied, any Changed is the
@@ -8624,7 +11430,9 @@ class CockpitApp(App):
         try:
             live = self.query_one("#drill-logs", LivePane)
             live.clear_log()
-            live.append_line(f"[dim]{placeholder}[/dim]")
+            # buffer=False: a display-only note — [Y] on an idle/stopped drill
+            # must fall through to the container name, not copy this line (F4).
+            live.append_line(f"[dim]{placeholder}[/dim]", buffer=False)
         except Exception:
             pass
         try:
@@ -8662,6 +11470,14 @@ class CockpitApp(App):
         bid = event.button.id
         if bid == "lane-bring-fit-btn":
             self._trigger_lane_bring()
+        elif bid == "lane-bring-inspect-btn":
+            self._trigger_lane_inspect()
+        elif bid == "lane-bring-continue-btn":
+            self._bring_advance_to_serve()
+        elif bid == "lane-serve-btn":
+            self.action_serve_untested()
+        elif bid == "lane-promote-btn":
+            self.action_promote_catalog()
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.input.id == "catalog-filter":
@@ -8673,7 +11489,9 @@ class CockpitApp(App):
             except Exception:
                 pass
         elif event.input.id == "lane-bring-url-input":
-            self._trigger_lane_bring()
+            # §2b-1 — ⏎ on the repo input runs stage-1 INSPECT (the funnel's
+            # entry), not the fit-check (which needs a slug pick first).
+            self._trigger_lane_inspect()
 
     def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id == "catalog-filter":

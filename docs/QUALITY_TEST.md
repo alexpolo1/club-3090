@@ -59,6 +59,13 @@ The **reasoning suite** is also separate from `--full`; run it with `--reasoning
 
 `--full` runs the sandbox packs by default. `--no-sandboxed` drops `--full` back to the 5-pack deterministic scope (no Docker); `--sandboxed-only` runs just the 3 sandbox packs. `--reasoning` is independent of `--full`; use it for the four reasoning packs, with GPQA skipped until gated data is available.
 
+> ⚠️ **`--full` needs the sandbox images built first — "needs Docker" isn't enough.** The 3 sandboxed packs run inside pre-built `benchlocal-sandbox-*` Docker images that are **not auto-pulled**, and the build tooling is **not in the `pip install`** — it lives in a benchlocal-cli *checkout*. Build them once:
+> ```bash
+> git clone https://github.com/noonghunna/benchlocal-cli
+> bash benchlocal-cli/tools/build-sandboxes.sh        # ~30 GB free; the aider image is biggest — `docker system prune` if tight
+> ```
+> Then `--full` works. Without the images, `quality-test.sh` warns up front and runs the deterministic packs only; for a clean no-Docker run use **`--medium`** (or `--no-sandboxed`). (club-3090 #492 — benchlocal-cli's own mid-run hint pointed at a relative path that's wrong outside a checkout.)
+
 ## Install (one-time)
 
 ```bash
@@ -124,7 +131,7 @@ Output:
 Example output:
 
 ```
-=== benchlocal-cli --medium  (endpoint: http://localhost:8020, model: qwen3.6-27b-autoround) ===
+=== benchlocal-cli --medium  (endpoint: http://localhost:8020, model: qwen3.6-27b) ===
 
 Pack                       | Pass / Total | Score | p50 latency | p95 latency | Status
 ToolCall-15 (v1.0.1)       |   14 / 15    |  93%  |     8.2s    |     12.1s   | ✅
@@ -146,6 +153,82 @@ Quality: line for compose schema field (paste into compose YAML header):
 ==========================================================================
 Quality:   ToolCall-15 14/15 (93%) · InstructFollow-15 13/15 (87%) · StructOutput-15 15/15 (100%) · DataExtract-15 12/15 (80%) · ReasonMath-15 11/15 (73%) (--medium, packs v1.0.x, 2026-05-09)
 ```
+
+## Scenario-level probes (selection, incremental, resume)
+
+Since benchlocal-cli [#84](https://github.com/noonghunna/benchlocal-cli/pull/84)/[#85](https://github.com/noonghunna/benchlocal-cli/pull/85) the wrapper passes through scenario-granular runs:
+
+```bash
+# one or more specific scenarios (pack-qualified, repeatable)
+bash scripts/quality-test.sh --scenario cli-40/CLI-31 --scenario reasonmath-15/RM-04 --no-thinking
+
+# a curated probe set from a file (newline PACK_ID/SCENARIO_ID, # comments),
+# BOTH reasoning modes — same pairing as a full eval:
+bash scripts/quality-test.sh --scenarios-file scripts/scenario-sets/tess4-model-floor.txt --no-thinking
+# ⚠ ON leg: boot the compose with reasoning parsing on FIRST (REASONING=on for
+#   llama.cpp composes, --reasoning-parser for vLLM) so <think> lands in
+#   reasoning_content, not the graded answer — then:
+bash scripts/quality-test.sh --scenarios-file scripts/scenario-sets/tess4-model-floor.txt \
+    --enable-thinking --repeat 3
+
+# journal each scored scenario (fsynced sidecar) so an interrupt is resumable
+bash scripts/quality-test.sh --full --no-thinking --incremental
+
+# resume an interrupted (or inspect-then-continue) run — restores the original
+# pack-set/selection/thinking/sampling/timeout config; only missing arms run
+bash scripts/quality-test.sh --resume results/quality/quality-<ts>.json.partial.jsonl
+```
+
+**Probe discipline (the tool enforces most of this):**
+
+- A selection result is **PARTIAL** — the JSON carries top-level `selection` + per-pack `catalog_scenario_count`, human output says `PARTIAL SELECTION`, and history ingestion / `rescore` refuse it without `--allow-partial`. **It is never a `/150` claim** — full 8-pack both modes remains the bar for BENCHMARKS rows, `Quality:` lines, and promotions.
+- Thinking-ON probes sample at temp 1.0 by pack contract → single ON probes are draws; pass `--repeat 3` (cheap at scenario granularity) when a number gates a decision.
+- `--resume` is mutually exclusive with mode/pack/selection/thinking/sampling/timeout flags — it restores those from the saved run; the wrapper refuses the combination rather than fork the config.
+
+**Curated probe sets** live in `scripts/scenario-sets/` with provenance headers:
+
+| file | what | when to run |
+|---|---|---|
+| `tess4-model-floor.txt` | 14 fails-everywhere (+2 thinking-only) across 2 rigs / 2 drafters / 2 engine builds — the Tess retrain-target list (#665 intersection) | before/after a Tess fine-tune or retrained drafter head; quantifying a "did the model move" claim. **Measured (Tess dual, b9967, 2026-07-12): OFF ~3.5 min · ON ~11 min single draw** (ON ×3 ≈ 30 min — still ⅓ of one full 8-pack leg) |
+| `tess4-engine-window.txt` | CLI-25/31/32 — the b9932→b9967 engine-window flips | first probe on any new engine build/pin arm, before paying for a full 8-pack. **Measured: ~40 s OFF** |
+
+**`scripts/rerun-failed-packs.sh`** now re-runs a prior run's failures as ONE selection run (was: whole-pack loops) — 6 failures over 5 packs = 6 scenarios, with `--incremental` durability and a REPRODUCED/FIXED verdict per original failure. `RERUN_DRY=1` previews the plan.
+
+## pass@1 vs pass@N — the churn-harvest ceiling (and why we don't report it)
+
+Every `/150` total in this repo is **pass@1 at pack-contract sampling**: think-OFF legs are greedy (deterministic), think-ON legs are a *single draw* at temp 1.0 / top-p 0.95 / top-k 20. That contract is what makes totals comparable across rigs, engines, and dates.
+
+**The observation** (from the #665 cross-rig work, 2026-07-12): at temp 1.0, many "failing" scenarios aren't failures — they're **churners** with a per-draw pass probability. Measured examples on Tess-4-27B: scenarios that read as hard-0 on any single run pass 1-in-7 to ~2-in-5 across repeated draws (`tess4-model-floor.txt` Tier 2 documents six of them with evidence). Take the union of passes across enough draws and the effective ceiling rises sharply: a 7-draw window on a single 4090 reached ~139/150-equivalent coverage, and across every stack we've measured only **10 scenarios sit at p≈0** (Tier 1). The gap between a model's pass@1 total (~116–118) and its churn-harvest ceiling (~139) is ~20 points of *probability*, not capability.
+
+**Two consequences, deliberately kept apart:**
+
+### 1. As a serving technique, harvesting is legitimate — and now cheap to size
+
+If the **caller owns a verifier** — tests pass, JSON validates against a schema, an archive hash matches, a migration applies cleanly — then verifier-guided best-of-N (rejection sampling) converts probability gaps into successes at predictable cost:
+
+| per-draw p | N for ≥90% | N for ≥99% |
+|---:|---:|---:|
+| 0.15 | 15 | 29 |
+| 0.30 | 7 | 13 |
+| 0.40 | 5 | 10 |
+
+(`P = 1 − (1−p)^N`; cost ≈ N× tokens plus the verifier, and draws parallelize — see the concurrency numbers in FAQ.) Agent harnesses already do a degenerate version of this via retry-on-error; doing it *deliberately*, with the validator run before accepting, is strictly better. Measuring a scenario's p is now a minutes-scale task: `--scenarios-file <set> --repeat N` returns per-scenario pass rates directly.
+
+**When it applies:** only where verification is cheaper than generation and mechanical (schema/tests/hashes). It does nothing for open-ended prose, and nothing for Tier-1 capability gaps — no N rescues p≈0.
+
+**What it is not (yet):** a stack feature. It's a client-side pattern; if it graduates, it would be a retry-with-validator wrapper in front of the endpoint, never an engine or compose change. Structured-output constrained decoding remains the first choice where the check is expressible as a grammar — best-of-N is the fallback for checks that only a verifier can run.
+
+### 2. As a benchmark number, harvesting is laundering — and the tooling refuses it
+
+pass@N and pass@1 are different metrics, and mixing them inflates a model's number with the *verifier's* work. This is why the guardrails are shaped the way they are:
+
+- Selection results are labeled `PARTIAL SELECTION` and refuse history/`rescore` ingestion without `--allow-partial`.
+- `--repeat N` aggregates at ≥50% per scenario — a *majority* vote, not a best-of harvest.
+- Canonical sampling is pinned per pack; overrides mark the run non-canonical.
+
+**Reporting rules:** BENCHMARKS `/150` columns are pass@1-at-contract, always. If you publish a harvested number, label it `pass@k` with k and the verifier stated (e.g. "pass@7, pack verifiers as oracle") — and never in the same column as pass@1 totals. Scenario-level claims ("X now passes") follow the same discipline: a churner observed once is `1/N draws`, not "passes".
+
+*Credit: the ceiling observation and the "probability lifted vs capability trained in" framing come from @seanyourhighness's 7-draw b9967 window in #665.*
 
 ## Diagnosing failures
 
@@ -262,6 +345,29 @@ Suggested gates (informal, not enforced):
 | ReasonMath-15 | ≥60% | Reasoning quality varies more by quant; treat as informational |
 
 For comparing a new pin / quant / config A/B against the previous version: a >10pp drop on any pack vs the previous baseline is a signal worth investigating before promoting `Status: ✅ Production`.
+
+### Rescoring saved results — MATERIALIZE, don't just read
+
+When a harness fix changes how saved runs score (e.g. the benchlocal-cli #79/#81
+fairness + reasoning-channel fixes), re-score the SAVED result JSONs with the
+`rescore` subcommand — and **write the corrected results back into the artifact**:
+
+```bash
+benchlocal-cli rescore results/rebench/<tag>/quality-full-thinking.json --in-place
+```
+
+`rescore` re-runs the deterministic scorers against each run's saved
+`raw_response` (sandbox packs like hermes/cli-40 are skipped — those need a live
+re-run). Printing the corrected totals to stdout and publishing them **without
+`--in-place`/`--output` leaves the tag artifact stale** — anything that later
+reads the tag (the `catalog-baseline.sh` induction tool, `rebench-report.py`,
+the measurement-record corpus) silently resurrects the pre-fix numbers. This
+bit the Agents-A1 gate: the published thinking-on 110/150 was rescore-corrected,
+but the tag JSON read 108/150 until the rescore was materialized on 2026-07-04.
+
+**Rule: a rescore that changes a number you publish must be materialized into
+the tag artifact in the same session** (keep a copy of the pre-rescore JSON
+elsewhere if you want the history; the tag carries the accepted truth).
 
 ### Regression baselines (the curated corpus)
 

@@ -81,7 +81,15 @@ if [[ -f "${ROOT_DIR}/.env" ]]; then
     _env_line="${_env_line#"${_env_line%%[![:space:]]*}"}"   # strip leading whitespace
     _env_line="${_env_line%$'\r'}"                           # strip trailing CR
     [[ "$_env_line" == "export "* ]] && _env_line="${_env_line#export }"
-    [[ "$_env_line" == CLUB3090_DEFAULT_* ]] || continue
+    # #632 — pass model-default pins AND user engine-image overrides through to
+    # docker compose.  IK_LLAMA_IMAGE/LLAMACPP_IMAGE were silently dropped here
+    # (only CLUB3090_DEFAULT_* passed), so a .env cu12 pin never reached the
+    # ik-llama/llama.cpp composes.  Shell env still wins (checked below); the
+    # vllm/beellama images get profile-injected later regardless.
+    case "$_env_line" in
+      CLUB3090_DEFAULT_*|VLLM_IMAGE=*|BEELLAMA_IMAGE=*|IK_LLAMA_IMAGE=*|LLAMACPP_IMAGE=*|VLLM_NIGHTLY_SHA=*) ;;
+      *) continue ;;
+    esac
     _env_key="${_env_line%%=*}"
     [[ "$_env_key" == "$_env_line" || -z "$_env_key" ]] && continue
     [[ -n "${!_env_key+x}" ]] && continue                    # already set in env → shell wins
@@ -92,9 +100,17 @@ if [[ -f "${ROOT_DIR}/.env" ]]; then
   done < "${ROOT_DIR}/.env"
   unset _env_line _env_key _env_val
 fi
+# #632 — surface a user engine-image pin (ik-llama / llama.cpp images are NOT
+# profile-injected, so a .env/shell pin is the only override path; echo it so a
+# wrong-image boot is never silent).  Fires only when actually set.
+[[ -n "${IK_LLAMA_IMAGE:-}" ]] && echo "[launch] ik-llama image pinned: ${IK_LLAMA_IMAGE}"
+[[ -n "${LLAMACPP_IMAGE:-}" ]] && echo "[launch] llama.cpp image pinned: ${LLAMACPP_IMAGE}"
 MODEL_DIR="${MODEL_DIR:-${ROOT_DIR}/models-cache}"
 # shellcheck source=preflight.sh
 source "${ROOT_DIR}/scripts/preflight.sh"
+# Runtime-agnostic GPU selection helpers (#610 Phase A) — gpu_select_export
+# (UUID-pin the --gpus set) + gpu_select_assert_placement (post-boot check).
+source "${ROOT_DIR}/scripts/lib/gpu-select.sh"
 
 # --- arg parsing ---
 ENGINE=""
@@ -866,7 +882,7 @@ suggest_default_variant() {
     echo "llamacpp/deckard40B-dual-mtp"
   else
     if (( cards >= 2 )); then
-      echo "vllm/gemma-bf16-mtp"
+      echo "vllm/gemma-31b-dual"
     else
       # Single card: beellama/gemma-dflash is the recommended Gemma-4 path — the
       # only viable fast single-card config on Ampere. vLLM single-card is dead
@@ -1156,9 +1172,12 @@ validate_selected_variant() {
 }
 
 export_variant_engine_pin() {
-  local variant="$1" output line key value
+  local variant="$1" output line key value gpu_spec
   [[ "$variant" == vllm/* || "$variant" == beellama/* ]] || return 0
-  if ! output="$(python3 "$LAUNCH_PROFILE" resolve-variant-pin --variant "$variant" --format shell 2>&1)"; then
+  # detected-GPU spec enables the #246 arch-aware env for pilot variants;
+  # empty (no selection yet / no nvidia-smi) -> pin exports only.
+  gpu_spec="$(selected_gpu_profile_spec 2>/dev/null || true)"
+  if ! output="$(python3 "$LAUNCH_PROFILE" resolve-variant-pin --variant "$variant" --format shell --gpu-spec "$gpu_spec" 2>&1)"; then
     echo "$output" >&2
     exit 2
   fi
@@ -1168,6 +1187,20 @@ export_variant_engine_pin() {
       VLLM_NIGHTLY_SHA) export VLLM_NIGHTLY_SHA="$value" ;;
       VLLM_IMAGE) export VLLM_IMAGE="$value" ;;
       BEELLAMA_IMAGE) export BEELLAMA_IMAGE="$value" ;;
+      # #246 arch-aware env (pilot slugs; hardware-profile balanced default)
+      KV_CACHE_DTYPE)
+        export KV_CACHE_DTYPE="$value"
+        echo "[launch] arch-aware KV dtype: ${value} (hardware-profile default for detected GPUs — #246)" ;;
+      MAX_NUM_SEQS)
+        export MAX_NUM_SEQS="$value"
+        echo "[launch] memory-envelope concurrency: MAX_NUM_SEQS=${value} (measured for this card class — #246 Phase 2)" ;;
+      GPU_MEMORY_UTILIZATION)
+        export GPU_MEMORY_UTILIZATION="$value"
+        echo "[launch] memory-fraction floor: GPU_MEMORY_UTILIZATION=${value} (unified-memory card can't safely give the default — #246 Phase 2)" ;;
+      VLLM_USE_DEEP_GEMM)
+        export VLLM_USE_DEEP_GEMM="$value"
+        echo "[launch] fp8 weights: VLLM_USE_DEEP_GEMM=${value} (consumer card has no DeepGEMM recipe — disc #571)" ;;
+      VLLM_ATTENTION_BACKEND) export VLLM_ATTENTION_BACKEND="$value" ;;
       *) echo "[launch] ERROR: unexpected engine pin export: $key" >&2; exit 2 ;;
     esac
   done <<< "$output"
@@ -1292,8 +1325,10 @@ case "$_launch_status" in
 esac
 echo ""
 if [[ -n "$SELECTED_GPU_CSV" ]]; then
-  export CUDA_VISIBLE_DEVICES="$SELECTED_GPU_CSV"
-  export NVIDIA_VISIBLE_DEVICES="$SELECTED_GPU_CSV"
+  # Resolve the selected indices to GPU UUIDs and export both CUDA_/NVIDIA_
+  # VISIBLE_DEVICES so ONE selection mechanism works on both container GPU
+  # runtimes (#610). Logic lives in the shared gpu-select.sh lib (Phase A).
+  gpu_select_export "$SELECTED_GPU_CSV" "launch"
 fi
 if [[ -n "$TP_VALUE" ]]; then
   export TP="$TP_VALUE"
@@ -1321,6 +1356,12 @@ else
     echo "  - 'Genesis patches' / 'MTP acceptance' skipped on llama.cpp = expected (vLLM-only checks)"
     exit 1
   }
+  # Post-boot placement assertion (#610 Phase A): when the user pinned a GPU
+  # set, confirm the model actually landed there (loud warn on mismatch, never
+  # fatal). Runs after verify so the compute processes exist to inspect.
+  if [[ -n "$SELECTED_GPU_CSV" ]]; then
+    gpu_select_assert_placement "$ENDPOINT_CONTAINER" "${CUDA_VISIBLE_DEVICES:-}" "launch"
+  fi
 fi
 
 echo ""
@@ -1334,7 +1375,7 @@ maybe_offer_set_default "$VARIANT"
 echo "[launch] sample request:"
 echo "  curl -sf ${ENDPOINT_URL}/v1/chat/completions \\"
 echo "    -H 'Content-Type: application/json' \\"
-echo "    -d '{\"model\":\"qwen3.6-27b-autoround\",\"messages\":[{\"role\":\"user\",\"content\":\"Capital of France?\"}],\"max_tokens\":200}'"
+echo "    -d '{\"model\":\"qwen3.6-27b\",\"messages\":[{\"role\":\"user\",\"content\":\"Capital of France?\"}],\"max_tokens\":200}'"
 echo ""
 echo "[launch] switch later with:  bash scripts/switch.sh <variant>"
 echo "[launch] list variants:      bash scripts/switch.sh --list"

@@ -10,9 +10,13 @@
 # Env knobs:
 #   SKIP_BUILD=1     skip the ComfyUI image build (already built)
 #   SKIP_DOWNLOAD=1  skip the ~120 GB roster pull (already on disk)
+#   SKIP_DISK_CHECK=1 bypass the free-space preflight (resume an idempotent download)
 #   SKIP_PIPE=1      skip installing the OWUI Studio pipe (do it later)
 #   ASSUME_YES=1     same as --yes (also auto-yes when not a TTY / under CI)
-#   LANIP=<ip>       host IP shown in the final URLs (auto-detected otherwise)
+#   LANIP=<ip>       host IP shown in the final URLs. Auto-detected + saved to .env on first run;
+#                    pin it in .env (or via this env var) if it picks the wrong NIC / can't detect.
+#   MODEL_DIR=<dir>  HF/GGUF cache root; the ComfyUI tree goes to a "comfyui" sibling
+#                    of it (override COMFYUI_ROOT / COMFYUI_MODELS_DIR to decouple).
 #
 # Idempotent: re-running rebuilds/re-pulls only what changed, installs-or-updates
 # the pipe, then brings the stack up via `gpu-mode ai-studio`.
@@ -21,13 +25,20 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 COMFYUI_DIR="$REPO_DIR/services/comfyui"
 STUDIO_DIR="$REPO_DIR/services/studio"
-LANIP="${LANIP:-$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^(192\.168|10\.|172\.)' | head -1)}"
-LANIP="${LANIP:-<host-ip>}"
+# Derive COMFYUI_ROOT / COMFYUI_MODELS_DIR from MODEL_DIR so the download target, the disk
+# check, and the container mounts all agree (a user who set MODEL_DIR gets the ComfyUI tree
+# alongside it instead of the rig's /mnt fallback). See services/comfyui/comfyui-paths.sh.
+# shellcheck disable=SC1091
+. "$COMFYUI_DIR/comfyui-paths.sh"
+# LAN IP for the final URLs. Resolve via the shared helper: env / .env win, else auto-detect and
+# PERSIST to .env (the source of truth) — or, if nothing detects, fall back to localhost and tell
+# the user to set LANIP in .env. Keeps setup + gpu-mode from drifting. (#504, #512)
+c3_resolve_lanip
 
 ASSUME_YES="${ASSUME_YES:-}"
 case "${1:-}" in
   -y|--yes) ASSUME_YES=1 ;;
-  -h|--help) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  -h|--help) sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
 esac
 # Auto-yes when non-interactive (piped / nohup / CI) so we never hang on the prompt.
 [ -t 0 ] || ASSUME_YES=1
@@ -43,8 +54,8 @@ ok()   { echo -e "\033[0;32m$*\033[0m"; }
 if declare -f preflight_docker >/dev/null 2>&1; then
     preflight_docker || exit 1                                   # docker + compose v2 + daemon
     preflight_gpu 1  || exit 1                                   # 1 GPU runs image+audio; video wants 2 (warned below)
-    [ -z "${SKIP_BUILD:-}" ]    && { preflight_disk / 32 || exit 1; }                       # comfyui-local image + ~9 GB CUDA base
-    [ -z "${SKIP_DOWNLOAD:-}" ] && { preflight_disk /mnt/models/comfyui 130 || exit 1; }    # ~120 GB studio roster
+    [ -z "${SKIP_BUILD:-}${SKIP_DISK_CHECK:-}" ]    && { preflight_disk / 32 || exit 1; }                          # comfyui-local image + ~9 GB CUDA base
+    [ -z "${SKIP_DOWNLOAD:-}${SKIP_DISK_CHECK:-}" ] && { preflight_disk "$COMFYUI_MODELS_DIR" 130 || exit 1; }      # ~120 GB roster → MODEL_DIR-derived path
     preflight_gpu_idle || true                                   # soft warn if VRAM already in use
 else
     command -v docker >/dev/null 2>&1 || { echo "ERROR: docker not found." >&2; exit 1; }
@@ -102,14 +113,18 @@ say "── [3/4] Starting the studio (gpu-mode ai-studio) ──"
 bash "$REPO_DIR/scripts/gpu-mode.sh" ai-studio
 
 # --- 4. Install the OWUI Studio pipe (install-if-absent; needs an OWUI admin) ---
+# PIPE_OK drives the onboarding below: a fresh install has no OWUI admin yet (you create it by
+# signing up), so the pipe install is EXPECTED to be skipped here — we then make "sign up THEN
+# install the pipe" a prominent numbered step instead of a warning that scrolls past (#510).
+PIPE_OK=0
 if [ -z "${SKIP_PIPE:-}" ]; then
     say "── [4/4] Installing the Open WebUI Studio pipe ──"
     if bash "$STUDIO_DIR/push-pipe-to-owui.sh"; then
         ok "  Studio pipe installed/updated."
+        PIPE_OK=1
     else
-        warn "  Pipe install skipped — Open WebUI likely has no admin account yet."
-        warn "  Sign up at http://$LANIP:8080 (first account = admin), then run:"
-        warn "    bash services/studio/push-pipe-to-owui.sh"
+        warn "  Pipe install skipped — Open WebUI has no admin account yet (expected on a fresh install)."
+        warn "  → see the highlighted step below: sign up first, then install the pipe."
     fi
 else
     echo "  (SKIP_PIPE set — install later: bash services/studio/push-pipe-to-owui.sh)"
@@ -141,12 +156,23 @@ echo "  ComfyUI:     http://$LANIP:8188   ← optional: full node-graph control"
 echo "  Gallery:     http://$LANIP:8189   ← your renders (survive ComfyUI restarts)"
 echo ""
 say  "  Get started:"
-echo "    1. Open the Open WebUI URL and SIGN UP — the FIRST account becomes the admin."
-echo "       (If you signed up after this ran, install the pipe now:"
-echo "        bash services/studio/push-pipe-to-owui.sh )"
-echo "    2. On the 'Studio' function (gear icon), set the 'browser_base' valve to"
-echo "       http://$LANIP:8189 so returned media links open from your browser."
-echo "    3. Pick a lane in the model selector (🎬 Video · 🖼️ Image · 🎵 Audio), type an idea,"
+_n=1
+echo "    $_n. Open the Open WebUI URL and SIGN UP — the FIRST account becomes the admin."; _n=$((_n + 1))
+# The pipe couldn't install without an admin → make installing it a LOUD, unmissable step.
+if [ "$PIPE_OK" != "1" ] && [ -z "${SKIP_PIPE:-}" ]; then
+    echo ""
+    warn "    $_n. ⚠ INSTALL THE STUDIO LANES — they were skipped because Open WebUI had no admin"
+    warn "       account yet. After you sign up (step 1), run this ONE command:"
+    warn ""
+    warn "           bash services/studio/push-pipe-to-owui.sh"
+    warn ""
+    warn "       Then reload Open WebUI — the 🎬 Studio lanes appear in the model selector."
+    echo ""
+    _n=$((_n + 1))
+fi
+echo "    $_n. On the 'Studio' function (Admin → Functions → Studio), set the 'browser_base'"
+echo "       valve to http://$LANIP:8189 so returned media links open from your browser."; _n=$((_n + 1))
+echo "    $_n. Pick a lane in the model selector (🎬 Video · 🖼️ Image · 🎵 Audio), type an idea,"
 echo "       and refine by just replying. Full guide: docs/ai-studio/README.md"
 echo ""
 warn "  Notes:"

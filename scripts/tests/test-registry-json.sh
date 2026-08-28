@@ -25,12 +25,19 @@ json="$(bash scripts/lib/registry-emit.sh --json "$ROOT_DIR" 2>/dev/null)"
 # python pass. The JSON is passed via the environment (not stdin) so the heredoc
 # can serve as the python script. Exits non-zero with a clear message on the
 # first mismatch.
-REGISTRY_JSON="$json" python3 - <<'PY'
+# Temp file, not env: a single env value is capped at MAX_ARG_STRLEN
+# (~128 KB on Linux) — the emit crossed that at 63 registry entries
+# ("Argument list too long", 2026-07-11).
+json_file="$(mktemp)"
+trap 'rm -f "$json_file"' EXIT
+printf '%s' "$json" > "$json_file"
+REGISTRY_JSON_FILE="$json_file" python3 - <<'PY'
 import json
 import os
 import sys
+from pathlib import Path
 
-d = json.loads(os.environ["REGISTRY_JSON"])
+d = json.loads(Path(os.environ["REGISTRY_JSON_FILE"]).read_text(encoding="utf-8"))
 
 def need(cond, msg):
     if not cond:
@@ -44,16 +51,22 @@ need(isinstance(d["variants"], list) and d["variants"], "variants must be a non-
 need(isinstance(d["defaults"], list) and d["defaults"], "defaults must be a non-empty list")
 
 # variants — the parse_variant_rows fields (+ source + configured_ctx +
-# weights_companions/drafter/vision); port is an int.  configured_ctx is the EXACT
-# numeric registry max_ctx int behind ctx_label (the cockpit's divergence badge
-# compares the probe against it).  weights_companions = the per-slug extra weight
-# keys (DFlash draft / mmproj) the cockpit Download fetches alongside the core;
-# drafter / vision are the per-slug facets (display + companion derivation).
+# weights_companions/drafter/vision + baseline); port is an int.  configured_ctx
+# is the EXACT numeric registry max_ctx int behind ctx_label (the cockpit's
+# divergence badge compares the probe against it).  weights_companions = the
+# per-slug extra weight keys (DFlash draft / mmproj) the cockpit Download
+# fetches alongside the core; drafter / vision are the per-slug facets.
+# baseline = the shipped catalog-baseline row joined from
+# scripts/lib/profiles/baselines.yml with the emit-computed 'stale' verdict
+# (catalog-baselines slice 1) — None when the slug has no accepted row.
 VARIANT_KEYS = {
     "slug", "switch_engine", "launch_engine", "compose_dir", "file", "port",
     "model", "engine", "kvcalc_key", "container", "compose_path", "status",
     "ctx_label", "configured_ctx", "status_note", "source",
-    "weights_companions", "drafter", "vision",
+    "weights_companions", "drafter", "vision", "baseline",
+    # c3 catalog Weights/KV columns (#600): registry kv_format + the model
+    # profile's weights format / explicit quant_label joins.
+    "kv_format", "weights_format", "weights_quant_label",
 }
 v0 = d["variants"][0]
 need(set(v0.keys()) == VARIANT_KEYS,

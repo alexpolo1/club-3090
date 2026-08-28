@@ -20,9 +20,11 @@ Start here if you want to run a model.
 | [`SINGLE_CARD.md`](SINGLE_CARD.md) | 1× RTX 3090 — workload → curated config → quick start. |
 | [`DUAL_CARD.md`](DUAL_CARD.md) | 2× RTX 3090 (PCIe / NVLink auto-detected) — workload → config → quick start. |
 | [`MULTI_CARD.md`](MULTI_CARD.md) | 3+ GPUs — TP scaling math, derivation from `dual.yml`, valid TP values. |
+| [`PODS.md`](PODS.md) | Multiple models on one host — `pod.sh` + the c3 pod view/wizard, GPU pinning, placement, the estate file. |
 | [`PULL.md`](PULL.md) | Any HF safetensors repo — evaluate against the KV math, honest about confidence. |
 | [`BRING_YOUR_OWN.md`](BRING_YOUR_OWN.md) | Serve + tune + validate **your own** model/compose (any engine, single or dual) without touching the catalog. |
 | [`HARDWARE.md`](HARDWARE.md) | Card-class questions — 4090/5090, power caps, NVLink, laptop EC power. |
+| [`PCIE_P2P.md`](PCIE_P2P.md) | PCIe-only multi-GPU — read your `topo -m`, and optionally enable P2P over PCIe without NVLink. |
 | [`GLOSSARY.md`](GLOSSARY.md) | TPS / KV / MTP / TP and the rest of the vocabulary. |
 | [`FAQ.md`](FAQ.md) | Common setup and operational questions. |
 | [`COMPARISONS.md`](COMPARISONS.md) | Self-host vs cloud APIs — cost crossover and when each wins. |
@@ -78,6 +80,7 @@ These are cross-cutting references both tracks reach for.
 | [`engines/`](engines/) | Per-engine deep dives — [vLLM](engines/VLLM.md), [llama.cpp](engines/LLAMA_CPP.md), [SGLang](engines/SGLANG.md). |
 | [`INFERENCE_ENGINES.md`](INFERENCE_ENGINES.md) | Engine picker — which engine for which workload, and structural gaps. |
 | [`CLIFFS.md`](CLIFFS.md) | The accumulated-context / prefill failure modes (Cliff 2, Cliff 2b) and how to detect them. |
+| [`QUANTIZATION.md`](QUANTIZATION.md) | **Quant field guide** — GGUF ladder, the vLLM/safetensors schemes, KLD-by-fidelity (§4a), and the **fast/balanced/max tier trade-space** (§4b). The conceptual home the dtype/kernel matrices support. |
 | [`DTYPE_MATRIX.md`](DTYPE_MATRIX.md) | Supported dtype × model × engine matrix. |
 | [`KERNEL_MATRIX.md`](KERNEL_MATRIX.md) | Quant-kernel availability and alignment constraints. |
 | [`QUALITY_TEST.md`](QUALITY_TEST.md) | The quality-test harness and what it measures. |

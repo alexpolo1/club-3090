@@ -9,6 +9,7 @@ What this stack assumes about your hardware. True regardless of which model or e
 - **NVIDIA RTX 3090 (24 GB, Ampere SM 8.6)** — 1 or 2 cards.
 - **PCIe Gen 4 slot** — Gen 3 works but allreduce on dual-card is slower (mild impact on multi-tenant; minimal impact on single-stream).
 - **NVIDIA driver 580.x or newer** — for CUDA 13 runtime in vLLM nightly. `nvidia-smi` to check. Older drivers won't load CUDA 13 kernels.
+  - ⚠️ **The ik-llama `cu13` pin needs CUDA ≥ 13.2 specifically** (not just 580.x). Its digest is a CUDA 13.2 runtime, so a driver whose *supported* CUDA < 13.2 — e.g. 580.159 = CUDA 13.0 — forward-compat-fails on GeForce (error 804) → CPU fallback → crash loop ([#633](../../../noonghunna/club-3090/issues/633)). The launcher **auto-selects the cu12 sibling build** (same build, backward-compatible) on such drivers; override with `IK_LLAMA_IMAGE=…:cu12-server-4574` in `.env`. Check your ceiling top-right in `nvidia-smi`.
 - **Linux** (Ubuntu 22.04+ tested). vLLM is Linux + CUDA only. llama.cpp works on macOS / Windows but our recipes assume Linux paths.
 - **Docker + NVIDIA Container Toolkit** for vLLM. llama.cpp doesn't need Docker.
 
@@ -65,6 +66,63 @@ Same `MAX_MODEL_LEN` / `GPU_MEMORY_UTILIZATION` env overrides apply for any setu
 
 ---
 
+## Arch-aware launcher defaults (#246 Phase 1)
+
+The shipped composes carry **Ampere-safe defaults** (fp8_e5m2 KV etc.). Since [#246](https://github.com/noonghunna/club-3090/issues/246) Phase 1, `launch.sh` / `switch.sh` detect your GPU's compute capability and export the better flag for newer silicon so you don't hand-tune:
+
+| Detected class | What the launchers do |
+|---|---|
+| **ampere** (sm_8.6/8.7) | Nothing — compose defaults apply, byte-for-byte pre-#246 behavior |
+| **ada** (sm_8.9) / **hopper** (sm_9.x) / **blackwell** (sm_10+) | Export `KV_CACHE_DTYPE=fp8_e4m3` for the **pilot slugs** — a **better-precision** FP8 KV format. NB: it's storage-only (≡e5m2 in speed) on consumer cards; native FP8 *attention* is Hopper/datacenter-only. See [DTYPE_MATRIX](DTYPE_MATRIX.md#having-the-tensor-cores--using-them-the-two-axes-that-decide-real-behavior) |
+| unknown / heterogeneous mix / no nvidia-smi | Nothing — compose defaults apply |
+
+Mechanics and boundaries:
+
+- **Pilot slugs only**: `vllm/dual`, `vllm/minimal` — the two Qwen fp8-KV reference configs. Expansion to the rest of the catalog is gated on the cross-rig A/B in #246 (≥15% on either canonical prompt on a volunteer 4090/5090; within CV → the injection framework gets closed out instead).
+- **The injected value comes from the hardware profiles** (`scripts/lib/profiles/hardware/<card>.yml` → `kv_format_default.balanced`) — one source of truth shared with the pull gates and c3. 3090-class profiles declare `fp8_e5m2` there, which equals the compose default: the Ampere no-op is data, not a code branch.
+- **Your env wins**: an explicit `KV_CACHE_DTYPE=…` before `launch.sh`/`switch.sh` suppresses the injection entirely.
+- **Quant-specific KV slugs are never touched** — int8-PTH (compressed-tensors weights *reject* fp8 KV), TurboQuant, and bf16 configs keep their registry KV format.
+- **Direct `docker compose -f … up` bypasses all of this** and keeps the Ampere-safe compose defaults on any card.
+- The preflight banner names the detected class: `[preflight] arch: ada (sm_8.9) — arch-aware KV defaults active for pilot slugs (#246)`.
+- `VLLM_ATTENTION_BACKEND` is plumbed through the same channel but **ships no value** — vLLM's backend auto-detect is the default until someone measures a better per-arch choice.
+- **`nvfp4` KV is DATACENTER-Blackwell-only** (sm_100/sm_103). It needs vLLM's trtllm-gen FP4 FMHA, which has no consumer-Blackwell (sm_120/121) build — so it **crashes on RTX 5090s** even though they run NVFP4 *weights* fine ([vLLM #43562](https://github.com/vllm-project/vllm/issues/43562) / [TRT-LLM #10241](https://github.com/NVIDIA/TensorRT-LLM/issues/10241); confirmed on two 5090s, disc #571). On consumer Blackwell use **fp8_e4m3** KV — the launchers inject it automatically for the pilot slugs.
+
+---
+
+## Pinning specific GPUs on multi-GPU rigs (and CDI / NixOS runtimes)
+
+`bash scripts/launch.sh --gpus 1,2` pins the model to host GPUs 1+2 (leaving GPU 0 free for e.g. a desktop session or an image-gen stack). As of [#610] the launcher resolves your indices to **GPU UUIDs** (`nvidia-smi -L`) and exports them as *both* `NVIDIA_VISIBLE_DEVICES` and `CUDA_VISIBLE_DEVICES` — one mechanism that works on **both** container GPU runtimes:
+
+| Runtime | How devices reach the container | What pins the cards |
+|---|---|---|
+| classic `nvidia` runtime (default Docker + nvidia-container-toolkit) | `NVIDIA_VISIBLE_DEVICES` (the runtime hook) | the UUID exposure itself; the CUDA mask is a no-op that agrees with it |
+| **CDI** (NixOS `hardware.nvidia-container-toolkit`, `nvidia-ctk cdi`, Podman) | the compose `deploy` block's CDI `device_ids` (typically `nvidia.com/gpu=all`) — **`NVIDIA_VISIBLE_DEVICES` is IGNORED** | the in-container `CUDA_VISIBLE_DEVICES` UUID mask |
+
+Why UUIDs and not indices: the classic runtime **renumbers** the exposed set inside the container (host GPUs 1,2 become 0,1), so an index-based inner mask would point at the wrong or a nonexistent card. UUIDs are stable under any exposure order.
+
+**CDI rigs (NixOS etc.)** — swap the compose's `deploy` device block for the CDI form and let the CUDA mask do the selection:
+
+```yaml
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: cdi
+              device_ids:
+                - nvidia.com/gpu=all
+```
+
+then `bash scripts/launch.sh --gpus 1,2` as normal (the composes pass `CUDA_VISIBLE_DEVICES` through). Manual/no-launcher equivalent: `CUDA_VISIBLE_DEVICES=GPU-xxxx,GPU-yyyy docker compose -f … up -d` with the UUIDs from `nvidia-smi -L` (indices also work under CDI-with-all-exposed, but UUIDs are unambiguous).
+
+**Gotchas:**
+- *In-container renumbering is expected, not a bug*: with 2 of 3 cards pinned, `nvidia-smi` **inside** the container shows them as GPU 0/1 (classic runtime) or shows *all* cards while CUDA uses only the masked pair (CDI). Verify placement with **host** `nvidia-smi` — the utilization lands on the cards you picked.
+- The single-card GGUF composes (beellama / llama.cpp / ik-llama) select via `device_ids: ["${ESTATE_GPUS:-${CUDA_VISIBLE_DEVICES:-0}}"]` interpolated on the **host** side — they honor the same launcher export on the classic runtime; on CDI, apply the device-block swap above.
+- Estate (multi-instance) GPU pinning is UUID-pinned the same way (#610 Phase A): each instance's `gpus: [..]` stays index-based in the estate file, and the boot path resolves them to UUIDs — so estates land on the cards they claimed on CDI rigs too. After boot, a **placement assertion** (`docker exec … nvidia-smi --query-compute-apps=gpu_uuid`) confirms the model actually ran on the requested GPUs and prints a loud ⚠ on mismatch — no more silent wrong-card serving.
+
+**Multiple models on one host (pods).** Running several models at once, each pinned to its own GPU set + port, is a **pod** workload — managed with `scripts/pod.sh` (CLI) or the c3 cockpit's Operate tab, both over one estate file with the UUID pinning + placement verification described above. Full guide: **[PODS.md](PODS.md)**.
+
+[#610]: https://github.com/noonghunna/club-3090/issues/610
+
 ## NVLink
 
 **Not required.** Dual-card composes auto-detect NVLink and configure themselves accordingly.
@@ -74,6 +132,7 @@ Same `MAX_MODEL_LEN` / `GPU_MEMORY_UTILIZATION` env overrides apply for any setu
 - **Override**: set `NVLINK_MODE=force_on|force_off` in your `.env` to bypass auto-detection.
 - Without NVLink (PCIe), `--disable-custom-all-reduce` is passed to vLLM and `NCCL_P2P_DISABLE=1` is set. With NVLink, custom all-reduce is enabled and NCCL uses the NVLink path.
 - **If you have NVLink installed and working**, single-stream TPS on dual-card will be ~1.6-1.8× single-card (vs ~1.05× without). Measured NVLink lift is ~10-15% over PCIe on the same rig. See [BENCHMARKS.md](../BENCHMARKS.md) for cross-rig data.
+- **No NVLink?** You can still enable GPU↔GPU P2P over the PCIe bus on a patched driver for a workload-dependent gain — and learn why `nvidia-smi topo -m` reports `PHB` instead of `PIX` — in [PCIE_P2P.md](PCIE_P2P.md).
 
 ---
 

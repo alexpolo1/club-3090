@@ -1,0 +1,19 @@
+[Service]
+# 2026-07-14 — point the dual service at the MTP-OFF compose.
+#
+# Why: --speculative-config mtp/n=3 (on the shipped default fp8-mtp.yml) corrupts tool
+# calls on chained-agent workloads. The agent poisons its own KV/prefix cache; blocks
+# written during MTP chained-agent decoding stay poisoned until restart, so later requests
+# sharing that prefix silently lose their tool call and the agent exits 0 having done
+# nothing. Filed upstream-of-us as club-3090 #710 (2x2 A/B isolates MTP as the sole cause;
+# the tool-call parser is NOT involved). MTP-off also measured +79% decode TPS on this rig.
+#
+# Measured here (probe = replay of a real captured hermes-agent request):
+#   MTP n=3  : 6/6 fresh -> 0/6 after 3 chained-agent runs | autonomous 2/3 | ~36.5 tok/s
+#   MTP off  : 6/6 fresh -> 6/6 after 3 chained-agent runs | autonomous 3/3 | ~65.5 tok/s
+#
+# Revert: delete this drop-in + `systemctl daemon-reload` -> falls back to 40-compose-path.conf
+# (fp8-mtp.yml, the shipped default). Remove once #710 settles the upstream default.
+Environment=CLUB3090_COMPOSE_FILE=fp8.yml
+ExecStop=
+ExecStop=/usr/bin/timeout 90s /usr/bin/docker compose -f /home/alex/club-3090/models/qwen3.6-27b/vllm/compose/dual/autoround-int4/fp8.yml down --timeout 30 --remove-orphans

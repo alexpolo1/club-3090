@@ -143,6 +143,13 @@ REGISTRY_JSON = json.dumps(
                 "ctx_label": "262K",
                 "status_note": "",
                 "source": "curated",
+                "baseline": {
+                    "narr_tps": 174.0, "code_tps": 42.0, "quality_8pk": "109/150",
+                    "date": "2026-07-01", "engine_pin": "vllm/vllm-openai:v0.24.0",
+                    "current_pin": "vllm/vllm-openai:v0.24.0", "stale": False,
+                    "rig": "2x3090-pcie", "power_cap_w": [370, 420],
+                    "submitted_by": "noonghunna",
+                },
             },
             {
                 "slug": "ik-llama/iq4ks-mtp",
@@ -160,6 +167,13 @@ REGISTRY_JSON = json.dumps(
                 "ctx_label": "200K",
                 "status_note": "",
                 "source": "curated",
+                "baseline": {
+                    "narr_tps": 60.4, "code_tps": 72.4,
+                    "date": "2026-05-23", "engine_pin": "ghcr.io/ik-old@sha256:aaa",
+                    "current_pin": "ghcr.io/ik-new@sha256:bbb", "stale": True,
+                    "rig": "1x3090-pcie", "power_cap_w": [370],
+                    "submitted_by": "noonghunna",
+                },
             },
         ],
     }
@@ -298,6 +312,17 @@ def full_runner(**overrides) -> FakeRunner:
 # ===========================================================================
 # Pure parse helpers
 # ===========================================================================
+
+
+class TestScriptsImportable:
+    def test_init_puts_repo_root_on_sys_path(self, tmp_path):
+        """route-G/C ② Serve emit does `from scripts.lib.profiles...`; c3 runs from
+        tools/serve-cockpit/ so the repo root ISN'T on sys.path by default. __init__
+        must add it, else serve dies "No module named 'scripts'" (2026-07-09)."""
+        import sys
+        assert str(tmp_path) not in sys.path
+        CockpitData(tmp_path, runner=full_runner())
+        assert str(tmp_path) in sys.path
 
 
 class TestParseHelpers:
@@ -487,13 +512,102 @@ class TestLoadCatalog:
         assert ik.fit.verdict == "skip"
 
     @pytest.mark.asyncio
-    async def test_catalog_enriches_measurement_from_explain(self):
+    async def test_catalog_enriches_measurement_from_baseline(self):
+        """Catalog-baselines slice 1: measured columns come from the shipped
+        baseline joined into the registry-emit contract — no per-slug explain
+        fan-out, no BENCHMARKS.md scrape (that stays a human ledger)."""
         cd = CockpitData(ROOT, runner=full_runner())
         entries, _ = await cd.load_catalog(enrich_fit=False, enrich_measurement=True)
         vllm = next(e for e in entries if e.slug == "vllm/dual")
-        assert vllm.measurement.source == "explain"
+        assert vllm.measurement.source == "baseline"
         assert vllm.measurement.tps_label == "174/42"
         assert vllm.measurement.quality_label == "109/150"
+        assert vllm.measurement.stale is False
+        # The enrichment ran ZERO --explain subprocesses (the ~4s/slug leg is gone).
+        assert not any("--explain" in " ".join(c) for c in cd._runner.calls)
+        # A stale row carries the emit-computed verdict through.
+        ik = next(e for e in entries if e.slug == "ik-llama/iq4ks-mtp")
+        assert ik.measurement.source == "baseline"
+        assert ik.measurement.stale is True
+
+    @pytest.mark.asyncio
+    async def test_submission_only_baseline_surfaces_rig_labelled(self):
+        """Slice 3 (revised): a submission-only baseline (no primary local row)
+        is SURFACED from its best cross-rig submission so the catalog isn't blank,
+        but tagged `submission_rig` so tps_label renders it ⑂-labelled — never
+        passed off as this rig's own on-rig bar.  A primary row WITH submissions
+        keeps its bar untouched."""
+        import copy
+
+        emit = json.loads(REGISTRY_JSON)
+        # vllm/dual: primary row + a cross-rig submission riding along
+        emit["variants"][0]["baseline"]["submissions"] = {
+            "2x5090-pcie": {
+                "narr_tps": 134.5, "code_tps": 165.1, "date": "2026-07-05",
+                "engine_pin": "vllm/vllm-openai:v0.24.0", "rig": "2x5090-pcie",
+                "power_cap_w": [575, 575], "tier": "submitted",
+                "source": "https://example.test/disc#42",
+                "submitted_by": "guybrush01", "stale": False,
+            }
+        }
+        # ik slug: submission-only (no primary fields at all)
+        sub_only = copy.deepcopy(emit["variants"][1])
+        emit["variants"][1]["baseline"] = {
+            "stale": None, "current_pin": "ghcr.io/ik-new@sha256:bbb",
+            "submissions": emit["variants"][0]["baseline"]["submissions"],
+        }
+        del sub_only  # (structure reuse above is enough)
+        cd = CockpitData(ROOT, runner=full_runner(**{
+            "registry-emit.sh --json": ok(json.dumps(emit)),
+        }))
+        entries, _ = await cd.load_catalog(enrich_fit=False, enrich_measurement=True)
+        vllm = next(e for e in entries if e.slug == "vllm/dual")
+        # primary bar unchanged by the riding submission
+        assert vllm.measurement.source == "baseline"
+        assert vllm.measurement.tps_label == "174/42"
+        ik = next(e for e in entries if e.slug == "ik-llama/iq4ks-mtp")
+        # submission-only: surfaced from the best submission so the catalog isn't
+        # blank, but ⑂-labelled + tagged with its rig_class (NOT this rig's own bar).
+        assert ik.measurement.source == "submission"
+        assert ik.measurement.submission_rig == "2x5090-pcie"
+        assert "⑂" in ik.measurement.tps_label
+        assert ik.measurement.tps_label.startswith("134/165")
+        # ...and the submissions still ride the row for the detail panel
+        subs = (getattr(ik.row, "baseline", None) or {}).get("submissions") or {}
+        assert subs["2x5090-pcie"]["tier"] == "submitted"
+
+    @pytest.mark.asyncio
+    async def test_local_measurements_overlay(self, tmp_path):
+        """Slice 2b — the per-rig corpus overlay: newest record per slug wins
+        (by _recorded_at), malformed lines are skipped, and the overlay joins
+        onto catalog entries as local_measurement."""
+        corpus = tmp_path / "results" / "measurement-records"
+        corpus.mkdir(parents=True)
+        older = {"_tag": "vllm/dual", "_recorded_at": "2026-07-01T10:00:00Z",
+                 "engine_pin": "vllm/vllm-openai:v0.22.0",
+                 "measured_extensions": {"decode_tps_by_ctx": {"canonical-short": 170.0},
+                                          "quality_8pk": "100/150"}}
+        newer = {"_tag": "vllm/dual", "_recorded_at": "2026-07-04T10:00:00Z",
+                 "engine_pin": "vllm/vllm-openai:v0.24.0",
+                 "measured_extensions": {"decode_tps_by_ctx": {"canonical-short": 174.5},
+                                          "quality_8pk": "109/150",
+                                          "quality_8pk_think_on": "111/150"}}
+        (corpus / "vllm-dual__aaaa.jsonl").write_text(
+            json.dumps(older) + "\nnot-json\n" + json.dumps(newer) + "\n"
+        )
+        cd = CockpitData(tmp_path, runner=full_runner())
+        local = cd.local_measurements()
+        lm = local["vllm/dual"]
+        assert lm.decode_tps == 174.5 and lm.quality_8pk == "109/150"
+        assert lm.quality_8pk_think_on == "111/150"
+        assert lm.engine_pin == "vllm/vllm-openai:v0.24.0"
+        assert lm.date == "2026-07-04"
+        # joins onto the catalog entry
+        entries, _ = await cd.load_catalog(enrich_fit=False, enrich_measurement=True)
+        vllm = next(e for e in entries if e.slug == "vllm/dual")
+        assert vllm.local_measurement == lm
+        ik = next(e for e in entries if e.slug == "ik-llama/iq4ks-mtp")
+        assert ik.local_measurement is None   # this rig never gated it
 
     @pytest.mark.asyncio
     async def test_catalog_empty_registry_returns_error(self):
@@ -542,6 +656,41 @@ class TestLoadCatalog:
         assert e_ar.weights is not None and e_ar.weights.hf_repo.startswith("Lorbus")
         assert e_fp8.weights_state == WEIGHTS_ABSENT          # fp8 subdir not created
         assert e_unk.weights_state == WEIGHTS_UNKNOWN          # no weights entry to join
+
+    @pytest.mark.asyncio
+    async def test_bring_download_in_progress_live_stale_absent(self, tmp_path, monkeypatch):
+        """#617 disk-truth probe: bring_download_in_progress reads the pull-dir
+        download lock — in-progress for a LIVE holder (with pct from .incomplete
+        bytes), None for a STALE (dead-holder) lock or no lock at all."""
+        import subprocess
+        cd = CockpitData(ROOT, runner=full_runner())
+        monkeypatch.setattr(cd, "_bring_hf_home", lambda: tmp_path)
+        repo = "org/Tess-4-27B-FP8"
+
+        assert cd.bring_download_in_progress(repo) is None        # no lock → absent
+
+        pull = cd.bring_pull_dir(repo)
+        (pull / ".download.lock").mkdir(parents=True)
+        inc = pull / ".incomplete"
+        inc.mkdir()
+        (inc / "part.bin").write_bytes(b"x" * 1000)               # 1000 bytes staged
+
+        holder = subprocess.Popen(["sleep", "30"])
+        try:
+            (pull / ".download.lock" / "pid").write_text(
+                f"{holder.pid}\n2026-01-01T00:00:00+00:00\n", encoding="utf-8"
+            )
+            info = cd.bring_download_in_progress(repo, expected_gb=2e-6)  # 2000 B expected
+            assert info is not None and info["in_progress"] is True
+            assert info["pid"] == holder.pid
+            assert info["pct"] == 50                              # 1000 / 2000 B
+            # pct is None when the total size is unknown
+            assert cd.bring_download_in_progress(repo)["pct"] is None
+        finally:
+            holder.terminate()
+            holder.wait()
+
+        assert cd.bring_download_in_progress(repo) is None        # dead holder → stale
 
     @pytest.mark.asyncio
     async def test_weights_download_plan_and_progress(self, tmp_path):
@@ -612,6 +761,48 @@ class TestLoadCatalog:
         cd2 = CockpitData(ROOT, runner=full_runner(), download_runner=cap2)
         await cd2.run_weights_download("qwen3.6-27b", "autoround-int4")
         assert "WEIGHT_EXTRA_KEYS" not in cap2.env
+
+    @pytest.mark.asyncio
+    async def test_run_bring_download_apply_swap_flag_and_capture(self):
+        """Route-C apply-swap: run_bring_download(apply_swap=True) appends
+        --apply-swap to pull.sh AND captures the emitted serve-locally compose
+        from the `[apply-swap] compose: <path>` line (② Serve serves it). With
+        apply_swap=False it does neither — the plain Path-B fetch is unchanged."""
+        import asyncio
+
+        class _SwapDL:
+            def __init__(self, emit): self.cmd = None; self._on = None; self._emit = emit
+            def set_callbacks(self, on_line=None, **kw): self._on = on_line
+            async def start_raw(self, cmd, env=None, run_type=None, parser=None):
+                self.cmd = cmd
+                if self._on and self._emit:
+                    self._on("[apply-swap] compose: /tmp/_brought-x.yml")
+                h = type("H", (), {})(); h.done = asyncio.Event(); h.done.set(); h.exit_code = 0
+                return h
+
+        dl = _SwapDL(emit=True)
+        cd = CockpitData(ROOT, runner=full_runner(), download_runner=dl)
+        await cd.run_bring_download("some/Fine-Tune", "vllm/dual", apply_swap=True)
+        assert "--apply-swap" in dl.cmd, dl.cmd
+        assert cd.last_swap_compose() == "/tmp/_brought-x.yml"
+
+        assert "--emit-only" not in dl.cmd, dl.cmd    # default: full download
+
+        dl2 = _SwapDL(emit=False)
+        cd2 = CockpitData(ROOT, runner=full_runner(), download_runner=dl2)
+        await cd2.run_bring_download("some/Fine-Tune", "vllm/dual", apply_swap=False)
+        assert "--apply-swap" not in dl2.cmd, dl2.cmd
+        assert cd2.last_swap_compose() == ""
+
+        # emit_only=True (present weights) → --apply-swap AND --emit-only, so
+        # pull.sh emits the serve compose WITHOUT downloading (② Serve's no-[D] path)
+        dl3 = _SwapDL(emit=True)
+        cd3 = CockpitData(ROOT, runner=full_runner(), download_runner=dl3)
+        await cd3.run_bring_download(
+            "some/Fine-Tune", "vllm/dual", apply_swap=True, emit_only=True
+        )
+        assert "--apply-swap" in dl3.cmd and "--emit-only" in dl3.cmd, dl3.cmd
+        assert cd3.last_swap_compose() == "/tmp/_brought-x.yml"
 
     @pytest.mark.asyncio
     async def test_weights_state_partial_until_companion_present(self, tmp_path):
@@ -1562,6 +1753,83 @@ class TestReconcileGate:
         assert rec.estate_claims == []
         assert rec.safe is True
 
+    # ── F7 — estate.yml is a PLAN: only LIVE instances are claims ────────────────
+    # (T1.1 audit: an EMPTY rig warned "⚠ Starting this will STOP estate
+    # llama-gpu0, llama-gpu1" off a leftover ~/.club3090/estate.yml.  estate_cli
+    # report-state now probes docker per instance; running==False → not a claim;
+    # True / null / missing → claim, the gate fails CLOSED on unknown liveness.
+    # The missing-key case is the legacy fixtures above, which must stay claims.)
+
+    def _estate_report(self, running):
+        return json.dumps(
+            {
+                "active_estate": {
+                    "present": True,
+                    "valid": True,
+                    "instances": [
+                        {"name": "llama-gpu0", "compose": "llamacpp/default",
+                         "gpus": [0], "port": 8010, "container": "club3090-llama-gpu0",
+                         "running": running},
+                        {"name": "llama-gpu1", "compose": "llamacpp/default",
+                         "gpus": [1], "port": 8020, "container": "club3090-llama-gpu1",
+                         "running": running},
+                    ],
+                }
+            }
+        )
+
+    def _empty_rig_data(self, runner):
+        gpus = [GpuInfo(index=0, mem_used_mib=3), GpuInfo(index=1, mem_used_mib=3)]
+        return CockpitData(
+            ROOT, runner=runner,
+            detect_endpoint_fn=make_detect(ServingTarget(gpus=gpus)),
+            get_gpu_info_fn=make_gpu_info(gpus),
+        )
+
+    @pytest.mark.asyncio
+    async def test_stale_estate_plan_is_not_a_claim(self):
+        """The audit repro: empty rig + leftover estate.yml (instances probed
+        DOWN) → the gate is SAFE; no scary stop-conflict for a fresh user."""
+        runner = full_runner(
+            **{
+                "docker ps": ok(DOCKER_PS_EMPTY),
+                "estate_cli.py report-state --json": ok(self._estate_report(False)),
+            }
+        )
+        cd = self._empty_rig_data(runner)
+        rec = await cd.reconcile_before_write("serve:dual", pending_gpus=[0, 1])
+        assert rec.estate_claims == []
+        assert rec.safe is True
+
+    @pytest.mark.asyncio
+    async def test_live_estate_instance_still_claims(self):
+        """running == True stays a conflict even when nvidia-smi shows the cards
+        idle (the instance may be mid-boot, VRAM not allocated yet)."""
+        runner = full_runner(
+            **{
+                "docker ps": ok(DOCKER_PS_EMPTY),
+                "estate_cli.py report-state --json": ok(self._estate_report(True)),
+            }
+        )
+        cd = self._empty_rig_data(runner)
+        rec = await cd.reconcile_before_write("serve:dual", pending_gpus=[0, 1])
+        assert len(rec.estate_claims) == 2
+        assert rec.safe is False
+
+    @pytest.mark.asyncio
+    async def test_unknown_estate_liveness_fails_closed(self):
+        """running == null (docker unavailable to estate_cli) → still a claim."""
+        runner = full_runner(
+            **{
+                "docker ps": ok(DOCKER_PS_EMPTY),
+                "estate_cli.py report-state --json": ok(self._estate_report(None)),
+            }
+        )
+        cd = self._empty_rig_data(runner)
+        rec = await cd.reconcile_before_write("serve:dual", pending_gpus=[0, 1])
+        assert len(rec.estate_claims) == 2
+        assert rec.safe is False
+
     @pytest.mark.asyncio
     async def test_pending_gpus_none_is_conservative_both_cards(self):
         """pending_gpus=None means 'wants both cards' → any GPU1 use conflicts."""
@@ -1955,6 +2223,40 @@ class TestContainerLogs:
         out = await cd.container_logs("nope")
         assert out["lines"] == []
         assert "No such container" in out["error"]
+
+
+class TestBringDownloadSeam:
+    """§2b-6/7 — the lane download's presence probe + path contract."""
+
+    def test_pull_dir_mirrors_downloader_sanitizer(self, monkeypatch, tmp_path):
+        # The c3-side path computation must equal the SoT sanitizer in
+        # scripts/lib/profiles/downloader.py (drift guard — the probe reads
+        # where pull.sh actually writes).
+        import sys
+        from pathlib import Path as _P
+
+        monkeypatch.setenv("HF_HOME", str(tmp_path))
+        cd = CockpitData(ROOT, runner=full_runner())
+        repo_root = str(_P(__file__).resolve().parents[3])
+        if repo_root not in sys.path:
+            sys.path.insert(0, repo_root)
+        from scripts.lib.profiles.downloader import pull_dir as sot_pull_dir
+
+        for repo in ("Org/Some Model-7B", "unsloth/Qwen3-27B-GGUF", "a/B__c"):
+            assert cd.bring_pull_dir(repo) == sot_pull_dir(tmp_path, repo), repo
+
+    def test_weights_present_probe(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HF_HOME", str(tmp_path))
+        cd = CockpitData(ROOT, runner=full_runner())
+        repo = "org/Model"
+        assert cd.bring_weights_present(repo) is False          # no dir
+        d = cd.bring_pull_dir(repo)
+        d.mkdir(parents=True)
+        assert cd.bring_weights_present(repo) is False          # dir, no blobs
+        (d / "model.safetensors").write_bytes(b"x")
+        assert cd.bring_weights_present(repo) is True           # blob present
+        (d / ".incomplete").mkdir()
+        assert cd.bring_weights_present(repo) is False          # staging = not done
 
 
 class TestRealRunnerNotInvokedInTests:
@@ -2778,6 +3080,99 @@ class TestPhase4Evidence:
 
 
 # ===========================================================================
+# F10 — Evidence live gate-run OBSERVER (pure filesystem READ of the
+# rebench-full artifacts: timings.json + <step>.log; REPORT.md is written LAST
+# so its absence == run in flight / aborted)
+# ===========================================================================
+
+
+def _seed_live_run(base: Path, tag: str = "live-run") -> Path:
+    """A mid-flight rebench dir: 2 steps done (timings.json), the 3rd step's
+    log growing with ANSI + \\r-overdraw progress lines."""
+    d = base / "results" / "rebench" / tag
+    d.mkdir(parents=True)
+    (d / "timings.json").write_text(
+        json.dumps({"verify-full": 132, "bench": 241}), encoding="utf-8"
+    )
+    (d / "verify-full.log").write_text("8/8 PASS\n", encoding="utf-8")
+    (d / "bench.log").write_text("narrative 153.9 TPS\n", encoding="utf-8")
+    (d / "verify-stress.log").write_text(
+        "ladder 32K ok\n\x1b[32mladder 91K ok\x1b[0m\n"
+        "run [1/7]…\rrun [2/7]…\rrun [3/7] longctx probe\n",
+        encoding="utf-8",
+    )
+    return d
+
+
+class TestF10EvidenceLiveObserver:
+    @pytest.mark.asyncio
+    async def test_live_run_detected_with_ladder_and_tail(self, tmp_path):
+        _seed_live_run(tmp_path)
+        # A completed sibling stays a plain completed row.
+        done = tmp_path / "results" / "rebench" / "done-run"
+        done.mkdir(parents=True)
+        (done / "REPORT.md").write_text("# Rebench report\n", encoding="utf-8")
+        cd = CockpitData(tmp_path, runner=full_runner())
+        tags = {t.tag: t for t in await cd.evidence_list()}
+        live = tags["live-run"]
+        assert live.live and not live.stale
+        assert live.steps_done == [("verify-full", 132), ("bench", 241)]
+        # Active step = the newest step log with no timings entry.
+        assert live.live_step == "verify-stress"
+        # Tail is ANSI-stripped and \r-overdraw-resolved (a terminal's view).
+        assert "\x1b" not in live.live_tail
+        assert "run [3/7] longctx probe" in live.live_tail
+        assert "run [1/7]" not in live.live_tail
+        assert "ladder 91K ok" in live.live_tail
+        comp = tags["done-run"]
+        assert not comp.live and not comp.stale
+
+    @pytest.mark.asyncio
+    async def test_quiet_incomplete_run_is_stale_not_live(self, tmp_path):
+        import os as _os
+
+        d = _seed_live_run(tmp_path, tag="dead-run")
+        old = time.time() - 7200
+        for f in [d, *d.iterdir()]:
+            _os.utime(f, (old, old))
+        cd = CockpitData(tmp_path, runner=full_runner())
+        t = next(t for t in await cd.evidence_list() if t.tag == "dead-run")
+        assert t.stale and not t.live
+        assert t.age_secs >= 7000
+        # The ladder data is still read (what it finished before dying).
+        assert t.steps_done and t.live_step == "verify-stress"
+        # No tail read for a dead run.
+        assert t.live_tail == ""
+
+    @pytest.mark.asyncio
+    async def test_mid_rewrite_timings_tolerated(self, tmp_path):
+        # record_timing REWRITES timings.json — a torn read must not crash the
+        # observer; it degrades to "no steps recorded (yet)".
+        d = _seed_live_run(tmp_path, tag="torn-run")
+        (d / "timings.json").write_text('{"verify-full": 13', encoding="utf-8")
+        cd = CockpitData(tmp_path, runner=full_runner())
+        t = next(t for t in await cd.evidence_list() if t.tag == "torn-run")
+        assert t.live
+        assert t.steps_done == []
+        # With no timings, every present step log is a candidate → newest wins.
+        assert t.live_step == "verify-stress"
+
+    def test_gate_steps_match_rebench_script(self):
+        """Drift guard: GATE_STEPS is a render constant mirroring the run_step
+        call sites in scripts/rebench-full.sh — the script owns the sequence."""
+        import re as _re
+
+        from club3090_cockpit.data import GATE_STEPS
+
+        script = Path(__file__).resolve().parents[3] / "scripts" / "rebench-full.sh"
+        if not script.is_file():
+            pytest.skip("rebench-full.sh not present (standalone checkout)")
+        text = script.read_text(encoding="utf-8", errors="replace")
+        names = _re.findall(r"\brun_step\s+([a-z][a-z-]*)", text)
+        assert tuple(names) == GATE_STEPS
+
+
+# ===========================================================================
 # PHASE 4 — submit-bench (READ preview vs OUTWARD-FACING gated write)
 # ===========================================================================
 
@@ -3351,3 +3746,91 @@ class TestStudioSidecarEnumeration:
         # No services/studio/* present → no sidecar rows (only any top-level dirs).
         names = CockpitData(tmp_path, runner=full_runner())._known_service_dirs()
         assert not any(n.startswith("studio-") for n in names)
+
+
+class TestServeOverrides:
+    """② Serve override editor — plan.env threading + compose-default pre-fill."""
+
+    def test_serve_generated_overrides_ride_plan_env(self):
+        cd = CockpitData(ROOT, runner=full_runner())
+        plan = cd.serve_generated("/tmp/x.yml", {
+            "MAX_MODEL_LEN": "65536", "SPEC": "off",
+            "KV_CACHE_DTYPE": "", "SERVED_NAME": "Foo",   # empty is dropped
+        })
+        assert plan.env["MAX_MODEL_LEN"] == "65536"
+        assert plan.env["SPEC"] == "off"
+        assert plan.env["SERVED_NAME"] == "Foo"
+        assert "KV_CACHE_DTYPE" not in plan.env          # empty override dropped
+        assert plan.env["MODEL_DIR"]                     # pinned (HF mount resolves)
+        # no overrides → only the pinned MODEL_DIR rides
+        assert cd.serve_generated("/tmp/x.yml").env == {"MODEL_DIR": cd.weights_model_dir()}
+
+    def test_serve_override_defaults_parses_sibling_compose(self):
+        repo_root = Path(__file__).resolve().parents[3]
+        cd = CockpitData(repo_root, runner=full_runner())
+        d = cd.serve_override_defaults("vllm/dual", "org/MyFineTune")
+        assert d["SERVED_NAME"] == "MyFineTune"          # from the brought repo name
+        assert d["MAX_MODEL_LEN"] == "262144"            # parsed ${MAX_MODEL_LEN:-262144}
+        assert d["KV_CACHE_DTYPE"] == "fp8_e5m2"
+        assert d["SPEC"] == "on"
+        assert d["ENGINE"] == "vllm-stable"              # only parsing gives this
+        assert d["SPEC_DRAFTER"] == "MTP n=3"            # real drafter, not "on"
+
+    def test_engine_kv_formats_is_engine_specific(self):
+        repo_root = Path(__file__).resolve().parents[3]
+        cd = CockpitData(repo_root, runner=full_runner())
+        vk = cd.engine_kv_formats("vllm-stable")
+        assert "fp8_e5m2" in vk and "int8_per_token_head" in vk
+        # a totally different engine → a totally different KV family
+        assert cd.engine_kv_formats("llama-cpp-mainline") == ["q4_0", "q5_0", "q8_0", "k8v4"]
+        # the editor's KV options come from the engine, not a generic list
+        assert cd.serve_override_defaults("vllm/dual", "org/Foo")["KV_OPTIONS"] == vk
+
+    def test_engine_drafters_and_options(self):
+        repo_root = Path(__file__).resolve().parents[3]
+        cd = CockpitData(repo_root, runner=full_runner())
+        assert cd.engine_drafters("vllm-stable") == ["mtp", "mtp_assistant"]
+        assert "dflash" in cd.engine_drafters("beellama-local")
+        d = cd.serve_override_defaults("vllm/dual", "org/Foo")
+        assert d["DRAFTER_OPTIONS"] == ["mtp", "mtp_assistant"]   # engine-driven
+        assert d["SPEC_METHOD"] == "mtp" and d["SPEC_N"] == "3"
+
+
+class TestBringGgufDownload:
+    """route-G [D]: a GGUF bring must fetch the picked quant's files directly (hf
+    download --include), NOT pull.sh — pull.sh aborts unsupported-format on a GGUF
+    repo (no config.json).  (2026-07-09 dogfood.)"""
+
+    def test_gguf_includes_build_hf_download_cmd(self, tmp_path):
+        import asyncio
+        d = CockpitData(tmp_path)
+        cap = {}
+
+        class R:
+            def set_callbacks(self, **k): pass
+            async def start_raw(self, cmd, **kw):
+                cap["cmd"] = cmd; cap["env"] = kw["env"]; return "h"
+
+        d._download_runner = R()
+        asyncio.run(d.run_bring_download(
+            "org/Repo-GGUF", "llamacpp/default",
+            gguf_includes=["org_Repo-Q8_0.gguf", "mmproj-f16.gguf"]))
+        c = cap["cmd"]
+        assert c[1] == "download" and "pull.sh" not in " ".join(c)     # hf download, not pull.sh
+        assert "--local-dir" in c and str(d.bring_pull_dir("org/Repo-GGUF")) in c
+        assert c.count("--include") == 2
+        assert cap["env"].get("HF_HUB_DISABLE_XET") == "1"             # resumable classic LFS
+
+    def test_no_gguf_includes_uses_pull_sh(self, tmp_path):
+        import asyncio
+        d = CockpitData(tmp_path)
+        cap = {}
+
+        class R:
+            def set_callbacks(self, **k): pass
+            async def start_raw(self, cmd, **kw):
+                cap["cmd"] = cmd; return "h"
+
+        d._download_runner = R()
+        asyncio.run(d.run_bring_download("org/Repo", "vllm/dual"))
+        assert cap["cmd"][:2] == ["bash", "scripts/pull.sh"]           # safetensors path unchanged

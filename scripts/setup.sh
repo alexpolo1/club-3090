@@ -152,7 +152,7 @@ esac
 if [[ $# -gt 1 ]]; then
   echo "ERROR: setup.sh takes a single model name; got extra argument(s): ${*:2}" >&2
   echo "       setup.sh only DOWNLOADS WEIGHTS for a model — e.g. bash scripts/setup.sh ${1}" >&2
-  echo "       To LAUNCH a serving config (a slug such as 'vllm/gemma-int8-mtp'), use:" >&2
+  echo "       To LAUNCH a serving config (a slug such as 'vllm/gemma-31b-dual'), use:" >&2
   echo "         bash scripts/launch.sh --variant <slug>      # or: bash scripts/switch.sh <slug>" >&2
   echo "       See the slugs available for a model:  bash scripts/switch.sh --list" >&2
   exit 64
@@ -622,7 +622,11 @@ download_weight_key() {
   _verify_downloaded_files "$WEIGHT_REPO" "$WEIGHT_SUBDIR" "$WEIGHT_VERIFY_GLOB" "${WEIGHT_REVISION:-main}"
 }
 
-VERIFY_GLOB="${VERIFY_GLOB_OVERRIDE:-*.safetensors}"
+# #634 — honour the PRIMARY recipe's verify_glob (set by load_weight_recipe →
+# line 100, e.g. "*.gguf" for GGUF keys), NOT a re-hardcoded *.safetensors, or
+# every GGUF primary fetch (WEIGHTS=gguf/iq4ks) fails verify despite a good
+# download.  An explicit VERIFY_GLOB_OVERRIDE still wins.
+VERIFY_GLOB="${VERIFY_GLOB_OVERRIDE:-${VERIFY_GLOB}}"
 _hf_download_repo "${MODEL_REPO}" "${MODEL_SUBDIR}" "${GGUF_FILES}" "${MODEL_REVISION:-}"
 _verify_downloaded_files "${MODEL_REPO}" "${MODEL_SUBDIR}" "${VERIFY_GLOB}" "${MODEL_REVISION:-main}"
 
@@ -680,7 +684,7 @@ case "${MODEL_NAME}" in
     SAMPLE_CONTAINER="vllm-qwen36-27b"
     SAMPLE_COMPOSE_FLAGS_DUAL=" -f dual/autoround-int4/fp8-mtp.yml"
     SAMPLE_PORT="8020"
-    SAMPLE_MODEL_NAME="qwen3.6-27b-autoround"
+    SAMPLE_MODEL_NAME="qwen3.6-27b"
     NEXT_STEPS_NOTE="Or dual-card vLLM (Marlin patched files already vendored in-repo):
   cd models/${MODEL_NAME}/vllm/compose && docker compose -f dual/autoround-int4/fp8-mtp.yml up -d"
     ;;
@@ -690,9 +694,9 @@ case "${MODEL_NAME}" in
     # Use scripts/switch.sh which auto-selects the right compose by variant.
     SAMPLE_COMPOSE_FLAGS_DUAL=""
     SAMPLE_PORT="8030"
-    SAMPLE_MODEL_NAME="gemma-4-31b-autoround"
+    SAMPLE_MODEL_NAME="gemma-4-31b"
     NEXT_STEPS_NOTE="Available variants:
-  bash scripts/switch.sh vllm/gemma-bf16-mtp        # MTP drafter, TP=2, port 8030 (dual-card)
+  bash scripts/switch.sh vllm/gemma-31b-dual        # bf16 KV, TP=2, port 8032 (dual-card, v0.24.0 overlay-free)
   bash scripts/switch.sh beellama/gemma-dflash # DFlash, single-card default, port 8061"
     ;;
   gemma-4-26b-a4b)
@@ -728,7 +732,7 @@ echo "[setup] Next: bash scripts/launch.sh"
 echo ""
 echo "Next — single-card vLLM (default):"
 if [[ "${MODEL_NAME}" == "gemma-4-31b" ]]; then
-  echo "  bash scripts/switch.sh vllm/gemma-bf16-mtp"
+  echo "  bash scripts/switch.sh vllm/gemma-31b-dual"
   echo "  docker logs -f ${SAMPLE_CONTAINER}"
 else
   echo "  cd models/${MODEL_NAME}/vllm/compose && docker compose up -d"

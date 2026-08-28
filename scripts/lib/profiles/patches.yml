@@ -58,38 +58,32 @@ patches:
     status: suspect
 
   - id: qwen-vllm-marlin-pad
+    deprecated_on: "2026-07-02"
+    deprecation_reason: "merged upstream (native in vLLM v0.24.0) — our #40361 sub-tile-n pad was closed-superseded by mgoin's #45295 (consolidated `marlin_padded_nk` across all dense Marlin paths). `vllm-stable` pins v0.24.0, so it's native there."
     model: [qwen3.6-27b]
     files:
       - models/qwen3.6-27b/vllm/patches/vllm-marlin-pad
-    load_bearing_when:
-      - composes:
-          - vllm/dual
-        reason: "AutoRound INT4 TP shards can fall below Marlin's output-feature tile floor."
-        evidence: "models/qwen3.6-27b/vllm/patches/vllm-marlin-pad/README.md; models/qwen3.6-27b/INTERNALS.md#dual-card-the-marlin-pad-sub-tile-n-patch-vllm40361"
+    # NOT load-bearing anymore: #40361 (our per-case W4A16 sub-tile-n pad) was
+    # closed-superseded by #45295 (general marlin_padded_nk), which is native in
+    # vLLM v0.24.0. `vllm-stable` is pinned v0.24.0, and the AutoRound INT4 TP=2
+    # path (vllm/dual) boots clean WITHOUT the overlay — validated 2026-06-30
+    # (PR #533 Phase 0b: "marlin-pad confirmed unnecessary"). No live compose
+    # mounts it (archive-only). Kept as historical reference (delivery: none).
+    load_bearing_when: []
     delivery:               # DEPRECATED/READ-ONLY (test-only) — see header
-      dockerfile_bake: true
-      entrypoint_invoke: true
+      dockerfile_bake: false
+      entrypoint_invoke: false
       genesis: false
     delivery_gaps: []
-    delivery_mechanism: site_package_overlay
-    delivery_spec:
-      overlay_files:
-        - src: models/qwen3.6-27b/vllm/patches/vllm-marlin-pad/marlin.py
-          dest: /usr/local/lib/python3.12/dist-packages/vllm/model_executor/kernels/linear/mixed_precision/marlin.py
-        - src: models/qwen3.6-27b/vllm/patches/vllm-marlin-pad/MPLinearKernel.py
-          dest: /usr/local/lib/python3.12/dist-packages/vllm/model_executor/kernels/linear/mixed_precision/MPLinearKernel.py
-      mount_mode: ro
-      wired_at: volumes
-    drift_guard:
-      kind: import-and-boot
-      check: "vLLM AutoRound W4A16 TP shard loads without Marlin sub-tile-n assertion (overlay target paths exist in selected nightly)"
-      on_fail: hard-refuse   # foundational: TP weights will not load without it
+    delivery_mechanism: none   # merged into stock v0.24.0 (#45295); dropped from all live composes
+    delivery_spec: null
+    drift_guard: null
     capability: tp-weight-load
-    foundational: true
+    foundational: false
     upstream:
       ref: vllm-project/vllm#40361
-      status: open
-      drop_when: "merged into the selected vLLM nightly and all affected composes pin beyond the merge"
+      status: merged
+      drop_when: "DONE — #40361 closed-superseded by #45295 (native in v0.24.0); vllm-stable pinned v0.24.0; no live compose mounts it. Entry retained as history."
     status: verified
 
   - id: qwen-vllm-pr35936-required-fallback
@@ -242,14 +236,15 @@ patches:
     status: verified
 
   - id: qwen-froggeric-chat-template
-    model: [qwen3.6-27b]
+    model: [qwen3.6-27b, tess-4-27b]
     files:
       - models/qwen3.6-27b/vllm/patches/froggeric-chat-template/chat_template.jinja
     load_bearing_when:
       - composes:
           - vllm/minimal
           - vllm/dual
-        reason: "Default Qwen3.6 chat template mis-handles tool-call XML / reasoning delimiters / streaming (the #145 silent-break class); the froggeric override fixes 7 default-template defects and is behavior-critical for every tool/agent compose. Carnice/Qwopus are intentional excludes (they ship their own carnice template)."
+          - vllm/tess-dual-nvfp4
+        reason: "Default Qwen3.6 chat template mis-handles tool-call XML / reasoning delimiters / streaming (the #145 silent-break class); the froggeric override fixes 7 default-template defects and is behavior-critical for every tool/agent compose. Tess-4-27B (same qwen3_5 template family) additionally NEEDS it because its repo template is stock-broken (developer-role crash). Carnice/Qwopus are intentional excludes (they ship their own carnice template)."
         evidence: "models/qwen3.6-27b/vllm/patches/froggeric-chat-template/PROVENANCE.md; docs/UPSTREAM.md (froggeric template re-eval #150 / v19 adopted PR #157)"
     delivery:               # DEPRECATED/READ-ONLY (test-only) — see header
       dockerfile_bake: false
@@ -592,7 +587,7 @@ patches:
     load_bearing_when:
       - composes:
           - vllm/diffusiongemma-dual
-        reason: "The official vllm/vllm-openai:gemma image has the DiffusionGemma arch baked in, but 3 fixes are NOT upstream (vLLM tests H100/B200 + TP=1): marlin.py + marlin_utils_fp8.py = sm_86 fp8 Marlin sub-tile-K pad (without them :gemma dies in warmup, K=352/1056 can't tile in 99 KB shared mem); diffusion_gemma.py = TP-vocab soft-embed + dtype fix (TP=2 path). Bind-mounted over the image's vllm pkg."
+        reason: "Stock vLLM v0.24.0 has the DiffusionGemma arch NATIVE (PR #45163 merged 2026-06-12, in v0.24.0), but 3 fixes are NOT in #45163 (vLLM tests H100/B200 + TP=1): marlin.py + marlin_utils_fp8.py = sm_86 fp8 Marlin sub-tile-K pad (without them stock v0.24.0 dies in warmup, K=352/1056 can't tile in 99 KB shared mem); diffusion_gemma.py = TP-vocab soft-embed + dtype fix (native #45163 copy is TP=1 → TP=2 vocab matmul mismatch). Bind-mounted over the image's vllm pkg. Bumped off the :gemma branch digest + re-validated on stock v0.24.0 2026-07-02."
         evidence: "models/diffusiongemma-26b-a4b/vllm/patches/gemma-image-fixes/README.md"
     delivery:               # DEPRECATED/READ-ONLY (test-only) — see header
       dockerfile_bake: false
@@ -612,14 +607,14 @@ patches:
       wired_at: volumes
     drift_guard:
       kind: import-and-boot
-      check: "On the pinned :gemma image, fp8 Marlin GEMM tiles K=352/1056 on sm_86 (no Invalid-thread-config) AND DiffusionGemma serves coherent output at TP=2 (no vocab/dtype mismatch)"
-      on_fail: hard-refuse   # foundational: :gemma clean dies in warmup on the Marlin wall without these
+      check: "On stock vllm/vllm-openai:v0.24.0, fp8 Marlin GEMM tiles K=352/1056 on sm_86 (no Invalid-thread-config) AND DiffusionGemma serves coherent output at TP=2 (no vocab/dtype mismatch)"
+      on_fail: hard-refuse   # foundational: stock v0.24.0 clean dies in warmup on the Marlin wall without these
     capability: diffusion-gemma-ampere-serve
     foundational: true
     upstream:
       ref: vllm-project/vllm#45163
       status: open
-      drop_when: "the K-pad lands upstream (our #40361 / an Ampere Marlin fix) AND the TP-vocab fix merges into :gemma — then mount nothing"
+      drop_when: "the K-pad lands upstream (our #40361 / an Ampere Marlin fix) AND the TP-vocab fix merges into a stock vLLM release — then mount nothing"
     status: verified
 
   - id: gemma4-unified-vision-unquant

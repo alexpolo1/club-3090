@@ -2,7 +2,7 @@
 """
 title: Studio (text/image -> video · image · music)
 author: club-3090
-description: Type a rough idea — the studio director (qwen) crafts it and generates. Video: LTX (video+audio) or Sulphur/10Eros (uncensored, text->video or attach an image, with optional voiceover) or Wan2.2 (uncensored, text->video). Image: HiDream-O1 (top quality), Ideogram-4 (design/logo/photo/text), Chroma (uncensored), Z-Image (uncensored, fast), or Krea 2 (aesthetic). Music: ACE-Step (songs + instrumentals). SFX: Stable Audio (sound effects + ambient). Voice: Step-Audio-EditX (premium cloned voice + emotion/style). Refine anytime by just saying what to change.
+description: Type a rough idea — the studio director (qwen) crafts it and generates. Production: type a brief and the 4B director plans + renders a whole short film (keyframes → video → narration → music → assembly into one MP4) — pick the stack (video/keyframe model, continuity, music) in the lane's ⚙️ valves or leave it on Auto. Video: LTX (video+audio) or Sulphur/10Eros (uncensored, text->video or attach an image, with optional voiceover) or Wan2.2 (uncensored, text->video). Image: HiDream-O1 (top quality), Ideogram-4 (design/logo/photo/text), Chroma (uncensored), Z-Image (uncensored, fast), or Krea 2 (aesthetic). Music: ACE-Step (songs + instrumentals). SFX: Stable Audio (sound effects + ambient). Voice: Step-Audio-EditX (premium cloned voice + emotion/style). Refine anytime by just saying what to change.
 required_open_webui_version: 0.5.0
 version: 0.14.0
 """
@@ -39,6 +39,284 @@ import json, time, base64, re, math, urllib.request, urllib.parse, urllib.error,
 from pydantic import BaseModel, Field
 
 WORKFLOWS = json.loads(r"""{"ltx-t2v": {"1": {"inputs": {"vae_name": "ltx-2.3-22b-distilled_audio_vae.safetensors", "device": "main_device", "weight_dtype": "bf16"}, "class_type": "VAELoaderKJ", "_meta": {"title": "VAELoader KJ"}}, "2": {"inputs": {"vae_name": "ltx-2.3-22b-distilled_video_vae.safetensors", "device": "main_device", "weight_dtype": "bf16"}, "class_type": "VAELoaderKJ", "_meta": {"title": "VAELoader KJ"}}, "3": {"inputs": {"unet_name": "ltx2.3/distilled-1.1/ltx-2.3-22b-distilled-1.1-Q8_0.gguf", "compute_device": "cuda:0", "donor_device": "cuda:1", "virtual_vram_gb": 24.0, "eject_models": true}, "class_type": "UnetLoaderGGUFDisTorch2MultiGPU", "_meta": {"title": "Unet Loader (GGUF)"}}, "5": {"inputs": {"text": "A close-up of rain falling on a window at night, water droplets sliding down the glass, warm light glowing behind, ambient sound of steady rain and distant thunder.", "clip": ["47", 0]}, "class_type": "CLIPTextEncode", "_meta": {"title": "CLIP Text Encode (Prompt)"}}, "6": {"inputs": {"text": "blurry, low quality, still frame, frames, watermark, overlay, titles, has blurbox, has subtitles", "clip": ["47", 0]}, "class_type": "CLIPTextEncode", "_meta": {"title": "CLIP Text Encode (Prompt)"}}, "7": {"inputs": {"width": 768, "height": 512, "batch_size": 1, "color": 0}, "class_type": "EmptyImage", "_meta": {"title": "EmptyImage"}}, "8": {"inputs": {"upscale_method": "lanczos", "scale_by": 1.0, "image": ["7", 0]}, "class_type": "ImageScaleBy", "_meta": {"title": "Upscale Image By"}}, "9": {"inputs": {"image": ["8", 0]}, "class_type": "GetImageSize", "_meta": {"title": "Get Image Size"}}, "10": {"inputs": {"value": 121}, "class_type": "PrimitiveInt", "_meta": {"title": "Length"}}, "11": {"inputs": {"value": 24}, "class_type": "PrimitiveInt", "_meta": {"title": "Frame Rate(int)"}}, "12": {"inputs": {"value": 24.0}, "class_type": "PrimitiveFloat", "_meta": {"title": "Frame Rate(float)"}}, "13": {"inputs": {"frames_number": ["10", 0], "frame_rate": ["11", 0], "batch_size": 1, "audio_vae": ["1", 0]}, "class_type": "LTXVEmptyLatentAudio", "_meta": {"title": "LTXV Empty Latent Audio"}}, "14": {"inputs": {"width": ["9", 0], "height": ["9", 1], "length": ["10", 0], "batch_size": 1}, "class_type": "EmptyLTXVLatentVideo", "_meta": {"title": "EmptyLTXVLatentVideo"}}, "15": {"inputs": {"video_latent": ["14", 0], "audio_latent": ["13", 0]}, "class_type": "LTXVConcatAVLatent", "_meta": {"title": "LTXVConcatAVLatent"}}, "16": {"inputs": {"noise_seed": 845334242002042}, "class_type": "RandomNoise", "_meta": {"title": "RandomNoise"}}, "17": {"inputs": {"noise": ["16", 0], "guider": ["18", 0], "sampler": ["20", 0], "sigmas": ["22", 0], "latent_image": ["15", 0]}, "class_type": "SamplerCustomAdvanced", "_meta": {"title": "SamplerCustomAdvanced"}}, "18": {"inputs": {"cfg": 1.0, "model": ["3", 0], "positive": ["23", 0], "negative": ["23", 1]}, "class_type": "CFGGuider", "_meta": {"title": "CFGGuider"}}, "19": {"inputs": {"av_latent": ["17", 0]}, "class_type": "LTXVSeparateAVLatent", "_meta": {"title": "LTXVSeparateAVLatent"}}, "20": {"inputs": {"sampler_name": "euler_ancestral"}, "class_type": "KSamplerSelect", "_meta": {"title": "KSamplerSelect"}}, "21": {"inputs": {"positive": ["23", 0], "negative": ["23", 1], "latent": ["19", 0]}, "class_type": "LTXVCropGuides", "_meta": {"title": "LTXVCropGuides"}}, "22": {"inputs": {"steps": 8, "max_shift": 2.05, "base_shift": 0.95, "stretch": true, "terminal": 0.1, "latent": ["15", 0]}, "class_type": "LTXVScheduler", "_meta": {"title": "LTXVScheduler"}}, "23": {"inputs": {"frame_rate": ["12", 0], "positive": ["5", 0], "negative": ["6", 0]}, "class_type": "LTXVConditioning", "_meta": {"title": "LTXVConditioning"}}, "35": {"inputs": {"samples": ["19", 1], "audio_vae": ["1", 0]}, "class_type": "LTXVAudioVAEDecode", "_meta": {"title": "LTXV Audio VAE Decode"}}, "36": {"inputs": {"fps": ["12", 0], "images": ["37", 0], "audio": ["35", 0]}, "class_type": "CreateVideo", "_meta": {"title": "Create Video"}}, "37": {"inputs": {"tile_size": 512, "overlap": 64, "temporal_size": 4096, "temporal_overlap": 8, "samples": ["21", 2], "vae": ["2", 0]}, "class_type": "VAEDecodeTiled", "_meta": {"title": "VAE Decode (Tiled)"}}, "38": {"inputs": {"filename_prefix": "video/ComfyUI", "format": "mp4", "codec": "auto", "video-preview": "", "video": ["36", 0]}, "class_type": "SaveVideo", "_meta": {"title": "Save Video"}}, "47": {"inputs": {"clip_name1": "gemma_3_12B_it_fp8_scaled.safetensors", "clip_name2": "ltx-2.3-22b-distilled_embeddings_connectors.safetensors", "type": "ltxv"}, "class_type": "DualCLIPLoaderGGUF", "_meta": {"title": "DualCLIPLoader (GGUF)"}}}, "ltx-i2v": {"1": {"inputs": {"vae_name": "ltx-2.3-22b-distilled_audio_vae.safetensors", "device": "main_device", "weight_dtype": "bf16"}, "class_type": "VAELoaderKJ", "_meta": {"title": "VAELoader KJ"}}, "2": {"inputs": {"vae_name": "ltx-2.3-22b-distilled_video_vae.safetensors", "device": "main_device", "weight_dtype": "bf16"}, "class_type": "VAELoaderKJ", "_meta": {"title": "VAELoader KJ"}}, "3": {"inputs": {"unet_name": "ltx2.3/distilled-1.1/ltx-2.3-22b-distilled-1.1-Q8_0.gguf", "compute_device": "cuda:0", "donor_device": "cuda:1", "virtual_vram_gb": 24.0, "eject_models": true}, "class_type": "UnetLoaderGGUFDisTorch2MultiGPU", "_meta": {"title": "Unet Loader (GGUF)"}}, "5": {"inputs": {"text": "A close-up of rain falling on a window at night, water droplets sliding down the glass, warm light glowing behind, ambient sound of steady rain and distant thunder.", "clip": ["47", 0]}, "class_type": "CLIPTextEncode", "_meta": {"title": "CLIP Text Encode (Prompt)"}}, "6": {"inputs": {"text": "blurry, low quality, still frame, frames, watermark, overlay, titles, has blurbox, has subtitles", "clip": ["47", 0]}, "class_type": "CLIPTextEncode", "_meta": {"title": "CLIP Text Encode (Prompt)"}}, "7": {"inputs": {"width": 768, "height": 512, "batch_size": 1, "color": 0}, "class_type": "EmptyImage", "_meta": {"title": "EmptyImage"}}, "8": {"inputs": {"upscale_method": "lanczos", "scale_by": 1.0, "image": ["7", 0]}, "class_type": "ImageScaleBy", "_meta": {"title": "Upscale Image By"}}, "9": {"inputs": {"image": ["8", 0]}, "class_type": "GetImageSize", "_meta": {"title": "Get Image Size"}}, "10": {"inputs": {"value": 121}, "class_type": "PrimitiveInt", "_meta": {"title": "Length"}}, "11": {"inputs": {"value": 24}, "class_type": "PrimitiveInt", "_meta": {"title": "Frame Rate(int)"}}, "12": {"inputs": {"value": 24.0}, "class_type": "PrimitiveFloat", "_meta": {"title": "Frame Rate(float)"}}, "13": {"inputs": {"frames_number": ["10", 0], "frame_rate": ["11", 0], "batch_size": 1, "audio_vae": ["1", 0]}, "class_type": "LTXVEmptyLatentAudio", "_meta": {"title": "LTXV Empty Latent Audio"}}, "14": {"inputs": {"width": ["9", 0], "height": ["9", 1], "length": ["10", 0], "batch_size": 1}, "class_type": "EmptyLTXVLatentVideo", "_meta": {"title": "EmptyLTXVLatentVideo"}}, "15": {"inputs": {"video_latent": ["103", 0], "audio_latent": ["13", 0]}, "class_type": "LTXVConcatAVLatent", "_meta": {"title": "LTXVConcatAVLatent"}}, "16": {"inputs": {"noise_seed": 845334242002042}, "class_type": "RandomNoise", "_meta": {"title": "RandomNoise"}}, "17": {"inputs": {"noise": ["16", 0], "guider": ["18", 0], "sampler": ["20", 0], "sigmas": ["22", 0], "latent_image": ["15", 0]}, "class_type": "SamplerCustomAdvanced", "_meta": {"title": "SamplerCustomAdvanced"}}, "18": {"inputs": {"cfg": 1.0, "model": ["3", 0], "positive": ["23", 0], "negative": ["23", 1]}, "class_type": "CFGGuider", "_meta": {"title": "CFGGuider"}}, "19": {"inputs": {"av_latent": ["17", 0]}, "class_type": "LTXVSeparateAVLatent", "_meta": {"title": "LTXVSeparateAVLatent"}}, "20": {"inputs": {"sampler_name": "euler_ancestral"}, "class_type": "KSamplerSelect", "_meta": {"title": "KSamplerSelect"}}, "21": {"inputs": {"positive": ["23", 0], "negative": ["23", 1], "latent": ["19", 0]}, "class_type": "LTXVCropGuides", "_meta": {"title": "LTXVCropGuides"}}, "22": {"inputs": {"steps": 8, "max_shift": 2.05, "base_shift": 0.95, "stretch": true, "terminal": 0.1, "latent": ["15", 0]}, "class_type": "LTXVScheduler", "_meta": {"title": "LTXVScheduler"}}, "23": {"inputs": {"frame_rate": ["12", 0], "positive": ["5", 0], "negative": ["6", 0]}, "class_type": "LTXVConditioning", "_meta": {"title": "LTXVConditioning"}}, "35": {"inputs": {"samples": ["19", 1], "audio_vae": ["1", 0]}, "class_type": "LTXVAudioVAEDecode", "_meta": {"title": "LTXV Audio VAE Decode"}}, "36": {"inputs": {"fps": ["12", 0], "images": ["37", 0], "audio": ["35", 0]}, "class_type": "CreateVideo", "_meta": {"title": "Create Video"}}, "37": {"inputs": {"tile_size": 512, "overlap": 64, "temporal_size": 4096, "temporal_overlap": 8, "samples": ["21", 2], "vae": ["2", 0]}, "class_type": "VAEDecodeTiled", "_meta": {"title": "VAE Decode (Tiled)"}}, "38": {"inputs": {"filename_prefix": "video/ComfyUI", "format": "mp4", "codec": "auto", "video-preview": "", "video": ["36", 0]}, "class_type": "SaveVideo", "_meta": {"title": "Save Video"}}, "47": {"inputs": {"clip_name1": "gemma_3_12B_it_fp8_scaled.safetensors", "clip_name2": "ltx-2.3-22b-distilled_embeddings_connectors.safetensors", "type": "ltxv"}, "class_type": "DualCLIPLoaderGGUF", "_meta": {"title": "DualCLIPLoader (GGUF)"}}, "100": {"class_type": "LoadImage", "inputs": {"image": "__STUDIO_IMAGE__"}}, "101": {"class_type": "ResizeImagesByLongerEdge", "inputs": {"images": ["100", 0], "longer_edge": 768}}, "102": {"class_type": "LTXVPreprocess", "inputs": {"image": ["101", 0], "img_compression": 35}}, "103": {"class_type": "LTXVImgToVideoInplace", "inputs": {"vae": ["2", 0], "image": ["102", 0], "latent": ["14", 0], "strength": 1.0, "bypass": false}}}, "sulphur-t2v": {"1": {"inputs": {"vae_name": "ltx-2.3-22b-dev_audio_vae.safetensors", "device": "main_device", "weight_dtype": "bf16"}, "class_type": "VAELoaderKJ", "_meta": {"title": "VAELoader KJ"}}, "2": {"inputs": {"vae_name": "ltx-2.3-22b-dev_video_vae.safetensors", "device": "main_device", "weight_dtype": "bf16"}, "class_type": "VAELoaderKJ", "_meta": {"title": "VAELoader KJ"}}, "3": {"inputs": {"unet_name": "sulphur-2/sulphur_dev-Q8_0.gguf", "compute_device": "cuda:0", "donor_device": "cuda:1", "virtual_vram_gb": 24.0, "eject_models": true}, "class_type": "UnetLoaderGGUFDisTorch2MultiGPU", "_meta": {"title": "Unet Loader (GGUF)"}}, "5": {"inputs": {"text": "A close-up of rain falling on a window at night, water droplets sliding down the glass, warm light glowing behind, ambient sound of steady rain and distant thunder.", "clip": ["47", 0]}, "class_type": "CLIPTextEncode", "_meta": {"title": "CLIP Text Encode (Prompt)"}}, "6": {"inputs": {"text": "blurry, low quality, still frame, frames, watermark, overlay, titles, has blurbox, has subtitles", "clip": ["47", 0]}, "class_type": "CLIPTextEncode", "_meta": {"title": "CLIP Text Encode (Prompt)"}}, "7": {"inputs": {"width": 1280, "height": 720, "batch_size": 1, "color": 0}, "class_type": "EmptyImage", "_meta": {"title": "EmptyImage"}}, "8": {"inputs": {"upscale_method": "lanczos", "scale_by": 1.0, "image": ["7", 0]}, "class_type": "ImageScaleBy", "_meta": {"title": "Upscale Image By"}}, "9": {"inputs": {"image": ["8", 0]}, "class_type": "GetImageSize", "_meta": {"title": "Get Image Size"}}, "10": {"inputs": {"value": 121}, "class_type": "PrimitiveInt", "_meta": {"title": "Length"}}, "11": {"inputs": {"value": 24}, "class_type": "PrimitiveInt", "_meta": {"title": "Frame Rate(int)"}}, "12": {"inputs": {"value": 24.0}, "class_type": "PrimitiveFloat", "_meta": {"title": "Frame Rate(float)"}}, "13": {"inputs": {"frames_number": ["10", 0], "frame_rate": ["11", 0], "batch_size": 1, "audio_vae": ["1", 0]}, "class_type": "LTXVEmptyLatentAudio", "_meta": {"title": "LTXV Empty Latent Audio"}}, "14": {"inputs": {"width": ["9", 0], "height": ["9", 1], "length": ["10", 0], "batch_size": 1}, "class_type": "EmptyLTXVLatentVideo", "_meta": {"title": "EmptyLTXVLatentVideo"}}, "15": {"inputs": {"video_latent": ["14", 0], "audio_latent": ["13", 0]}, "class_type": "LTXVConcatAVLatent", "_meta": {"title": "LTXVConcatAVLatent"}}, "16": {"inputs": {"noise_seed": 845334242002042}, "class_type": "RandomNoise", "_meta": {"title": "RandomNoise"}}, "17": {"inputs": {"noise": ["16", 0], "guider": ["18", 0], "sampler": ["20", 0], "sigmas": ["22", 0], "latent_image": ["15", 0]}, "class_type": "SamplerCustomAdvanced", "_meta": {"title": "SamplerCustomAdvanced"}}, "18": {"inputs": {"cfg": 1.0, "model": ["50", 0], "positive": ["23", 0], "negative": ["23", 1]}, "class_type": "CFGGuider", "_meta": {"title": "CFGGuider"}}, "19": {"inputs": {"av_latent": ["17", 0]}, "class_type": "LTXVSeparateAVLatent", "_meta": {"title": "LTXVSeparateAVLatent"}}, "20": {"inputs": {"sampler_name": "euler_ancestral"}, "class_type": "KSamplerSelect", "_meta": {"title": "KSamplerSelect"}}, "21": {"inputs": {"positive": ["23", 0], "negative": ["23", 1], "latent": ["19", 0]}, "class_type": "LTXVCropGuides", "_meta": {"title": "LTXVCropGuides"}}, "22": {"inputs": {"steps": 8, "max_shift": 2.05, "base_shift": 0.95, "stretch": true, "terminal": 0.1, "latent": ["15", 0]}, "class_type": "LTXVScheduler", "_meta": {"title": "LTXVScheduler"}}, "23": {"inputs": {"frame_rate": ["12", 0], "positive": ["5", 0], "negative": ["6", 0]}, "class_type": "LTXVConditioning", "_meta": {"title": "LTXVConditioning"}}, "35": {"inputs": {"samples": ["19", 1], "audio_vae": ["1", 0]}, "class_type": "LTXVAudioVAEDecode", "_meta": {"title": "LTXV Audio VAE Decode"}}, "36": {"inputs": {"fps": ["12", 0], "images": ["37", 0], "audio": ["35", 0]}, "class_type": "CreateVideo", "_meta": {"title": "Create Video"}}, "37": {"inputs": {"tile_size": 512, "overlap": 64, "temporal_size": 4096, "temporal_overlap": 8, "samples": ["21", 2], "vae": ["2", 0]}, "class_type": "VAEDecodeTiled", "_meta": {"title": "VAE Decode (Tiled)"}}, "38": {"inputs": {"filename_prefix": "video/ComfyUI", "format": "mp4", "codec": "auto", "video-preview": "", "video": ["36", 0]}, "class_type": "SaveVideo", "_meta": {"title": "Save Video"}}, "47": {"inputs": {"clip_name1": "gemma_3_12B_it_fp8_scaled.safetensors", "clip_name2": "ltx-2.3-22b-dev_embeddings_connectors.safetensors", "type": "ltxv"}, "class_type": "DualCLIPLoaderGGUF", "_meta": {"title": "DualCLIPLoader (GGUF)"}}, "50": {"class_type": "LoraLoaderModelOnly", "inputs": {"model": ["3", 0], "lora_name": "ltx-2.3-22b-distilled-lora-384-1.1.safetensors", "strength_model": 1.0}}}, "sulphur-i2v": {"1": {"inputs": {"vae_name": "ltx-2.3-22b-dev_audio_vae.safetensors", "device": "main_device", "weight_dtype": "bf16"}, "class_type": "VAELoaderKJ", "_meta": {"title": "VAELoader KJ"}}, "2": {"inputs": {"vae_name": "ltx-2.3-22b-dev_video_vae.safetensors", "device": "main_device", "weight_dtype": "bf16"}, "class_type": "VAELoaderKJ", "_meta": {"title": "VAELoader KJ"}}, "3": {"inputs": {"unet_name": "sulphur-2/sulphur_dev-Q8_0.gguf", "compute_device": "cuda:0", "donor_device": "cuda:1", "virtual_vram_gb": 24.0, "eject_models": true}, "class_type": "UnetLoaderGGUFDisTorch2MultiGPU", "_meta": {"title": "Unet Loader (GGUF)"}}, "5": {"inputs": {"text": "A close-up of rain falling on a window at night, water droplets sliding down the glass, warm light glowing behind, ambient sound of steady rain and distant thunder.", "clip": ["47", 0]}, "class_type": "CLIPTextEncode", "_meta": {"title": "CLIP Text Encode (Prompt)"}}, "6": {"inputs": {"text": "blurry, low quality, still frame, frames, watermark, overlay, titles, has blurbox, has subtitles", "clip": ["47", 0]}, "class_type": "CLIPTextEncode", "_meta": {"title": "CLIP Text Encode (Prompt)"}}, "7": {"inputs": {"width": 1280, "height": 720, "batch_size": 1, "color": 0}, "class_type": "EmptyImage", "_meta": {"title": "EmptyImage"}}, "8": {"inputs": {"upscale_method": "lanczos", "scale_by": 1.0, "image": ["7", 0]}, "class_type": "ImageScaleBy", "_meta": {"title": "Upscale Image By"}}, "9": {"inputs": {"image": ["8", 0]}, "class_type": "GetImageSize", "_meta": {"title": "Get Image Size"}}, "10": {"inputs": {"value": 121}, "class_type": "PrimitiveInt", "_meta": {"title": "Length"}}, "11": {"inputs": {"value": 24}, "class_type": "PrimitiveInt", "_meta": {"title": "Frame Rate(int)"}}, "12": {"inputs": {"value": 24.0}, "class_type": "PrimitiveFloat", "_meta": {"title": "Frame Rate(float)"}}, "13": {"inputs": {"frames_number": ["10", 0], "frame_rate": ["11", 0], "batch_size": 1, "audio_vae": ["1", 0]}, "class_type": "LTXVEmptyLatentAudio", "_meta": {"title": "LTXV Empty Latent Audio"}}, "14": {"inputs": {"width": ["9", 0], "height": ["9", 1], "length": ["10", 0], "batch_size": 1}, "class_type": "EmptyLTXVLatentVideo", "_meta": {"title": "EmptyLTXVLatentVideo"}}, "15": {"inputs": {"video_latent": ["103", 0], "audio_latent": ["13", 0]}, "class_type": "LTXVConcatAVLatent", "_meta": {"title": "LTXVConcatAVLatent"}}, "16": {"inputs": {"noise_seed": 845334242002042}, "class_type": "RandomNoise", "_meta": {"title": "RandomNoise"}}, "17": {"inputs": {"noise": ["16", 0], "guider": ["18", 0], "sampler": ["20", 0], "sigmas": ["22", 0], "latent_image": ["15", 0]}, "class_type": "SamplerCustomAdvanced", "_meta": {"title": "SamplerCustomAdvanced"}}, "18": {"inputs": {"cfg": 1.0, "model": ["50", 0], "positive": ["23", 0], "negative": ["23", 1]}, "class_type": "CFGGuider", "_meta": {"title": "CFGGuider"}}, "19": {"inputs": {"av_latent": ["17", 0]}, "class_type": "LTXVSeparateAVLatent", "_meta": {"title": "LTXVSeparateAVLatent"}}, "20": {"inputs": {"sampler_name": "euler_ancestral"}, "class_type": "KSamplerSelect", "_meta": {"title": "KSamplerSelect"}}, "21": {"inputs": {"positive": ["23", 0], "negative": ["23", 1], "latent": ["19", 0]}, "class_type": "LTXVCropGuides", "_meta": {"title": "LTXVCropGuides"}}, "22": {"inputs": {"steps": 8, "max_shift": 2.05, "base_shift": 0.95, "stretch": true, "terminal": 0.1, "latent": ["15", 0]}, "class_type": "LTXVScheduler", "_meta": {"title": "LTXVScheduler"}}, "23": {"inputs": {"frame_rate": ["12", 0], "positive": ["5", 0], "negative": ["6", 0]}, "class_type": "LTXVConditioning", "_meta": {"title": "LTXVConditioning"}}, "35": {"inputs": {"samples": ["19", 1], "audio_vae": ["1", 0]}, "class_type": "LTXVAudioVAEDecode", "_meta": {"title": "LTXV Audio VAE Decode"}}, "36": {"inputs": {"fps": ["12", 0], "images": ["37", 0], "audio": ["35", 0]}, "class_type": "CreateVideo", "_meta": {"title": "Create Video"}}, "37": {"inputs": {"tile_size": 512, "overlap": 64, "temporal_size": 4096, "temporal_overlap": 8, "samples": ["21", 2], "vae": ["2", 0]}, "class_type": "VAEDecodeTiled", "_meta": {"title": "VAE Decode (Tiled)"}}, "38": {"inputs": {"filename_prefix": "video/ComfyUI", "format": "mp4", "codec": "auto", "video-preview": "", "video": ["36", 0]}, "class_type": "SaveVideo", "_meta": {"title": "Save Video"}}, "47": {"inputs": {"clip_name1": "gemma_3_12B_it_fp8_scaled.safetensors", "clip_name2": "ltx-2.3-22b-dev_embeddings_connectors.safetensors", "type": "ltxv"}, "class_type": "DualCLIPLoaderGGUF", "_meta": {"title": "DualCLIPLoader (GGUF)"}}, "50": {"class_type": "LoraLoaderModelOnly", "inputs": {"model": ["3", 0], "lora_name": "ltx-2.3-22b-distilled-lora-384-1.1.safetensors", "strength_model": 1.0}}, "100": {"class_type": "LoadImage", "inputs": {"image": "__STUDIO_IMAGE__"}}, "101": {"class_type": "ResizeImagesByLongerEdge", "inputs": {"images": ["100", 0], "longer_edge": 1280}}, "102": {"class_type": "LTXVPreprocess", "inputs": {"image": ["101", 0], "img_compression": 35}}, "103": {"class_type": "LTXVImgToVideoInplace", "inputs": {"vae": ["2", 0], "image": ["102", 0], "latent": ["14", 0], "strength": 1.0, "bypass": false}}}, "10eros-t2v": {"1": {"inputs": {"vae_name": "ltx-2.3-22b-dev_audio_vae.safetensors", "device": "main_device", "weight_dtype": "bf16"}, "class_type": "VAELoaderKJ", "_meta": {"title": "VAELoader KJ"}}, "2": {"inputs": {"vae_name": "ltx-2.3-22b-dev_video_vae.safetensors", "device": "main_device", "weight_dtype": "bf16"}, "class_type": "VAELoaderKJ", "_meta": {"title": "VAELoader KJ"}}, "3": {"inputs": {"unet_name": "10eros/10Eros_v1-Q8_0.gguf", "compute_device": "cuda:0", "donor_device": "cuda:1", "virtual_vram_gb": 24.0, "eject_models": true}, "class_type": "UnetLoaderGGUFDisTorch2MultiGPU", "_meta": {"title": "Unet Loader (GGUF)"}}, "5": {"inputs": {"text": "A close-up of rain falling on a window at night, water droplets sliding down the glass, warm light glowing behind, ambient sound of steady rain and distant thunder.", "clip": ["47", 0]}, "class_type": "CLIPTextEncode", "_meta": {"title": "CLIP Text Encode (Prompt)"}}, "6": {"inputs": {"text": "blurry, low quality, still frame, frames, watermark, overlay, titles, has blurbox, has subtitles", "clip": ["47", 0]}, "class_type": "CLIPTextEncode", "_meta": {"title": "CLIP Text Encode (Prompt)"}}, "7": {"inputs": {"width": 1280, "height": 720, "batch_size": 1, "color": 0}, "class_type": "EmptyImage", "_meta": {"title": "EmptyImage"}}, "8": {"inputs": {"upscale_method": "lanczos", "scale_by": 1.0, "image": ["7", 0]}, "class_type": "ImageScaleBy", "_meta": {"title": "Upscale Image By"}}, "9": {"inputs": {"image": ["8", 0]}, "class_type": "GetImageSize", "_meta": {"title": "Get Image Size"}}, "10": {"inputs": {"value": 121}, "class_type": "PrimitiveInt", "_meta": {"title": "Length"}}, "11": {"inputs": {"value": 24}, "class_type": "PrimitiveInt", "_meta": {"title": "Frame Rate(int)"}}, "12": {"inputs": {"value": 24.0}, "class_type": "PrimitiveFloat", "_meta": {"title": "Frame Rate(float)"}}, "13": {"inputs": {"frames_number": ["10", 0], "frame_rate": ["11", 0], "batch_size": 1, "audio_vae": ["1", 0]}, "class_type": "LTXVEmptyLatentAudio", "_meta": {"title": "LTXV Empty Latent Audio"}}, "14": {"inputs": {"width": ["9", 0], "height": ["9", 1], "length": ["10", 0], "batch_size": 1}, "class_type": "EmptyLTXVLatentVideo", "_meta": {"title": "EmptyLTXVLatentVideo"}}, "15": {"inputs": {"video_latent": ["14", 0], "audio_latent": ["13", 0]}, "class_type": "LTXVConcatAVLatent", "_meta": {"title": "LTXVConcatAVLatent"}}, "16": {"inputs": {"noise_seed": 845334242002042}, "class_type": "RandomNoise", "_meta": {"title": "RandomNoise"}}, "17": {"inputs": {"noise": ["16", 0], "guider": ["18", 0], "sampler": ["20", 0], "sigmas": ["22", 0], "latent_image": ["15", 0]}, "class_type": "SamplerCustomAdvanced", "_meta": {"title": "SamplerCustomAdvanced"}}, "18": {"inputs": {"cfg": 1.0, "model": ["50", 0], "positive": ["23", 0], "negative": ["23", 1]}, "class_type": "CFGGuider", "_meta": {"title": "CFGGuider"}}, "19": {"inputs": {"av_latent": ["17", 0]}, "class_type": "LTXVSeparateAVLatent", "_meta": {"title": "LTXVSeparateAVLatent"}}, "20": {"inputs": {"sampler_name": "euler_ancestral"}, "class_type": "KSamplerSelect", "_meta": {"title": "KSamplerSelect"}}, "21": {"inputs": {"positive": ["23", 0], "negative": ["23", 1], "latent": ["19", 0]}, "class_type": "LTXVCropGuides", "_meta": {"title": "LTXVCropGuides"}}, "22": {"inputs": {"steps": 8, "max_shift": 2.05, "base_shift": 0.95, "stretch": true, "terminal": 0.1, "latent": ["15", 0]}, "class_type": "LTXVScheduler", "_meta": {"title": "LTXVScheduler"}}, "23": {"inputs": {"frame_rate": ["12", 0], "positive": ["5", 0], "negative": ["6", 0]}, "class_type": "LTXVConditioning", "_meta": {"title": "LTXVConditioning"}}, "35": {"inputs": {"samples": ["19", 1], "audio_vae": ["1", 0]}, "class_type": "LTXVAudioVAEDecode", "_meta": {"title": "LTXV Audio VAE Decode"}}, "36": {"inputs": {"fps": ["12", 0], "images": ["37", 0], "audio": ["35", 0]}, "class_type": "CreateVideo", "_meta": {"title": "Create Video"}}, "37": {"inputs": {"tile_size": 512, "overlap": 64, "temporal_size": 4096, "temporal_overlap": 8, "samples": ["21", 2], "vae": ["2", 0]}, "class_type": "VAEDecodeTiled", "_meta": {"title": "VAE Decode (Tiled)"}}, "38": {"inputs": {"filename_prefix": "video/ComfyUI", "format": "mp4", "codec": "auto", "video-preview": "", "video": ["36", 0]}, "class_type": "SaveVideo", "_meta": {"title": "Save Video"}}, "47": {"inputs": {"clip_name1": "gemma_3_12B_it_fp8_scaled.safetensors", "clip_name2": "ltx-2.3-22b-dev_embeddings_connectors.safetensors", "type": "ltxv"}, "class_type": "DualCLIPLoaderGGUF", "_meta": {"title": "DualCLIPLoader (GGUF)"}}, "50": {"class_type": "LoraLoaderModelOnly", "inputs": {"model": ["3", 0], "lora_name": "ltx-2.3-22b-distilled-lora-384-1.1.safetensors", "strength_model": 1.0}}}, "10eros-i2v": {"1": {"inputs": {"vae_name": "ltx-2.3-22b-dev_audio_vae.safetensors", "device": "main_device", "weight_dtype": "bf16"}, "class_type": "VAELoaderKJ", "_meta": {"title": "VAELoader KJ"}}, "2": {"inputs": {"vae_name": "ltx-2.3-22b-dev_video_vae.safetensors", "device": "main_device", "weight_dtype": "bf16"}, "class_type": "VAELoaderKJ", "_meta": {"title": "VAELoader KJ"}}, "3": {"inputs": {"unet_name": "10eros/10Eros_v1-Q8_0.gguf", "compute_device": "cuda:0", "donor_device": "cuda:1", "virtual_vram_gb": 24.0, "eject_models": true}, "class_type": "UnetLoaderGGUFDisTorch2MultiGPU", "_meta": {"title": "Unet Loader (GGUF)"}}, "5": {"inputs": {"text": "A close-up of rain falling on a window at night, water droplets sliding down the glass, warm light glowing behind, ambient sound of steady rain and distant thunder.", "clip": ["47", 0]}, "class_type": "CLIPTextEncode", "_meta": {"title": "CLIP Text Encode (Prompt)"}}, "6": {"inputs": {"text": "blurry, low quality, still frame, frames, watermark, overlay, titles, has blurbox, has subtitles", "clip": ["47", 0]}, "class_type": "CLIPTextEncode", "_meta": {"title": "CLIP Text Encode (Prompt)"}}, "7": {"inputs": {"width": 1280, "height": 720, "batch_size": 1, "color": 0}, "class_type": "EmptyImage", "_meta": {"title": "EmptyImage"}}, "8": {"inputs": {"upscale_method": "lanczos", "scale_by": 1.0, "image": ["7", 0]}, "class_type": "ImageScaleBy", "_meta": {"title": "Upscale Image By"}}, "9": {"inputs": {"image": ["8", 0]}, "class_type": "GetImageSize", "_meta": {"title": "Get Image Size"}}, "10": {"inputs": {"value": 121}, "class_type": "PrimitiveInt", "_meta": {"title": "Length"}}, "11": {"inputs": {"value": 24}, "class_type": "PrimitiveInt", "_meta": {"title": "Frame Rate(int)"}}, "12": {"inputs": {"value": 24.0}, "class_type": "PrimitiveFloat", "_meta": {"title": "Frame Rate(float)"}}, "13": {"inputs": {"frames_number": ["10", 0], "frame_rate": ["11", 0], "batch_size": 1, "audio_vae": ["1", 0]}, "class_type": "LTXVEmptyLatentAudio", "_meta": {"title": "LTXV Empty Latent Audio"}}, "14": {"inputs": {"width": ["9", 0], "height": ["9", 1], "length": ["10", 0], "batch_size": 1}, "class_type": "EmptyLTXVLatentVideo", "_meta": {"title": "EmptyLTXVLatentVideo"}}, "15": {"inputs": {"video_latent": ["103", 0], "audio_latent": ["13", 0]}, "class_type": "LTXVConcatAVLatent", "_meta": {"title": "LTXVConcatAVLatent"}}, "16": {"inputs": {"noise_seed": 845334242002042}, "class_type": "RandomNoise", "_meta": {"title": "RandomNoise"}}, "17": {"inputs": {"noise": ["16", 0], "guider": ["18", 0], "sampler": ["20", 0], "sigmas": ["22", 0], "latent_image": ["15", 0]}, "class_type": "SamplerCustomAdvanced", "_meta": {"title": "SamplerCustomAdvanced"}}, "18": {"inputs": {"cfg": 1.0, "model": ["50", 0], "positive": ["23", 0], "negative": ["23", 1]}, "class_type": "CFGGuider", "_meta": {"title": "CFGGuider"}}, "19": {"inputs": {"av_latent": ["17", 0]}, "class_type": "LTXVSeparateAVLatent", "_meta": {"title": "LTXVSeparateAVLatent"}}, "20": {"inputs": {"sampler_name": "euler_ancestral"}, "class_type": "KSamplerSelect", "_meta": {"title": "KSamplerSelect"}}, "21": {"inputs": {"positive": ["23", 0], "negative": ["23", 1], "latent": ["19", 0]}, "class_type": "LTXVCropGuides", "_meta": {"title": "LTXVCropGuides"}}, "22": {"inputs": {"steps": 8, "max_shift": 2.05, "base_shift": 0.95, "stretch": true, "terminal": 0.1, "latent": ["15", 0]}, "class_type": "LTXVScheduler", "_meta": {"title": "LTXVScheduler"}}, "23": {"inputs": {"frame_rate": ["12", 0], "positive": ["5", 0], "negative": ["6", 0]}, "class_type": "LTXVConditioning", "_meta": {"title": "LTXVConditioning"}}, "35": {"inputs": {"samples": ["19", 1], "audio_vae": ["1", 0]}, "class_type": "LTXVAudioVAEDecode", "_meta": {"title": "LTXV Audio VAE Decode"}}, "36": {"inputs": {"fps": ["12", 0], "images": ["37", 0], "audio": ["35", 0]}, "class_type": "CreateVideo", "_meta": {"title": "Create Video"}}, "37": {"inputs": {"tile_size": 512, "overlap": 64, "temporal_size": 4096, "temporal_overlap": 8, "samples": ["21", 2], "vae": ["2", 0]}, "class_type": "VAEDecodeTiled", "_meta": {"title": "VAE Decode (Tiled)"}}, "38": {"inputs": {"filename_prefix": "video/ComfyUI", "format": "mp4", "codec": "auto", "video-preview": "", "video": ["36", 0]}, "class_type": "SaveVideo", "_meta": {"title": "Save Video"}}, "47": {"inputs": {"clip_name1": "gemma_3_12B_it_fp8_scaled.safetensors", "clip_name2": "ltx-2.3-22b-dev_embeddings_connectors.safetensors", "type": "ltxv"}, "class_type": "DualCLIPLoaderGGUF", "_meta": {"title": "DualCLIPLoader (GGUF)"}}, "50": {"class_type": "LoraLoaderModelOnly", "inputs": {"model": ["3", 0], "lora_name": "ltx-2.3-22b-distilled-lora-384-1.1.safetensors", "strength_model": 1.0}}, "100": {"class_type": "LoadImage", "inputs": {"image": "__STUDIO_IMAGE__"}}, "101": {"class_type": "ResizeImagesByLongerEdge", "inputs": {"images": ["100", 0], "longer_edge": 1280}}, "102": {"class_type": "LTXVPreprocess", "inputs": {"image": ["101", 0], "img_compression": 35}}, "103": {"class_type": "LTXVImgToVideoInplace", "inputs": {"vae": ["2", 0], "image": ["102", 0], "latent": ["14", 0], "strength": 1.0, "bypass": false}}}, "image": {"unet_main": {"class_type": "UNETLoader", "inputs": {"unet_name": "ideogram4_fp8_scaled.safetensors", "weight_dtype": "default"}}, "unet_uncond": {"class_type": "UNETLoader", "inputs": {"unet_name": "ideogram4_unconditional_fp8_scaled.safetensors", "weight_dtype": "default"}}, "clip": {"class_type": "CLIPLoader", "inputs": {"clip_name": "qwen3vl_8b_fp8_scaled.safetensors", "type": "ideogram4"}}, "vae": {"class_type": "VAELoader", "inputs": {"vae_name": "flux2-vae.safetensors"}}, "pos": {"class_type": "CLIPTextEncode", "inputs": {"text": "placeholder", "clip": ["clip", 0]}}, "neg": {"class_type": "ConditioningZeroOut", "inputs": {"conditioning": ["pos", 0]}}, "guider": {"class_type": "DualModelGuider", "inputs": {"model": ["unet_main", 0], "positive": ["pos", 0], "cfg": 3.5, "model_negative": ["unet_uncond", 0], "negative": ["neg", 0]}}, "sigmas": {"class_type": "Ideogram4Scheduler", "inputs": {"steps": 20, "width": 1024, "height": 1024, "mu": 0.5, "std": 1.75}}, "sampler": {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "euler"}}, "noise": {"class_type": "RandomNoise", "inputs": {"noise_seed": 42}}, "latent": {"class_type": "EmptyFlux2LatentImage", "inputs": {"width": 1024, "height": 1024, "batch_size": 1}}, "samp": {"class_type": "SamplerCustomAdvanced", "inputs": {"noise": ["noise", 0], "guider": ["guider", 0], "sampler": ["sampler", 0], "sigmas": ["sigmas", 0], "latent_image": ["latent", 0]}}, "decode": {"class_type": "VAEDecode", "inputs": {"samples": ["samp", 0], "vae": ["vae", 0]}}, "save": {"class_type": "SaveImage", "inputs": {"images": ["decode", 0], "filename_prefix": "studio_image"}}}, "chroma": {"unet": {"class_type": "UNETLoader", "inputs": {"unet_name": "Chroma1-HD-fp8mixed.safetensors", "weight_dtype": "default"}}, "modelsampling": {"class_type": "ModelSamplingAuraFlow", "inputs": {"model": ["unet", 0], "shift": 1.0}}, "clip": {"class_type": "CLIPLoader", "inputs": {"clip_name": "t5xxl_fp16.safetensors", "type": "chroma", "device": "default"}}, "vae": {"class_type": "VAELoader", "inputs": {"vae_name": "flux/ae.safetensors"}}, "pos": {"class_type": "CLIPTextEncode", "inputs": {"text": "placeholder", "clip": ["clip", 0]}}, "neg": {"class_type": "CLIPTextEncode", "inputs": {"text": "low quality, blurry, distorted, deformed, watermark, signature, text artifacts, jpeg artifacts", "clip": ["clip", 0]}}, "guider": {"class_type": "CFGGuider", "inputs": {"model": ["modelsampling", 0], "positive": ["pos", 0], "negative": ["neg", 0], "cfg": 3.5}}, "sampler": {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "euler"}}, "sigmas": {"class_type": "BasicScheduler", "inputs": {"model": ["modelsampling", 0], "scheduler": "beta", "steps": 26, "denoise": 1.0}}, "noise": {"class_type": "RandomNoise", "inputs": {"noise_seed": 42}}, "latent": {"class_type": "EmptySD3LatentImage", "inputs": {"width": 1024, "height": 1024, "batch_size": 1}}, "samp": {"class_type": "SamplerCustomAdvanced", "inputs": {"noise": ["noise", 0], "guider": ["guider", 0], "sampler": ["sampler", 0], "sigmas": ["sigmas", 0], "latent_image": ["latent", 0]}}, "decode": {"class_type": "VAEDecode", "inputs": {"samples": ["samp", 0], "vae": ["vae", 0]}}, "save": {"class_type": "SaveImage", "inputs": {"images": ["decode", 0], "filename_prefix": "studio_chroma"}}}, "hidream": {"loader": {"class_type": "HiDreamO1ModelLoader", "inputs": {"model_name": "HiDream-O1-Image-Dev-2604-FP8", "precision": "auto", "attention": "auto", "download_if_missing": false}}, "cond": {"class_type": "HiDreamO1Conditioning", "inputs": {"prompt": "placeholder", "negative_prompt": ""}}, "sampler": {"class_type": "HiDreamO1Sampler", "inputs": {"model": ["loader", 0], "conditioning": ["cond", 0], "model_type": "auto", "width": 2048, "height": 2048, "steps": 0, "seed": 42, "guidance_scale": 5.0, "shift": -1.0, "noise_scale_start": 7.5, "noise_scale_end": 7.5, "noise_clip_std": 2.5, "dev_editing_scheduler": "flow_match", "layout_bboxes": "", "preview_every": 0, "keep_image1_aspect": false, "force_offload": false, "image": "0"}}, "save": {"class_type": "SaveImage", "inputs": {"images": ["sampler", 0], "filename_prefix": "studio_hidream"}}}, "zimage": {"unet": {"class_type": "UNETLoader", "inputs": {"unet_name": "z-image-turbo-fp8-e4m3fn.safetensors", "weight_dtype": "default"}}, "clip": {"class_type": "CLIPLoader", "inputs": {"clip_name": "qwen_3_4b_fp8_mixed.safetensors", "type": "lumina2", "device": "default"}}, "vae": {"class_type": "VAELoader", "inputs": {"vae_name": "ae.safetensors"}}, "modelsampling": {"class_type": "ModelSamplingAuraFlow", "inputs": {"model": ["unet", 0], "shift": 3.0}}, "pos": {"class_type": "CLIPTextEncode", "inputs": {"text": "a photorealistic close-up portrait", "clip": ["clip", 0]}}, "neg": {"class_type": "ConditioningZeroOut", "inputs": {"conditioning": ["pos", 0]}}, "latent": {"class_type": "EmptySD3LatentImage", "inputs": {"width": 1024, "height": 1024, "batch_size": 1}}, "ksampler": {"class_type": "KSampler", "inputs": {"model": ["modelsampling", 0], "seed": 0, "steps": 8, "cfg": 1.0, "sampler_name": "res_multistep", "scheduler": "simple", "positive": ["pos", 0], "negative": ["neg", 0], "latent_image": ["latent", 0], "denoise": 1.0}}, "decode": {"class_type": "VAEDecode", "inputs": {"samples": ["ksampler", 0], "vae": ["vae", 0]}}, "save": {"class_type": "SaveImage", "inputs": {"images": ["decode", 0], "filename_prefix": "z-image"}}}, "krea": {"unet": {"class_type": "UNETLoader", "inputs": {"unet_name": "krea2_turbo_fp8_scaled.safetensors", "weight_dtype": "default"}}, "clip": {"class_type": "CLIPLoader", "inputs": {"clip_name": "qwen3vl_4b_fp8_scaled.safetensors", "type": "krea2", "device": "default"}}, "vae": {"class_type": "VAELoader", "inputs": {"vae_name": "qwen_image_vae.safetensors"}}, "pos": {"class_type": "CLIPTextEncode", "inputs": {"text": "a photorealistic close-up portrait", "clip": ["clip", 0]}}, "neg": {"class_type": "ConditioningZeroOut", "inputs": {"conditioning": ["pos", 0]}}, "latent": {"class_type": "EmptyLatentImage", "inputs": {"width": 1024, "height": 1024, "batch_size": 1}}, "ksampler": {"class_type": "KSampler", "inputs": {"model": ["unet", 0], "seed": 0, "steps": 8, "cfg": 1.0, "sampler_name": "euler", "scheduler": "simple", "denoise": 1.0, "positive": ["pos", 0], "negative": ["neg", 0], "latent_image": ["latent", 0]}}, "decode": {"class_type": "VAEDecode", "inputs": {"samples": ["ksampler", 0], "vae": ["vae", 0]}}, "save": {"class_type": "SaveImage", "inputs": {"images": ["decode", 0], "filename_prefix": "krea2"}}}, "wan": {"unet": {"class_type": "UnetLoaderGGUF", "inputs": {"unet_name": "wan-rapid/Mega-v10/wan2.2-rapid-mega-aio-nsfw-v10-Q8_0.gguf"}}, "clip": {"class_type": "CLIPLoader", "inputs": {"clip_name": "umt5_xxl_fp8_e4m3fn_scaled.safetensors", "type": "wan", "device": "default"}}, "vae": {"class_type": "VAELoader", "inputs": {"vae_name": "wan_2.1_vae.safetensors"}}, "modelsampling": {"class_type": "ModelSamplingSD3", "inputs": {"model": ["unet", 0], "shift": 5.0}}, "pos": {"class_type": "CLIPTextEncode", "inputs": {"text": "a cinematic shot", "clip": ["clip", 0]}}, "neg": {"class_type": "CLIPTextEncode", "inputs": {"text": "blurry, distorted, low quality, static, watermark, text", "clip": ["clip", 0]}}, "latent": {"class_type": "EmptyHunyuanLatentVideo", "inputs": {"width": 832, "height": 480, "length": 81, "batch_size": 1}}, "ksampler": {"class_type": "KSampler", "inputs": {"model": ["modelsampling", 0], "seed": 0, "steps": 4, "cfg": 1.0, "sampler_name": "euler_ancestral", "scheduler": "beta", "positive": ["pos", 0], "negative": ["neg", 0], "latent_image": ["latent", 0], "denoise": 1.0}}, "decode": {"class_type": "VAEDecode", "inputs": {"samples": ["ksampler", 0], "vae": ["vae", 0]}}, "video": {"class_type": "CreateVideo", "inputs": {"images": ["decode", 0], "fps": 16.0}}, "save": {"class_type": "SaveVideo", "inputs": {"video": ["video", 0], "filename_prefix": "wan-rapid", "format": "auto", "codec": "auto"}}}, "wan-i2v": {"unet": {"class_type": "UnetLoaderGGUF", "inputs": {"unet_name": "wan-rapid/Mega-v10/wan2.2-rapid-mega-aio-nsfw-v10-Q8_0.gguf"}}, "clip": {"class_type": "CLIPLoader", "inputs": {"clip_name": "umt5_xxl_fp8_e4m3fn_scaled.safetensors", "type": "wan", "device": "default"}}, "vae": {"class_type": "VAELoader", "inputs": {"vae_name": "wan_2.1_vae.safetensors"}}, "modelsampling": {"class_type": "ModelSamplingSD3", "inputs": {"model": ["unet", 0], "shift": 5.0}}, "loadimage": {"class_type": "LoadImage", "inputs": {"image": "__STUDIO_IMAGE__"}}, "resize": {"class_type": "ImageScale", "inputs": {"image": ["loadimage", 0], "upscale_method": "lanczos", "width": 832, "height": 480, "crop": "center"}}, "pos": {"class_type": "CLIPTextEncode", "inputs": {"text": "subtle natural motion, gentle camera movement", "clip": ["clip", 0]}}, "neg": {"class_type": "CLIPTextEncode", "inputs": {"text": "blurry, distorted, low quality, static, watermark, text, deformed", "clip": ["clip", 0]}}, "i2v": {"class_type": "WanImageToVideo", "inputs": {"positive": ["pos", 0], "negative": ["neg", 0], "vae": ["vae", 0], "width": 832, "height": 480, "length": 81, "batch_size": 1, "start_image": ["resize", 0]}}, "ksampler": {"class_type": "KSampler", "inputs": {"model": ["modelsampling", 0], "seed": 0, "steps": 4, "cfg": 1.0, "sampler_name": "euler_ancestral", "scheduler": "beta", "positive": ["i2v", 0], "negative": ["i2v", 1], "latent_image": ["i2v", 2], "denoise": 1.0}}, "decode": {"class_type": "VAEDecode", "inputs": {"samples": ["ksampler", 0], "vae": ["vae", 0]}}, "video": {"class_type": "CreateVideo", "inputs": {"images": ["decode", 0], "fps": 16.0}}, "save": {"class_type": "SaveVideo", "inputs": {"video": ["video", 0], "filename_prefix": "wan-i2v", "format": "auto", "codec": "auto"}}}, "music": {"ckpt": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "ace-step-1.5/all_in_one/ace_step_v1_3.5b.safetensors"}}, "modelsampling": {"class_type": "ModelSamplingSD3", "inputs": {"model": ["ckpt", 0], "shift": 5.0}}, "tonemap": {"class_type": "LatentOperationTonemapReinhard", "inputs": {"multiplier": 1.0}}, "cfgop": {"class_type": "LatentApplyOperationCFG", "inputs": {"model": ["modelsampling", 0], "operation": ["tonemap", 0]}}, "pos": {"class_type": "TextEncodeAceStepAudio", "inputs": {"clip": ["ckpt", 1], "tags": "placeholder", "lyrics": "[instrumental]", "lyrics_strength": 0.99}}, "neg": {"class_type": "ConditioningZeroOut", "inputs": {"conditioning": ["pos", 0]}}, "latent": {"class_type": "EmptyAceStepLatentAudio", "inputs": {"seconds": 120.0, "batch_size": 1}}, "ksampler": {"class_type": "KSampler", "inputs": {"model": ["cfgop", 0], "positive": ["pos", 0], "negative": ["neg", 0], "latent_image": ["latent", 0], "seed": 0, "steps": 50, "cfg": 5.0, "sampler_name": "euler", "scheduler": "simple", "denoise": 1.0}}, "decode": {"class_type": "VAEDecodeAudio", "inputs": {"samples": ["ksampler", 0], "vae": ["ckpt", 2]}}, "save": {"class_type": "SaveAudioMP3", "inputs": {"audio": ["decode", 0], "filename_prefix": "studio_music", "quality": "V0"}}}, "sfx": {"ckpt": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "stable-audio-open-1.0.safetensors"}}, "clip": {"class_type": "CLIPLoader", "inputs": {"clip_name": "t5-base.safetensors", "type": "stable_audio", "device": "default"}}, "pos": {"class_type": "CLIPTextEncode", "inputs": {"text": "placeholder", "clip": ["clip", 0]}}, "neg": {"class_type": "CLIPTextEncode", "inputs": {"text": "", "clip": ["clip", 0]}}, "latent": {"class_type": "EmptyLatentAudio", "inputs": {"seconds": 10.0, "batch_size": 1}}, "ksampler": {"class_type": "KSampler", "inputs": {"model": ["ckpt", 0], "positive": ["pos", 0], "negative": ["neg", 0], "latent_image": ["latent", 0], "seed": 0, "steps": 50, "cfg": 4.98, "sampler_name": "dpmpp_3m_sde_gpu", "scheduler": "exponential", "denoise": 1.0}}, "decode": {"class_type": "VAEDecodeAudio", "inputs": {"samples": ["ksampler", 0], "vae": ["ckpt", 2]}}, "save": {"class_type": "SaveAudioMP3", "inputs": {"audio": ["decode", 0], "filename_prefix": "studio_sfx", "quality": "V0"}}}}""")
+
+# ── conversation-intent classifiers (injected from services/studio/director_intent.py) ──
+"""Pure conversation-intent classifiers for the 🎬 Studio Production lane.
+
+This is the SOURCE OF TRUTH for how the director reads a user turn (greeting? confirm?
+question? a film brief?). It is a standalone, stdlib-only module so it can be unit-tested
+offline — and `build_studio_pipe.py` INJECTS its source verbatim into the generated
+`studio_pipe.py` (the OWUI pipe runs in-container with no repo access, the same reason the
+director persona + workflows are baked in). Edit here; the bake keeps the deployed pipe and
+these tests from drifting.
+
+Keep it PURE: stdlib only, no `self`, no valves, no network. Anything needing valve state
+(e.g. clamping a duration to `max_seconds`) stays in the pipe and is passed in as an arg.
+
+The bug this fixes (Codex F1, 2026-06-29): the old gate classified "can you make a 30s noir
+short?" as a question and dropped it, so no brief was ever captured. A GENERATION REQUEST now
+takes precedence over question-shape, so a creation ask phrased as a question is still a brief.
+"""
+import json
+import re
+
+# Exact-match small-talk + confirmation vocabularies (matched on a normalized turn).
+GREET = ("hi", "hello", "hey", "yo", "sup", "hiya", "hello there", "hola", "thanks",
+         "thank you", "cool", "nice", "test", "testing", "ping", "help", "?")
+CONFIRM = ("go", "yes", "y", "start", "render", "render it", "proceed", "do it", "ok",
+           "okay", "ok go", "yep", "yeah", "sure", "build", "build it", "make it",
+           "let's go", "go ahead", "confirm", "\U0001F44D")
+# Leading interrogatives → treat as a question (chat), UNLESS it's a generation request.
+QWORDS = ("what", "how", "why", "which", "can", "could", "should", "do", "does",
+          "is", "are", "who", "when", "where", "will", "would", "tell")
+
+# A CREATION ask — a verb of making + a film/media noun close by — even when phrased as a
+# question ("can you make a 30s noir short?") or a polite request ("give me a 1-min doc").
+_GEN_VERB = (r"(?:make|create|render|build|generate|produce|do|design|put\s+together|whip\s+up"
+             r"|give\s+me|i\s+want|i'?d\s+like|i\s+need|let'?s\s+(?:make|do|create|build))")
+_GEN_NOUN = (r"(?:films?|movies?|shorts?|videos?|clips?|documentar\w*|docu\w*|trailers?|montages?"
+             r"|reels?|animations?|teasers?|promos?|adverts?|ads?|scenes?|stor(?:y|ies)|pieces?)")
+_GEN_RE = re.compile(_GEN_VERB + r"\b.{0,40}?\b" + _GEN_NOUN, re.I)
+
+
+# Tokens that, on their own, only ever mean "yes, proceed" — so a SHORT turn made up entirely of
+# them is a confirm even if the exact phrase isn't in CONFIRM (e.g. "ok do it", "yes go ahead").
+# This stops a compound confirm from leaking into brief detection (the "ok do it" became the film
+# brief bug, 2026-06-29).
+_CONFIRM_TOKENS = {"go", "yes", "y", "ya", "yeah", "yep", "yup", "sure", "ok", "okay", "k",
+                   "do", "it", "that", "start", "render", "build", "proceed", "confirm",
+                   "please", "now", "lets", "let's", "ahead", "on", "make", "run", "begin"}
+
+
+def _norm(t):
+    return (t or "").strip().lower().strip(" .!?")
+
+
+def is_confirm(t):
+    norm = _norm(t)
+    if norm in CONFIRM:
+        return True
+    toks = [w.strip(".,!?") for w in norm.split() if w]
+    return bool(toks) and len(toks) <= 4 and all(w in _CONFIRM_TOKENS for w in toks)
+
+
+def is_greeting(t):
+    return _norm(t) in GREET
+
+
+def is_generation_request(t):
+    """A turn that asks to CREATE a film/clip — the strongest brief signal."""
+    return bool(_GEN_RE.search(t or ""))
+
+
+# Documentary/factual signal — MIRRORS production/prompts.py detect_format (guarded by
+# test_looks_documentary_matches_detect_format). Used in the pipe to OFFER web research on a
+# documentary brief (the pipe can't import the server-side detect_format).
+_DOC_SIGNALS = re.compile(
+    r"document\w*"
+    r"|\bhistory of\b|\bthe history\b|\bhistories of\b"
+    r"|\bexplainer\b|\bexplain(?:ed|s|ing)?\b"
+    r"|\beducational\b|\bbiograph\w*"
+    r"|\bguide to\b|\boverview of\b|\btimeline of\b|\bfacts? about\b"
+    r"|\btutorial\b|\bhow to\b|\bhow .{0,30}?works?\b|\bcase study\b",
+    re.I,
+)
+
+
+def looks_documentary(brief):
+    """True if a brief reads as documentary/factual (→ offer web research)."""
+    return bool(_DOC_SIGNALS.search(brief or ""))
+
+
+def is_question(t):
+    """Question-shaped (leading interrogative or trailing '?'). Pure to its name —
+    callers that want creation-asks excluded use is_brief_candidate (gen wins there)."""
+    tl = (t or "").strip().lower()
+    if not tl:
+        return False
+    first = tl.split()[:1]
+    return tl.endswith("?") or (bool(first) and first[0] in QWORDS)
+
+
+def is_brief_candidate(t, pure_override=False):
+    """Should this turn be treated as the film brief?
+
+    A generation request ALWAYS qualifies (even if question-shaped) — that's the F1 fix.
+    Otherwise it's a brief only if it isn't a greeting / confirm / pure stack-tweak / question.
+    `pure_override` is supplied by the caller (it needs valve/seconds context to compute).
+    """
+    # A creation ask OR a named factual subject ("dig history of pakistan?", "the history of jazz")
+    # is a brief even when question-shaped — the old gate dropped "dig history of pakistan?" as a
+    # question and the confirm phrase after it became the brief (2026-06-29).
+    if is_generation_request(t) or looks_documentary(t):
+        return True
+    return not (is_confirm(t) or is_greeting(t) or pure_override or is_question(t))
+
+
+def pick_brief(turns, pure_override_of=None):
+    """First turn that reads as a film brief, else ''. `pure_override_of(t)->bool` optional."""
+    po = pure_override_of or (lambda _t: False)
+    for t in turns:
+        if is_brief_candidate(t, po(t)):
+            return t
+    return ""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Batch 2 — the structured LLM intent controller (Codex F1/F2/F3).
+#
+# The keyword classifiers above are the deterministic FLOOR/FALLBACK. The controller
+# asks the 4B to read the whole conversation and emit ONE small JSON decision —
+# {intent, brief, stack_patch, confirm, reply} — which the pipe merges ON TOP of the
+# floor (LLM brief/stack win when present; the floor fills the gaps). The pure parse +
+# validation below is table-tested; the HTTP call + fallback orchestration live in the
+# pipe (`_classify`). A render only starts when the decision says confirm AND the latest
+# turn carries a real confirm word (has_confirm_word) — the irreversible action is never
+# triggered on the LLM's say-so alone.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Valid slot values — MUST mirror the wired lanes in production/stack.py (guarded by
+# test_controller_lane_constants_match_stack). The pipe can't import stack.py (it runs
+# in the OWUI container), so these are duplicated here, same as the pipe's own lane maps.
+VIDEO_LANES_VALID = ("wan", "ltx", "sulphur", "10eros")
+KEYFRAME_LANES_VALID = ("chroma", "zimage", "krea", "hidream")
+CONTINUITY_VALID = ("storyboard", "hero", "chain", "none")
+INTENTS = ("brief", "revise", "stack", "question", "confirm", "smalltalk", "cancel")
+
+# A turn that signals "start rendering NOW" — used to CORROBORATE the LLM's confirm flag
+# so an expensive render never fires on a hallucinated confirm. Looser than is_confirm
+# (exact-match) so compound asks like "go with LTX" still count.
+_CONFIRM_WORD_RE = re.compile(r"\b(go|yes|yeah|yep|sure|start|render|build|proceed|confirm|okay?)\b", re.I)
+_CONFIRM_PHRASES = ("do it", "go ahead", "let's go", "lets go", "ok go", "render it",
+                    "build it", "make it", "ship it", "send it")
+
+
+def has_confirm_word(t):
+    """Does this turn carry an explicit 'start now' signal? (corroborates the LLM confirm)."""
+    tl = (t or "").lower()
+    return bool(_CONFIRM_WORD_RE.search(tl)) or any(p in tl for p in _CONFIRM_PHRASES)
+
+
+def build_controller_system():
+    """The 4B's intent-parser system prompt — read the conversation, emit ONE JSON decision."""
+    return (
+        "You are the intent parser for a film studio's chat assistant. Read the conversation and "
+        "output ONE JSON object describing what the user wants RIGHT NOW. OUTPUT ONLY THE JSON — no "
+        "prose, no markdown fences.\n\n"
+        "{\n"
+        '  "intent": "brief|revise|stack|question|confirm|smalltalk|cancel",\n'
+        '  "brief": "<the ONE-LINE film the user currently wants, or empty string>",\n'
+        '  "stack_patch": {"video_lane": "", "keyframe_lane": "", "continuity": "", "music": true, "narration": true, "seconds": 0},\n'
+        '  "confirm": false,\n'
+        '  "reply": "<a warm, concise 1-2 sentence reply to the user>"\n'
+        "}\n\n"
+        "Rules:\n"
+        "- brief: the SUBJECT the user wants a film about — INFER it even from indirect phrasing: a topic "
+        "they asked you to research / dig / search (\"dig history of pakistan\" -> \"the history of pakistan\"), "
+        "a bare topic (\"history of jazz\"), or a changed subject (\"actually make it a bookstore promo\" -> use "
+        "the NEW one). If they named ANY subject to film or research, THAT subject is the brief. Leave it empty "
+        "ONLY if they named no topic at all (pure greetings, or questions about what you can do).\n"
+        "- stack_patch: include ONLY settings the user explicitly asked for; OMIT keys they didn't mention. "
+        "video_lane ∈ {wan, ltx, sulphur, 10eros}; keyframe_lane ∈ {chroma, zimage, krea, hidream}; "
+        "continuity ∈ {storyboard, hero, chain, none}; music/narration are booleans; seconds is the requested length.\n"
+        "- confirm: true ONLY if the user is telling you to START rendering now (\"go\", \"ok do it\", "
+        "\"yes do it\", \"go with ltx\", \"render it\"). A change request like \"make it 30 seconds\" is NOT a confirm.\n"
+        "- intent: brief = first/main film description; revise = changing the film; stack = changing a "
+        "setting/model; question = asking something; confirm = start now; smalltalk = greeting/chit-chat; "
+        "cancel = stop/never mind.\n"
+        "- reply: what to say back, warm and concise. For a question, ANSWER it truthfully. You CAN research "
+        "real facts on the web (SearXNG) to ground a DOCUMENTARY you're making — so \"can you search the web?\" "
+        "is YES, for grounding a documentary — but you canNOT browse arbitrary pages or fetch live info to chat "
+        "about. Never claim rendering or searching has already started (only \"go\" starts a render).\n"
+        "Output ONLY the JSON object."
+    )
+
+
+def _extract_json(text):
+    """First balanced {...} object out of the model's reply, or None."""
+    t = (text or "").strip()
+    if t.startswith("```"):
+        t = t.strip("`")
+        t = t[4:] if t[:4].lower() == "json" else t
+    i = t.find("{")
+    if i < 0:
+        return None
+    depth = 0
+    for j in range(i, len(t)):
+        if t[j] == "{":
+            depth += 1
+        elif t[j] == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    return json.loads(t[i:j + 1])
+                except Exception:
+                    return None
+    return None
+
+
+def parse_controller_json(raw):
+    """Parse the controller's reply into a dict, or None (→ caller falls back to heuristics)."""
+    d = _extract_json(raw)
+    return d if isinstance(d, dict) else None
+
+
+def normalize_decision(parsed):
+    """Validate + clean a parsed controller dict → a usable decision, or None.
+
+    Drops unknown lanes (never silently coerced — the heuristic floor fills them), coerces
+    types, and clamps `seconds`. None only when there's nothing usable to act on.
+    """
+    if not isinstance(parsed, dict):
+        return None
+    brief = str(parsed.get("brief") or "").strip()
+
+    # The controller owns ONLY the explicit MODEL/continuity picks. music/narration/seconds are
+    # deliberately NOT taken from the LLM — the 4B over-reaches on them (e.g. it stripped music +
+    # narration from a "bookstore promo" nobody asked to silence). Those stay keyword-driven in the
+    # pipe (`_overrides`: "no music" / "30 seconds" are reliable + explicit). Unknown lanes are
+    # DROPPED, never coerced — the keyword floor fills the gap.
+    raw_patch = parsed.get("stack_patch") or {}
+    patch = {}
+    if isinstance(raw_patch, dict):
+        v = str(raw_patch.get("video_lane") or "").strip().lower()
+        if v in VIDEO_LANES_VALID:
+            patch["video_lane"] = v
+        k = str(raw_patch.get("keyframe_lane") or "").strip().lower()
+        if k in KEYFRAME_LANES_VALID:
+            patch["keyframe_lane"] = k
+        c = str(raw_patch.get("continuity") or "").strip().lower()
+        if c in CONTINUITY_VALID:
+            patch["continuity"] = c
+
+    intent = str(parsed.get("intent") or "").strip().lower()
+    if intent not in INTENTS:
+        intent = "brief" if brief else "smalltalk"
+    reply = str(parsed.get("reply") or "").strip() or None
+    return {
+        "brief": brief,
+        "stack_patch": patch,
+        "confirm": bool(parsed.get("confirm")),
+        "intent": intent,
+        "reply": reply,
+    }
+
+
+def decide_action(brief, confirmed, intent):
+    """Route a resolved turn to ONE pipe action. Pure — the pipe handles the rendering.
+
+      build      → a brief is set AND the user confirmed (corroborated) → start the render
+      need_brief → the user confirmed but there's nothing to build yet
+      proposal   → a brief is set and the plan is new/changed (brief/revise/stack) → show the card
+      chat       → answer the user naturally (no brief yet, or a question/smalltalk/cancel)
+    """
+    if confirmed:
+        return "build" if brief else "need_brief"
+    if not brief:
+        return "chat"
+    return "chat" if intent in ("question", "smalltalk", "cancel") else "proposal"
+
+# ── end injected intent classifiers ──
 
 class Pipe:
     class Valves(BaseModel):
@@ -80,11 +358,24 @@ class Pipe:
         voice_url: str = Field(default="http://host.docker.internal:8193", description="Studio premium-voice service (Step-Audio-EditX, isolated container, transformers 4.53.3). Zero-shot clone + emotion/style editing. GPU — bring up on demand (docker compose -f services/studio/step-voice/docker-compose.yml up -d). If unreachable, the voice lane errors.")
         voice_reference: str = Field(default="Narrator.wav", description="Default reference voice the lane clones — a bundled sample name (Narrator.wav / Narrator-UK.wav / Pirates.wav) or an absolute path inside the service. Replace with your own 10–30 s clean clip to clone your voice.")
         hide_unavailable_lanes: bool = Field(default=True, description="Only list lanes whose backend is currently reachable — ComfyUI (:8188) for every media lane, the voice service (:8193) for the voice lane. When the ai-studio scene is down, the Studio lanes drop out of the OWUI model picker instead of listing-but-erroring. Set false to always list all lanes regardless of backend state.")
+        # ── Production lane (the Director: brief → planned → finished film) ──────
+        production_url: str = Field(default="http://host.docker.internal:8195", description="Studio Production service (the host-side wrapper around the 4B director + executor). The 🎬 Production lane is a thin client over it; gated by /produce/health. Bring it up on the host: python3 -m services.studio.production.server")
+        production_timeout_s: int = Field(default=1800, description="Min wait for a production to finish; the lane auto-extends this by the shot count (~3.5 min/shot) so a long film doesn't time out. Polls progress until done / error / this budget.")
+        production_shots: int = Field(default=0, description="Shot count. 0 (default) = SIZE it from the brief's stated duration (~5s/shot, e.g. “1 minute” → ~12 shots), else 4 when no length is given. Set >0 to force an exact count.")
+        # Two-level UX: leave these 'auto' for the visible default stack (Wan · Chroma ·
+        # storyboard), or PIN one to override. The director plans shot content within the
+        # chosen stack — it never silently picks the video/image model.
+        production_video_lane: str = Field(default="auto", description="Video model for every shot — ALL render in the production executor. 'auto' = wan (832×480, no native audio). ltx = LTX-2.3 base (768×512, 24fps). sulphur / 10eros = uncensored LTX-2.3 dev fine-tunes (1280×720). LTX-family clips carry native audio, but the film's soundtrack is the narration + music layer.")
+        production_keyframe_lane: str = Field(default="auto", description="Image model for continuity keyframes (tiers). 'auto' = chroma (conservative default). chroma/zimage = fast everyday (zimage = fastest, 8-step turbo); hidream = quality / hero frames (slow ~1 min/kf, native 2560×1440 — but Wan downscales to 832×480, so reserve it for hero frames, not everyday iteration); krea = aesthetic / stylized. (Ideogram is a title-card/design lane, not a continuity keyframe lane.)")
+        production_continuity: str = Field(default="storyboard", description="storyboard (per-shot keyframes + shared style bible, DEFAULT) · hero (one shared keyframe) · chain (i2v from prev frame) · none (independent t2v).")
+        production_music: bool = Field(default=True, description="Add an ACE-Step music bed under the film. Off = narration + visuals only.")
 
     # Lane catalog — (id, picker label, backend that must be live to serve it).
     #   "comfy" → ComfyUI (:8188), gates every image/video/music/SFX lane.
     #   "voice" → Step-Audio-EditX (:8193), an on-demand service, gates the voice lane.
+    #   "production" → the Production service (:8195), gates the Director lane.
     _LANES = [
+        ("production", "\U0001F3AC Studio · Production (Director · brief → finished film)",         "production"),
         ("ltx",     "\U0001F3AC Studio · Video (LTX-2.3 · +synced audio · text or image)",        "comfy"),
         ("sulphur", "\U0001F513 Studio · Video (Sulphur · uncensored · text or image)",           "comfy"),
         ("10eros",  "\U0001F513 Studio · Video (10Eros · uncensored · text or image)",            "comfy"),
@@ -125,6 +416,7 @@ class Pipe:
         self._live_cache = {
             "comfy": self._alive(self.valves.comfyui_url, "/system_stats"),
             "voice": self._alive(self.valves.voice_url, "/"),
+            "production": self._alive(self.valves.production_url, "/produce/health"),
         }
         self._live_ts = now
         return self._live_cache
@@ -245,6 +537,11 @@ class Pipe:
         "Output ONLY the final sound prompt — no preamble, no quotes."
     )
 
+    # The 🎬 Production lane's conversational voice (greetings, "what options?", nudging toward a
+    # brief). The behavioral spec is the editable source of truth in director/AGENTS.md — the build
+    # bakes its body in here (the pipe runs in-container and can't read the repo at runtime).
+    DIRECTOR_PRODUCER_SYS = json.loads(r"""["You are the Studio Production Director \u2014 a warm, concise assistant that plans and renders SHORT AI films from a one-line brief. Chat naturally; keep replies to 1\u20134 sentences, plain prose (NO JSON, NO markdown tables).\n\nWhat you can make, and the options the user can pick:\n- Length: any \u2014 roughly 5 seconds per shot (e.g. a 1-minute film \u2248 12 shots).\n- Video model (all render): Wan2.2 (default, 832\u00d7480, uncensored), LTX-2.3 (768\u00d7512, the distilled base), Sulphur (uncensored LTX dev, 1280\u00d7720), or 10Eros (uncensored LTX dev, 1280\u00d7720). The LTX-family lanes can generate their own audio, but in a multi-shot film the soundtrack comes from the narration + music layer, so their native audio isn't used.\n- Keyframe / image model (drives the look + character consistency): Chroma (default), Z-Image (fast), Krea 2 (aesthetic), or HiDream-O1 (top quality, slower).\n- Continuity: storyboard (default), hero, chain, or none.\n- Audio: narration (Kokoro) and/or background music (ACE-Step) \u2014 either can be turned off.\n- Research (documentary / factual films only): I can look up real facts on the web first (just say \"research\", \"search\", or \"dig\") so the narration and shots use real names, dates, and events instead of guesses. Be honest about the limit: I only research the film you're making \u2014 I CANNOT browse arbitrary web pages, open links, or fetch live info to chat about. If someone asks \"can you search the web?\", say yes \u2014 for grounding a documentary \u2014 then ask for a one-line factual brief.\n\nThe user changes anything by just saying so (\"use HiDream\", \"30 seconds\", \"no music\", \"research\"). When they're happy they say \"go\" and the build starts \u2014 only \"go\" renders; never claim you've already started rendering or searching. If they haven't described a film yet, warmly invite a one-line brief. Answer the user's actual message; when useful, end with a light nudge to say \"go\" or tell you what to change."]""")[0]
+
     # HiDream-O1 takes rich NATURAL-LANGUAGE prompts (Qwen3-VL text understanding). The Dev-2604
     # build runs CFG-off (no negative prompt), so everything must live in the positive description.
     DIRECTOR_HIDREAM_SYS = (
@@ -362,6 +659,42 @@ class Pipe:
         if t[:5].upper() == "CHAT:":
             return t[5:].strip() or "Tell me what you'd like to create and I'll generate it."
         return None
+
+    def _produce_reply(self, user_msg, plan_ctx=""):
+        """Natural studio-director chat for the 🎬 Production lane — greetings + questions like
+        'what other options do we have?' get a real answer, not a canned re-dump. Returns plain
+        prose; raises on director error so the caller can fall back to a static line."""
+        u = ("Current plan: " + plan_ctx + "\n\n" if plan_ctx else "") + "User: " + user_msg
+        body = json.dumps({"model": self.valves.chat_model,
+                           "messages": [{"role": "system", "content": self.DIRECTOR_PRODUCER_SYS},
+                                        {"role": "user", "content": u}],
+                           "max_tokens": 220, "temperature": 0.7,
+                           "chat_template_kwargs": {"enable_thinking": False}}).encode()
+        req = urllib.request.Request(self.valves.chat_url + "/chat/completions", data=body,
+                                     headers={"Content-Type": "application/json"})
+        return json.load(urllib.request.urlopen(req, timeout=120))["choices"][0]["message"]["content"].strip()
+
+    def _classify(self, turns, plan_ctx=""):
+        """Batch-2 LLM intent controller (blocking; call via run_in_executor).
+
+        Reads the whole conversation and returns a validated decision dict
+        {intent, brief, stack_patch, confirm, reply}, or None on any failure (→ the caller
+        falls back to the Batch-1 keyword heuristics). build_controller_system /
+        parse_controller_json / normalize_decision are injected from director_intent.py."""
+        convo = "\n".join("User: " + t for t in turns[-10:])
+        u = (("Current plan: " + plan_ctx + "\n\n") if plan_ctx else "") + "Conversation:\n" + convo
+        body = json.dumps({"model": self.valves.chat_model,
+                           "messages": [{"role": "system", "content": build_controller_system()},
+                                        {"role": "user", "content": u}],
+                           "max_tokens": 320, "temperature": 0.0,   # deterministic intent across turns
+                           "chat_template_kwargs": {"enable_thinking": False}}).encode()
+        try:
+            req = urllib.request.Request(self.valves.chat_url + "/chat/completions", data=body,
+                                         headers={"Content-Type": "application/json"})
+            raw = json.load(urllib.request.urlopen(req, timeout=45))["choices"][0]["message"]["content"]
+            return normalize_decision(parse_controller_json(raw))
+        except Exception:
+            return None   # director unreachable / bad JSON → caller uses the keyword floor
 
     # ── long-clip (>15s) via the orchestrator: chain ~10s segments → one combined video ──
     def _target_seconds(self, text):
@@ -642,6 +975,269 @@ class Pipe:
         if ("### Task:" in _lastu or "### Chat History:" in _lastu or "### Guidelines:" in _lastu
                 or "<chat_history>" in _lastu or "autocompletion" in _lastu.lower()):
             return ""   # OWUI internal task prompt, not a user generation request — do not render
+
+        # ── PRODUCTION LANE (the Director: brief → planned → finished film) ─────────────────────────
+        # plan-then-execute (NOT a live tool-loop): POST the brief + the operator-chosen stack to the
+        # Production service (:8195), then poll job progress and stream it. The 4B plans a
+        # ProductionPlanV1 and a deterministic executor runs keyframes → video → narration → music →
+        # assembly into one MP4. The stack (video/keyframe model, continuity, music) is chosen in the
+        # lane's ⚙️ valves — Auto by default, overridable — and never silently picked by the director.
+        if "production" in model:
+            loop = asyncio.get_event_loop()
+            # QUALIFY → CONFIRM → BUILD. The conversation is the state: gather the user turns,
+            # resolve a plan, PROPOSE it (models · length→shots · est. time), and only build once
+            # the user says "go". Never fire a render straight off a brief (or a greeting).
+            users = []
+            for m in body.get("messages", []):
+                if m.get("role") == "user":
+                    c = m.get("content")
+                    t = (" ".join(p.get("text", "") for p in c if isinstance(p, dict) and p.get("type") == "text").strip()
+                         if isinstance(c, list) else (c or "").strip())
+                    if t:
+                        users.append(t)
+            last = users[-1] if users else ""
+            _help = ("\U0001F3AC Tell me what film to make — a one-line brief like "
+                     "“a 1-minute documentary on the history of Pakistan” or “a 15s noir detective short”. "
+                     "I'll size it, show you the plan (models · length · render time), and build it once "
+                     "you say **go**.")
+            if not last:
+                return _help
+
+            # intent classifiers are injected at module level from director_intent.py (stdlib-only,
+            # unit-tested offline; the bake keeps the deployed pipe and the tests in sync). Thin
+            # local aliases keep the rest of this method unchanged.
+            _is_confirm = is_confirm
+            _is_greeting = is_greeting
+            _is_question = is_question
+            def _overrides(t):
+                tl = t.lower(); words = set(re.findall(r"[a-z0-9\-]+", tl)); o = {}
+                for k in ("10eros", "sulphur", "ltx", "wan"):
+                    if k in words:
+                        o["video_lane"] = k; break
+                for k, v in (("hidream", "hidream"), ("z-image", "zimage"), ("zimage", "zimage"),
+                             ("chroma", "chroma"), ("krea", "krea")):
+                    if k in words:
+                        o["keyframe_lane"] = v; break
+                for cc in ("storyboard", "hero", "chain"):
+                    if cc in words:
+                        o["continuity"] = cc
+                if "no continuity" in tl or "independent" in words:
+                    o["continuity"] = "none"
+                if "no music" in tl or "without music" in tl:
+                    o["music"] = False
+                if "no narration" in tl or "no voice" in tl or "no voiceover" in tl:
+                    o["narration"] = False
+                # web research toggle (documentary grounding) — opt-in; "dig"/"search"/"research"
+                if ("research" in words or "dig" in words or "search" in words
+                        or "look it up" in tl or "find facts" in tl):
+                    o["research"] = True
+                if ("no research" in tl or "without research" in tl or "don't search" in tl
+                        or "skip research" in tl or "no search" in tl):
+                    o["research"] = False
+                s = self._target_seconds(t)
+                if s:
+                    o["seconds"] = s
+                return o
+            def _pure_override(t):
+                return bool(_overrides(t)) and len(t.split()) <= 5
+
+            # ── FLOOR (Batch 1): deterministic keyword heuristics — the fallback when the LLM is down.
+            # A GENERATION REQUEST ("can you make a 30s noir short?") counts as a brief even though
+            # it's question-shaped (Codex F1, 2026-06-29).
+            brief_kw = pick_brief(users, _pure_override)
+            ov = {}
+            for t in users:
+                ov.update(_overrides(t))         # accumulate explicit tweaks across the convo (later wins)
+            confirm_kw = _is_confirm(last)
+
+            # ── CONTROLLER (Batch 2): the 4B reads the WHOLE conversation and returns a structured
+            # decision {intent, brief, stack_patch(lanes), confirm, reply}. It REFINES the floor —
+            # a mid-chat brief change ("actually make it a bookstore promo"), a compound confirm
+            # ("go with ltx"), a natural question — and FALLS BACK to the floor on any failure. A
+            # render starts only when the decision says confirm AND the latest turn carries a real
+            # confirm word (has_confirm_word) — never on the LLM's say-so alone (Codex F1/F2/F3).
+            _pshots = max(1, math.ceil(ov["seconds"] / 5.0)) if ov.get("seconds") else 0
+            _prelim_ctx = "film so far: %s; video=%s%s" % (
+                brief_kw or "(none described yet)",
+                ov.get("video_lane") or (self.valves.production_video_lane or "auto"),
+                (", ~%d shots" % _pshots) if _pshots else "")
+            _decision = await loop.run_in_executor(None, self._classify, users, _prelim_ctx)
+            if _decision:
+                # The LLM is the DRIVER — trust its read of the conversation (brief, intent, reply).
+                # The keyword floor is NOT consulted for the brief; it only supplies the explicit
+                # stack toggles the user typed ("use ltx", "no music", "research") the LLM might miss.
+                # Brief extraction is the LLM's job — that's what the controller prompt is for.
+                brief = _decision["brief"]
+                intent = _decision["intent"]
+                llm_reply = _decision["reply"]
+                for _k, _v in _decision["stack_patch"].items():
+                    ov.setdefault(_k, _v)        # explicit keyword toggles win; the LLM fills gaps
+                # render is irreversible → fire on a BARE confirm ("go", "ok do it") or an
+                # LLM-confirmed compound ("go with ltx"), ALWAYS gated by a real go-word (safety latch).
+                confirmed = confirm_kw or (_decision["confirm"] and has_confirm_word(last))
+            else:
+                # LLM unreachable → minimal keyword fallback (the 4B planner is down too, so this
+                # mostly keeps the lane honest until the director is back — it never guesses a brief
+                # from a confirm phrase).
+                brief = brief_kw
+                confirmed = confirm_kw
+                intent = ("confirm" if confirm_kw
+                          else "question" if (_is_question(last) and last != brief_kw and not _overrides(last))
+                          else "stack" if (last == brief_kw or _overrides(last)) else "smalltalk")
+                llm_reply = None
+
+            video = ov.get("video_lane") or (self.valves.production_video_lane or "auto")
+            keyf = ov.get("keyframe_lane") or (self.valves.production_keyframe_lane or "auto")
+            cont = ov.get("continuity") or (self.valves.production_continuity or "auto")
+            music = ov.get("music", bool(self.valves.production_music))
+            narr = ov.get("narration", True)
+            secs = ov.get("seconds") or 0
+            if secs:
+                shots = max(1, min(24, math.ceil(secs / 5.0)))  # ~5s/shot, capped ~2 min. ceil (NOT
+                #   round) — must match production.planner.derive_shots so the proposal == what /produce builds.
+            elif int(self.valves.production_shots or 0) > 0:
+                shots = int(self.valves.production_shots)
+            else:
+                shots = 4                                       # no stated length → a short default
+            est_lo, est_hi = int(round(shots * 2.5)), int(round(shots * 3)) + 3
+            research = bool(ov.get("research", False))   # documentary web-research, opt-in
+            is_doc = looks_documentary(brief)            # offer research only for factual briefs
+
+            # the plan proposal card (shown when there's a new / changed plan to confirm)
+            _audio_txt = ("narration + music" if (narr and music) else "narration only" if narr
+                          else "music only" if music else "silent")
+            _plan_ctx = ("video=%s, keyframes=%s, continuity=%s, audio=%s, ~%d shots"
+                         % (video, keyf, cont, _audio_txt, shots))
+            def _proposal():
+                _vl = {"auto": "Wan2.2 (auto)", "wan": "Wan2.2", "ltx": "LTX-2.3",
+                       "sulphur": "Sulphur (uncensored)", "10eros": "10Eros (uncensored)"}.get(video, video)
+                _kl = {"auto": "Chroma (auto)", "chroma": "Chroma", "zimage": "Z-Image",
+                       "krea": "Krea 2", "hidream": "HiDream-O1"}.get(keyf, keyf)
+                _audio = ("narration" if narr else "no narration") + " + " + ("music" if music else "no music")
+                _len = ("~%ds → %d shots" % (int(secs), shots)) if secs else \
+                       ("%d shots (~%ds — say a length like “1 minute” to size it)" % (shots, shots * 5))
+                _research_row = ("| \U0001F50E research | **on** — real web facts ground the script |\n"
+                                 if (is_doc and research) else "")
+                _research_offer = ("\n\n\U0001F50E _This looks like a documentary — reply **research** to "
+                                   "ground the shots in real web facts (recommended for accuracy), or just "
+                                   "**go** to use what I already know._" if (is_doc and not research) else "")
+                return (
+                    "\U0001F3AC **Plan — " + brief + "**\n\n"
+                    "| | |\n|---|---|\n"
+                    "| \U0001F3A5 video | **" + _vl + "** |\n"
+                    "| \U0001F5BC️ keyframes | **" + _kl + "** |\n"
+                    "| \U0001F39E️ continuity | **" + str(cont) + "**  ·  \U0001F50A audio **" + _audio + "** |\n"
+                    "| ⏱️ length | **" + _len + "** |\n"
+                    + _research_row +
+                    "| ⚙️ est. render | **~" + str(est_lo) + "–" + str(est_hi) + " min** on 1× 3090 |\n\n"
+                    "Reply **go** to start — or tell me what to change: _“use LTX” · “sulphur” · "
+                    "“30 seconds” · “no music” · “hidream keyframes” · “hero continuity”_."
+                    + _research_offer +
+                    "\n\n_(Video: Wan2.2 · LTX-2.3 · Sulphur · 10Eros — all render. LTX-family lanes "
+                    "use their own resolution; the film's audio is the narration + music layer.)_"
+                )
+
+            async def _chat(msg, ctx):
+                await status("", True)
+                try:
+                    return "\U0001F3AC " + await loop.run_in_executor(None, self._produce_reply, msg, ctx)
+                except Exception:
+                    return None   # director unreachable
+
+            # route the resolved turn → ONE action (tested: director_intent.decide_action).
+            action = decide_action(brief, confirmed, intent)
+            if action == "need_brief":
+                return ("Nothing to start yet — give me a one-line brief first, e.g. "
+                        "“a 1-minute documentary on the history of Pakistan”.")
+            if action == "chat":
+                # the LLM's own reply when it has one, else a fresh director chat call; the static
+                # fallback is the plan card (if we have a brief) or the help line.
+                return llm_reply or (await _chat(last, _plan_ctx if brief else "")) or \
+                    (_proposal() if brief else _help)
+            if action == "proposal":
+                await status("", True)
+                return _proposal()
+            # action == "build" → fall through to the resolved-plan build below
+
+            # CONFIRMED + have a brief → build with the resolved plan
+            await status("\U0001F3AC Starting “" + brief + "” — " + str(shots) + " shots, ~" +
+                         str(est_lo) + "–" + str(est_hi) + " min…")
+            base_prod = self.valves.production_url.rstrip("/")
+            payload = {"brief": brief, "shots": shots, "video_lane": video, "keyframe_lane": keyf,
+                       "continuity": cont, "music": music, "narration": narr, "research": research}
+
+            def _prod_post():
+                req = urllib.request.Request(base_prod + "/produce", data=json.dumps(payload).encode(),
+                                             headers={"Content-Type": "application/json"})
+                try:
+                    return 200, json.load(urllib.request.urlopen(req, timeout=30))
+                except urllib.error.HTTPError as e:
+                    try:
+                        return e.code, json.load(e)
+                    except Exception:
+                        return e.code, {"error": "HTTP " + str(e.code)}
+
+            await status("\U0001F3AC Director planning the production…")
+            try:
+                code, resp = await loop.run_in_executor(None, _prod_post)
+            except Exception as e:
+                await status("Failed", True)
+                return ("⚠️ Could not reach the Production service at " + base_prod +
+                        " — bring it up on the host: `python3 -m services.studio.production.server`\n\n" + str(e))
+            if code == 409:
+                await status("Busy", True)
+                return "⏳ A production is already running (one film at a time). Try again when it finishes."
+            if code != 200:
+                await status("Rejected", True)
+                rt = resp.get("renders_today") or {}
+                extra = ("\n\nRenders today — video: " + ", ".join(rt.get("video", [])) +
+                         " · keyframes: " + ", ".join(rt.get("keyframe", []))) if rt else ""
+                return "⚠️ " + str(resp.get("error", "stack rejected")) + extra
+            job_id = resp.get("job_id", "")
+            st = resp.get("stack", {})
+            stack_line = ("**Stack** — video: `" + str(st.get("video_lane")) + "` · keyframes: `" +
+                          str(st.get("keyframe_lane")) + "` · continuity: `" + str(st.get("continuity")) +
+                          "` · " + ("music on" if st.get("music") else "no music"))
+            deadline = time.time() + max(int(self.valves.production_timeout_s), shots * 210 + 300)
+            last_phase = ""
+            job = {}
+            while time.time() < deadline:
+                await asyncio.sleep(5)
+
+                def _prod_get():
+                    try:
+                        return json.load(urllib.request.urlopen(base_prod + "/job/" + job_id, timeout=30))
+                    except Exception:
+                        return {}
+
+                job = await loop.run_in_executor(None, _prod_get)
+                phase = job.get("phase", "")
+                pct = int(round(float(job.get("frac", 0.0)) * 100))
+                title = job.get("title") or "…"
+                if phase and phase != last_phase:
+                    await status("\U0001F3AC " + title + " — " + phase + " (" + str(pct) + "%)")
+                    last_phase = phase
+                if job.get("status") in ("done", "error"):
+                    break
+            if job.get("status") == "error":
+                await status("Failed", True)
+                return "⚠️ Production failed: " + str(job.get("error", "unknown error")) + "\n\n" + stack_line
+            if job.get("status") != "done":
+                await status("Timed out", True)
+                return ("⏱️ Production didn't finish within " + str(self.valves.production_timeout_s) +
+                        "s — it may still be rendering. Check the gallery: " +
+                        self.valves.browser_base.rstrip("/") + "/\n\n" + stack_line)
+            await status("Done", True)
+            base = self.valves.browser_base.rstrip("/")
+            gurl = base + "/" + str(job.get("gallery_url", "")).lstrip("/")
+            title = job.get("title") or "Production"
+            return ("**\U0001F3AC Studio · Production — " + title + "**\n\n" + stack_line + "\n\n"
+                    "<video src=\"" + gurl + "\" controls width=\"640\"></video>\n\n"
+                    "\U0001F3AC **[Open / download the film](" + gurl + ")**\n\n"
+                    "_The 4B director planned it, then the executor ran keyframes → video → narration "
+                    "→ music → assembly. Want changes? Adjust the stack in ⚙️ valves and send "
+                    "the brief again._ _(Browse all media: " + base + "/ )_")
+
         if "music" in model:
             lane = "music"
         elif "sfx" in model:

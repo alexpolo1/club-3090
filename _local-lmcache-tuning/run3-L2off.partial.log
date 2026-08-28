@@ -1,0 +1,60 @@
+====================================================================
+STEP 1 — recreate with LMCACHE_L2=0 (07:10:56)
+====================================================================
+ Container vllm-qwen36-27b-lmcache Starting 
+ Container vllm-qwen36-27b-lmcache Started 
+[switch] waiting for http://localhost:8017/v1/models (container=vllm-qwen36-27b-lmcache, timeout 600s)...
+[switch]   16s — Application startup complete
+[switch]   28s — Resolved architecture: Qwen3_5ForConditionalGeneration
+[switch]   36s — Resolved architecture: Qwen3_5MTP
+[switch]   60s elapsed, still waiting...
+[switch]   68s — Loading weights
+[switch]   120s elapsed, still waiting...
+[switch]   180s elapsed, still waiting...
+[switch]   208s — Capturing CUDA graphs
+[switch]   224s — Application startup complete
+[switch] ✓ ready (224s)
+[switch] ▶ API:  http://192.168.1.98:8017/v1   (model: qwen3.6-27b · OpenAI-compatible · no auth)
+[switch] done. Try:  curl -s http://localhost:8017/v1/models | jq .
+>> container LMCACHE_L2=0
+====================================================================
+STEP 2 — clean retention test, L2 OFF, fresh L1 (07:14:52)
+  (Round 1 = true cold ~52s; Round 2 warm<8s = held in L1, cold = evicted)
+====================================================================
+LMCache L1 retention probe -> http://localhost:8017   model=qwen3.6-27b
+  sessions=8  target_tokens/session~=48000  warm_threshold=8.0s  kv=131KB/tok
+
+Building calibrated haystacks (one /tokenize probe each)...
+
+Round 1 - cold insert (fills L1):
+  session  1: cold TTFT   55.05s  (prompt_tokens=48173)
+  session  2: cold TTFT   54.25s  (prompt_tokens=48141)
+  session  3: cold TTFT   57.25s  (prompt_tokens=49197)
+  session  4: cold TTFT   54.68s  (prompt_tokens=46422)
+  session  5: cold TTFT   60.64s  (prompt_tokens=49274)
+  session  6: cold TTFT   64.87s  (prompt_tokens=50187)
+  session  7: cold TTFT   63.76s  (prompt_tokens=48045)
+  session  8: cold TTFT   63.24s  (prompt_tokens=46967)
+
+  inserted ~386406 tokens ~= 50.6 GB of L1
+  capacity lines: L1=30 -> ~229K tok (~30 GB), L1=60 -> ~458K tok (~60 GB)
+
+Round 2 - retention read (same prefixes; warm = retained):
+  session  1: TTFT   66.52s  COLD  evicted / re-prefill
+  session  2: TTFT   47.73s  COLD  evicted / re-prefill
+  session  3: TTFT   69.82s  COLD  evicted / re-prefill
+  session  4: TTFT   45.63s  COLD  evicted / re-prefill
+  session  5: TTFT   71.24s  COLD  evicted / re-prefill
+  session  6: TTFT   49.44s  COLD  evicted / re-prefill
+  session  7: TTFT   69.20s  COLD  evicted / re-prefill
+  session  8: TTFT   48.29s  COLD  evicted / re-prefill
+
+  retained warm: 0/8
+
+  FAIL - 8 session(s) evicted. Working set exceeded the live L1,
+         or L1 is smaller than expected. Check LMCACHE_L1_GB and that
+         shm_size >= L1 (else the MP connector falls back to slow pickle).
+>> test exit rc=1
+====================================================================
+STEP 3 — restore production (LMCACHE_L2=1) (07:30:37)
+====================================================================

@@ -163,22 +163,43 @@ class FitVerdict:
     """Result of kv-calc --fit / switch.sh --explain's fit block for one slug."""
 
     # Real kv-calc --fit verdict enum (verified live):
-    #   fits-clean | fits-constrained | wont-fit | unknown
+    #   fits-clean | fits-constrained | wont-fit | incompatible-hw | unknown
     # plus the cockpit-internal "skip" (ik/llama kvcalc_key=SKIP — no vLLM fit).
-    verdict: str = "unknown"          # fits-clean | fits-constrained | wont-fit | unknown | skip
+    # "incompatible-hw" = the registry's required_sm exceeds the local card's
+    # compute capability (e.g. NVFP4 on Ampere) — VRAM is irrelevant, the
+    # kernels don't exist here. Drives the catalog default-hide + the
+    # download/serve hardware warning.
+    verdict: str = "unknown"          # fits-clean | fits-constrained | wont-fit | incompatible-hw | unknown | skip
     vram_est_gb: Optional[float] = None
     band_gb: Optional[float] = None
     max_ctx: Optional[int] = None
     card: str = ""
     error: str = ""
+    # Populated only for verdict == "incompatible-hw".
+    required_sm: Optional[float] = None
+    card_sm: Optional[float] = None
+    # Populated when the card sits in a registry fallback band
+    # (fallback_sm <= card_sm < required_sm): the slug RUNS here via a
+    # weight-only fallback kernel (e.g. NVFP4 -> Marlin W4A16 on Ampere,
+    # live-confirmed 2026-07-11) and kv-calc prices it normally — the fit
+    # verdict is a real fits-*/wont-fit, this dict just carries the badge
+    # data: {"required_sm": float, "card_sm": float, "note": str}.
+    # Fallback-band slugs are VISIBLE by default (not [h]-hidden).
+    hw_fallback: Optional[dict[str, Any]] = None
 
     # Compact glyph for the Catalog "fit" column.
     @property
     def glyph(self) -> str:
+        # Fallback-band + fits → flag glyph: "runs here, via fallback kernels
+        # (no native speed edge)". wont-fit/unknown keep their own glyphs —
+        # the VRAM story outranks the kernel story.
+        if self.hw_fallback and self.verdict in ("fits-clean", "fits-constrained"):
+            return "⚑"
         return {
             "fits-clean": "●",
             "fits-constrained": "◐",
             "wont-fit": "○",
+            "incompatible-hw": "⊘",
             "skip": "·",
             "unknown": "·",
         }.get(self.verdict, "·")
@@ -194,6 +215,9 @@ class FitVerdict:
             max_ctx=_as_int(d.get("max_ctx")),
             card=card,
             error=str(d.get("error", "")),
+            required_sm=_as_float(d.get("required_sm")),
+            card_sm=_as_float(d.get("card_sm")),
+            hw_fallback=d.get("hw_fallback") if isinstance(d.get("hw_fallback"), dict) else None,
         )
 
 
@@ -202,16 +226,27 @@ class FitVerdict:
 
 @dataclass
 class Measurement:
-    """A measured result for a slug, joined from a structured corpus or parsed
-    coarsely from BENCHMARKS.md.  ``source`` records provenance so the UI can
-    distinguish a structured record from a best-effort markdown parse."""
+    """A measured result for a slug.  The catalog's source is the SHIPPED
+    BASELINE joined at registry-emit (source=="baseline"); "explain"/
+    "benchmarks.md" remain only for non-catalog surfaces (Explain modal,
+    cross-rig explorer).  ``source`` records provenance so the UI never
+    presents a coarse parse as an accepted number."""
 
     narr_tps: Optional[float] = None
     code_tps: Optional[float] = None
     quality_8pk: Optional[str] = None   # e.g. "107/150"
     max_ctx_label: str = ""
     date: str = ""
-    source: str = ""                    # "explain" | "corpus" | "benchmarks.md" | ""
+    source: str = ""                    # "baseline" | "explain" | "corpus" | "benchmarks.md" | ""
+    # Catalog-baselines: emit-computed pin-staleness for a baseline row —
+    # True = measured on an older engine pin (re-bench owed), False = current
+    # pin, None = undeterminable / not a baseline measurement.
+    stale: Optional[bool] = None
+    # Slice 3: set when this row is a CROSS-RIG submission surfaced because the
+    # slug has NO on-rig primary (e.g. 4-card slugs our 2-card rig can't run) —
+    # the rig_class it came from.  The catalog cell then renders it ⑂-labelled so
+    # it's never mistaken for this rig's own bar.  None = a normal on-rig row.
+    submission_rig: Optional[str] = None
 
     @property
     def tps_label(self) -> str:
@@ -219,7 +254,10 @@ class Measurement:
             return "—"
         n = f"{self.narr_tps:.0f}" if self.narr_tps is not None else "—"
         c = f"{self.code_tps:.0f}" if self.code_tps is not None else "—"
-        return f"{n}/{c}"
+        lab = f"{n}/{c}"
+        if self.submission_rig:
+            lab += "  [dim]⑂[/dim]"
+        return lab
 
     @property
     def quality_label(self) -> str:
@@ -313,6 +351,10 @@ class CatalogEntry:
     weights_state: str = "unknown"
     weights: Optional["WeightsMeta"] = None
     download_pct: Optional[int] = None   # 0-99 while weights_state == "downloading"
+    # Catalog-baselines slice 2b: THIS RIG's newest corpus record for the slug
+    # (results/measurement-records/, written by rebench-full) — the "yours vs
+    # the bar" overlay.  None when this rig has never gated the slug.
+    local_measurement: Optional["LocalMeasured"] = None
 
     # Convenience pass-throughs (so panes can read entry.slug, not entry.row.slug)
     @property
@@ -396,6 +438,22 @@ class CatalogEntry:
         return getattr(self.row, "source", "") or "·"
 
 
+@dataclass
+class LocalMeasured:
+    """The local "yours" overlay projection of one #249 corpus record
+    (catalog-baselines slice 2b) — THIS RIG's newest gate numbers for a slug.
+
+    The record's bench carries ONE canonical-short decode point (not the
+    narr/code pair — a parser limitation noted for slice 2c), plus the
+    quality extensions and the pin the run measured on."""
+
+    decode_tps: Optional[float] = None
+    quality_8pk: Optional[str] = None
+    quality_8pk_think_on: Optional[str] = None
+    engine_pin: Optional[str] = None
+    date: str = ""                       # _recorded_at date, else file-mtime date
+
+
 # ── Estate / Scene / Container / Doctor ─────────────────────────────────────────
 
 
@@ -452,6 +510,7 @@ class ContainerInfo:
     internal_port: int = 0
     engine: str = ""                    # for engine containers
     slug: str = ""                      # registry slug if matched
+    match_confidence: str = ""          # "identity" | "shape" | "" (see core detect)
     gpus: str = ""                      # "0,1" if known, else ""
     status: str = "running"             # "running" | "stopped" (known-but-down service)
 
@@ -580,6 +639,65 @@ class ReconcileResult:
 
 
 @dataclass
+class GgufVariant:
+    """One GGUF quant discovered in an HF repo (deriver artifact inventory)."""
+
+    quant: str = ""
+    size_gb: float = 0.0
+    parts: int = 1
+    files: list[str] = field(default_factory=list)
+
+
+@dataclass
+class ArtifactInventory:
+    """Bring-funnel stage-1 INSPECT (design §2b): what servable artifacts an
+    HF repo carries — BEFORE any engine/template is shown.  From
+    ``deriver.py --inventory <repo> --json`` (offline-testable; a GGUF-only
+    repo is a first-class bring here, never ``unsupported-format``)."""
+
+    repo: str = ""
+    error: str = ""
+    formats: list[str] = field(default_factory=list)
+    safetensors_files: int = 0
+    safetensors_size_gb: float = 0.0
+    gguf_variants: list[GgufVariant] = field(default_factory=list)
+    gguf_mmproj: list[str] = field(default_factory=list)
+    lineage_base_model: Any = None
+
+    @property
+    def has_safetensors(self) -> bool:
+        return "safetensors" in self.formats
+
+    @property
+    def has_gguf(self) -> bool:
+        return bool(self.gguf_variants)
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any] | None) -> "ArtifactInventory":
+        if not d:
+            return cls(error="no output")
+        st = d.get("safetensors") or {}
+        return cls(
+            repo=str(d.get("repo", "")),
+            error=str(d.get("error", "") or ""),
+            formats=list(d.get("formats") or []),
+            safetensors_files=len(st.get("weight_files") or []),
+            safetensors_size_gb=float(st.get("size_gb") or 0.0),
+            gguf_variants=[
+                GgufVariant(
+                    quant=str(v.get("quant", "")),
+                    size_gb=float(v.get("size_gb") or 0.0),
+                    parts=int(v.get("parts") or 1),
+                    files=list(v.get("files") or []),
+                )
+                for v in (d.get("gguf_variants") or [])
+            ],
+            gguf_mmproj=list(d.get("gguf_mmproj") or []),
+            lineage_base_model=d.get("lineage_base_model"),
+        )
+
+
+@dataclass
 class ByoResult:
     """Result of pull.sh --profile-like <repo> --dry-run --json."""
 
@@ -627,7 +745,7 @@ class ActionPlan:
     The reconcile gate is consulted BEFORE execution.
     """
 
-    kind: str                           # "serve" | "set_default" | "clear_default" | "scene" | "estate_down" | "container" | "validation" | "submit_bench" | "power_cap" | "power_cap_sweep" | "prune" | "container_rm"
+    kind: str                           # "serve" | "set_default" | "clear_default" | "scene" | "estate_down" | "container" | "validation" | "submit_bench" | "power_cap" | "power_cap_sweep" | "prune" | "container_rm" | "pod_create"
     cmd: list[str]
     description: str = ""
     is_write: bool = True
@@ -641,6 +759,11 @@ class ActionPlan:
     # (submit-bench POST/PR) so the confirm copy can warn it leaves the rig.
     requires_confirm: bool = True
     network: bool = False
+    # Extra env merged over os.environ when the cmd runs (dispatch_action).  Used
+    # by the ② Serve override editor to pass MAX_MODEL_LEN / KV_CACHE_DTYPE / SPEC
+    # / GPU_MEMORY_UTILIZATION / SERVED_NAME to `docker compose up` — the compose
+    # interpolates ${VAR}, so no compose rewrite per serve.
+    env: Optional[dict[str, str]] = None
 
 
 # ── Phase 4: Doctor (estate + profile triage reads) ──────────────────────────────
@@ -831,6 +954,20 @@ class BenchRow:
 
 # ── Phase 4: Evidence (rebench run tags) ──────────────────────────────────────────
 
+# F10 — the rebench-full gate ladder, in run order.  MUST mirror the `run_step
+# <name>` call sites in scripts/rebench-full.sh (the script owns the sequence;
+# this is a render constant — test_gate_steps_match_rebench_script pins the two
+# together so they can't drift).  Steps may be absent from a given run
+# (--skip / --resume / --quick): the observer renders those positionally.
+GATE_STEPS: tuple[str, ...] = (
+    "verify-full",
+    "bench",
+    "verify-stress",
+    "quality-full",
+    "quality-thinking",
+    "soak",
+)
+
 
 @dataclass
 class EvidenceTag:
@@ -844,6 +981,17 @@ class EvidenceTag:
     date: str = ""                      # from REPORT.md Meta or dir mtime
     # A coarse one-line TL;DR scraped from REPORT.md if present.
     tldr: str = ""
+    # F10 — live gate-run observer.  A dir with NO REPORT.md is a run in
+    # flight (rebench-full synthesizes REPORT.md last): ``live`` while its
+    # artifacts are still being written, ``stale`` once it has gone quiet
+    # (aborted / orphaned).  Both derive purely from the dir's files — the
+    # observer works identically for CLI-launched (nohup) runs.
+    live: bool = False
+    stale: bool = False                 # incomplete AND no recent writes
+    live_step: str = ""                 # the step whose log is growing now
+    steps_done: list = field(default_factory=list)   # [(step, secs), …] from timings.json
+    live_tail: str = ""                 # last lines of the active step's log
+    age_secs: int = 0                   # since the newest artifact write
 
 
 @dataclass
@@ -917,6 +1065,11 @@ class MeasureVsBar:
     # was picked deterministically on model alone (surfaced as a caveat).
     run_engine: str = ""
     engine_resolved: bool = False       # True when run_engine drove bar selection
+    # Friction #9 (T2): the bar is the SIBLING-CLASS bar (①'s swap_path
+    # sibling) because no same-model bar exists — a NEW model's primary case.
+    # Labeled, never silent: the verdict reads class-relative.
+    bar_is_class: bool = False
+    class_model: str = ""
     # Per-metric measured−bar deltas (None when either side is missing).
     narr_tps_delta: Optional[float] = None
     code_tps_delta: Optional[float] = None
@@ -1724,7 +1877,7 @@ _REPORT_DECODE_ROW_RE = re.compile(
 _REPORT_QUALITY_RE = re.compile(
     r"\*\*\s*(\d+)\s*/\s*(\d+)\s*\*\*", re.IGNORECASE
 )
-# REPORT.md Meta line:  - **Served as:** `qwen3.6-27b-autoround` from `…`
+# REPORT.md Meta line:  - **Served as:** `qwen3.6-27b` from `…`
 _REPORT_SERVED_RE = re.compile(r"\*\*Served as:\*\*\s*`([^`]+)`")
 # REPORT.md Meta line:  - **Model arch:** qwen3_next (Qwen3NextForCausalLM)
 _REPORT_ARCH_RE = re.compile(r"\*\*Model arch:\*\*\s*([^\s(]+)")
@@ -1858,7 +2011,7 @@ def _canon_model_key(model: str) -> str:
     """Reduce a model id / served-name to a coarse comparable token.
 
     The curated bar's model is a registry slug (``qwen3.6-27b``); a rebench
-    REPORT.md's ``Served as`` is a served-model-name (``qwen3.6-27b-autoround``).
+    REPORT.md's ``Served as`` is a served-model-name (``qwen3.6-27b``).
     Strip non-alnum + a trailing weights-variant tail so both reduce to the same
     family token for the loose match."""
     norm = re.sub(r"[^a-z0-9.]", "", (model or "").lower())

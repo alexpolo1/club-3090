@@ -47,8 +47,8 @@
 #     vllm/dual4-dflash     262K + FP16 + DFlash N=5 + 2 streams + vision (4× 3090 code)
 #     (NVLink is auto-detected at boot by every dual compose — no separate
 #      nvlink-* variant. Force it with NVLINK_MODE=force_on if auto-detect misses.)
-#     vllm/gemma-int8-mtp       Gemma-4-31B dual default — 262K + INT8 KV + vision (v0.21.0 + #40391 overlay)
-#     vllm/gemma-bf16-mtp        Gemma-4-31B stable fallback — 32K + bf16 KV + vision (stock v0.22.0, no overlay)
+#     vllm/gemma-31b-dual       Gemma-4-31B dual default — ~224K + bf16 KV + vision, stock v0.24.0 (overlay-free) ⭐
+#       (the v0.22.0 gemma-int8-mtp / gemma-bf16-mtp / qat-w4a16 duals are DEPRECATED — see --list --all)
 #     (other Qwen dual variants — dflash / tq3 / bf16 / int8 — were deprecated
 #      2026-05-31; see `switch.sh --list --all`.)
 #
@@ -100,6 +100,11 @@ if [[ -f "${ROOT_DIR}/.env" ]]; then
   done < "${ROOT_DIR}/.env"
   unset _env_line _env_key _env_val
 fi
+# #632 — surface a user engine-image pin (ik-llama / llama.cpp images are NOT
+# profile-injected, so a .env/shell pin is the only override path; echo it so a
+# wrong-image boot is never silent).  Fires only when actually set.
+[[ -n "${IK_LLAMA_IMAGE:-}" ]] && echo "[switch] ik-llama image pinned: ${IK_LLAMA_IMAGE}"
+[[ -n "${LLAMACPP_IMAGE:-}" ]] && echo "[switch] llama.cpp image pinned: ${LLAMACPP_IMAGE}"
 
 # Surface the resolved MODEL_DIR + its source so the precedence is unambiguous
 # (the exact confusion behind #425 / #187). Unset → the compose's built-in
@@ -135,6 +140,21 @@ declare -A VARIANT_CONTAINER=()
 # shellcheck source=lib/registry-emit.sh
 source "${ROOT_DIR}/scripts/lib/registry-emit.sh"
 derive_switch_variant_tables "${ROOT_DIR}"
+# shellcheck source=lib/compose-meta.sh
+source "${ROOT_DIR}/scripts/lib/compose-meta.sh"
+
+# Detected GPUs as an idx|name|mem_mib|sm;... spec (the launch_compat format).
+# Empty when detection fails -> the #246 arch-aware env simply stays off.
+switch_gpu_profile_spec() {
+  local lines idx name mem sm parts=()
+  lines="$(compose_hw_detect_gpus 2>/dev/null || true)"
+  [[ -n "$lines" ]] || { printf ''; return 0; }
+  while IFS=$'\t' read -r idx name mem sm; do
+    [[ -z "$idx" ]] && continue
+    parts+=("${idx}|${name}|${mem}|${sm}")
+  done <<< "$lines"
+  (IFS=';'; printf '%s' "${parts[*]}")
+}
 
 # Teardown is registry-derived from VARIANT_CONTAINER (see down_running()). This
 # replaced a fixed `^(vllm-|llama-cpp-)` regex that missed beellama-/ik-llama-/
@@ -894,9 +914,10 @@ gpu_preflight() {
 }
 
 export_variant_engine_pin() {
-  local variant="$1" output line key value
+  local variant="$1" output line key value gpu_spec
   [[ "$variant" == vllm/* || "$variant" == beellama/* ]] || return 0
-  if ! output="$(python3 "$LAUNCH_PROFILE" resolve-variant-pin --variant "$variant" --format shell 2>&1)"; then
+  gpu_spec="$(switch_gpu_profile_spec 2>/dev/null || true)"
+  if ! output="$(python3 "$LAUNCH_PROFILE" resolve-variant-pin --variant "$variant" --format shell --gpu-spec "$gpu_spec" 2>&1)"; then
     echo "$output" >&2
     exit 2
   fi
@@ -906,6 +927,20 @@ export_variant_engine_pin() {
       VLLM_NIGHTLY_SHA) export VLLM_NIGHTLY_SHA="$value" ;;
       VLLM_IMAGE) export VLLM_IMAGE="$value" ;;
       BEELLAMA_IMAGE) export BEELLAMA_IMAGE="$value" ;;
+      # #246 arch-aware env (pilot slugs; hardware-profile balanced default)
+      KV_CACHE_DTYPE)
+        export KV_CACHE_DTYPE="$value"
+        echo "[switch] arch-aware KV dtype: ${value} (hardware-profile default for detected GPUs — #246)" ;;
+      MAX_NUM_SEQS)
+        export MAX_NUM_SEQS="$value"
+        echo "[switch] memory-envelope concurrency: MAX_NUM_SEQS=${value} (measured for this card class — #246 Phase 2)" ;;
+      GPU_MEMORY_UTILIZATION)
+        export GPU_MEMORY_UTILIZATION="$value"
+        echo "[switch] memory-fraction floor: GPU_MEMORY_UTILIZATION=${value} (unified-memory card can't safely give the default — #246 Phase 2)" ;;
+      VLLM_USE_DEEP_GEMM)
+        export VLLM_USE_DEEP_GEMM="$value"
+        echo "[switch] fp8 weights: VLLM_USE_DEEP_GEMM=${value} (consumer card has no DeepGEMM recipe — disc #571)" ;;
+      VLLM_ATTENTION_BACKEND) export VLLM_ATTENTION_BACKEND="$value" ;;
       *) echo "[switch] ERROR: unexpected engine pin export: $key" >&2; exit 2 ;;
     esac
   done <<< "$output"
@@ -978,17 +1013,26 @@ up_variant() {
     preflight_compose_deps "${full_dir}/${file}" || exit 1
     if [[ "$eng" == "vllm" ]]; then
       preflight_compose_hardware "${full_dir}/${file}" "$v" "${FORCE:-0}" || exit 1
+      # Free-VRAM gate: fail fast (not a 600s restart-loop) when the GPUs don't have
+      # room for this config's gpu_memory_utilization — e.g. a desktop/other scene
+      # still holding VRAM after a switch (club-3090 #535). Runs AFTER down_running(),
+      # so its settle-retry also covers the just-torn-down container's VRAM lag.
+      preflight_compose_gpu_fit "${full_dir}/${file}" "${FORCE:-0}" || exit 1
     fi
     # LMCache host-RAM guard — runs even under --force (incubating LMCache slugs
     # launch WITH --force, yet over-sizing --l1-size-gb can OOM the host; #133).
     # No-op for composes without an LMCache-l1-gb metadata header.
     preflight_lmcache_ram "${full_dir}/${file}" || exit 1
     preflight_kv_format_hint "${full_dir}/${file}" || true
+    # Single-card util-override guard — runs even under --force (the nvfp4 slug
+    # launches with --force, and util=0.92 on one card OOMs the tool-prefill; #617).
+    preflight_single_card_util "${full_dir}/${file}" "$v" || true
   fi
   gpu_preflight
 
   echo "[switch] bringing up: ${v}  (${dir}/${file})"
   export_variant_engine_pin "$v"
+  preflight_ik_llama_image "$v"   # #633 — cu12 fallback on <13.2 drivers (unless pinned)
   (cd "${full_dir}" && ${COMPOSE_BIN} -f "${file}" up -d --remove-orphans)
 }
 
@@ -1057,6 +1101,22 @@ wait_ready() {
     fi
   done
   echo "[switch] ✓ ready (${elapsed}s)"
+  # F3 (CLI parity with c3's serving card): print the USABLE endpoint — the LAN
+  # URL an agent/client should point at, the served model id, and the auth
+  # status. LANIP's source of truth is the repo .env (#512, loaded above; shell
+  # env wins); fall back to the shared c3_lan_ip helper in a SUBSHELL
+  # (comfyui-paths.sh sets studio paths at source time — keep that contained),
+  # then localhost.
+  local _lanip _served _port
+  _lanip="${LANIP:-}"
+  if [[ -z "$_lanip" && -f "${ROOT_DIR}/services/comfyui/comfyui-paths.sh" ]]; then
+    _lanip="$(bash -c ". '${ROOT_DIR}/services/comfyui/comfyui-paths.sh' >/dev/null 2>&1; c3_lan_ip" 2>/dev/null || true)"
+  fi
+  _lanip="${_lanip:-localhost}"
+  _port="${READY_URL#*://}"; _port="${_port#*:}"; _port="${_port%%/*}"
+  _served="$(curl -sf --max-time 3 "${READY_URL}" \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"][0]["id"])' 2>/dev/null || true)"
+  echo "[switch] ▶ API:  http://${_lanip}:${_port}/v1   (model: ${_served:-?} · OpenAI-compatible · no auth)"
 }
 
 # --- arg parsing ---

@@ -24,58 +24,34 @@ ZIMAGE_TEMPLATE = os.path.join(_HERE, 'workflows', 'z_image_turbo.json')        
 KREA_TEMPLATE = os.path.join(_HERE, 'workflows', 'krea2.json')                  # Krea 2 Turbo fp8 graph (aesthetic image, ~18GB; natural-language, 8-step cfg=1; Qwen3-VL-4B encoder type=krea2; needs ComfyUI >= v0.26.0)
 WAN_TEMPLATE = os.path.join(_HERE, 'workflows', 'wan22_rapid.json')             # Wan2.2-Rapid-AllInOne Mega NSFW Q8 GGUF graph (uncensored video, t2v; umt5 encoder, euler_ancestral/beta 4-step cfg=1 distill-baked)
 WAN_I2V_TEMPLATE = os.path.join(_HERE, 'workflows', 'wan22_rapid_i2v.json')      # Wan2.2-Rapid i2v graph (WanImageToVideo start_image → animate an attached still)
+
+# Production director's behavioral spec (persona / capabilities / how to chat) — editable source
+# of truth, baked into the pipe at build time (everything after the '---' marker is the prompt).
+DIRECTOR_AGENTS = os.path.join(_HERE, 'director', 'AGENTS.md')
+with open(DIRECTOR_AGENTS) as _f:
+    # wrap in a 1-element array so the injected literal starts with '[' (not a bare '"' that would
+    # collide with the r\"\"\"...\"\"\" wrapper); the template indexes [0] back out.
+    DIRECTOR_MD = json.dumps([_f.read().split('\n---\n', 1)[-1].strip()])
+
+# Pure conversation-intent classifiers — the SOURCE OF TRUTH lives in director_intent.py
+# (stdlib-only, unit-tested offline). Its source is injected verbatim at module level so the
+# deployed pipe and the tests can't drift. Strip the module docstring/import header below the
+# marker — only the functions/constants are injected (the template already `import re`).
+INTENT_SRC = open(os.path.join(_HERE, 'director_intent.py')).read()
+
 OUT_PATH = os.path.join(_HERE, 'studio_pipe.py')
 
-def build(dit, audio_vae, video_vae, connectors, width, height, frames=121, lora=None):
-    wf = json.load(open(TEMPLATE))
-    wf['3']['inputs']['unet_name'] = dit
-    wf['1']['inputs']['vae_name'] = audio_vae
-    wf['2']['inputs']['vae_name'] = video_vae
-    wf['47']['inputs']['clip_name2'] = connectors
-    wf['7']['inputs']['width'] = width; wf['7']['inputs']['height'] = height
-    wf['8']['inputs']['scale_by'] = 1.0          # output res == base res (no upscaler stage)
-    wf['10']['inputs']['value'] = frames
-    if lora:                                     # distill LoRA -> dev DiT runs single-stage 8-step cfg=1
-        wf['50'] = {"class_type": "LoraLoaderModelOnly",
-                    "inputs": {"model": ["3", 0], "lora_name": lora, "strength_model": 1.0}}
-        wf['18']['inputs']['model'] = ["50", 0]  # CFGGuider reads the LoRA'd model
-    return wf
+# LTX-family video graphs (LTX-2.3 · Sulphur · 10Eros, t2v + i2v) are built from the SHARED
+# recipe in production/ltx_workflows.py, which the Production executor also uses at render time
+# (one source of truth — the interactive lanes + the production executor can't drift). The
+# script's own dir (services/studio) is on sys.path, so `production` is importable.
+import sys as _sys
+if _HERE not in _sys.path:
+    _sys.path.insert(0, _HERE)
+from production import ltx_workflows   # noqa: E402
 
-def i2v_insert(wf, base_longer_edge):
-    """Insert LoadImage->resize->preprocess->ImgToVideoInplace, conditioning the base video latent (node 14) on an image."""
-    wf = json.loads(json.dumps(wf))
-    wf['100'] = {"class_type": "LoadImage", "inputs": {"image": "__STUDIO_IMAGE__"}}
-    wf['101'] = {"class_type": "ResizeImagesByLongerEdge", "inputs": {"images": ["100", 0], "longer_edge": base_longer_edge}}
-    wf['102'] = {"class_type": "LTXVPreprocess", "inputs": {"image": ["101", 0], "img_compression": 35}}
-    wf['103'] = {"class_type": "LTXVImgToVideoInplace",
-                 "inputs": {"vae": ["2", 0], "image": ["102", 0], "latent": ["14", 0], "strength": 1.0, "bypass": False}}
-    wf['15']['inputs']['video_latent'] = ["103", 0]   # rewire concat: empty latent -> image-conditioned latent
-    return wf
-
-LTX_DIT      = 'ltx2.3/distilled-1.1/ltx-2.3-22b-distilled-1.1-Q8_0.gguf'
-SUL_DIT      = 'sulphur-2/sulphur_dev-Q8_0.gguf'
-EROS_DIT     = '10eros/10Eros_v1-Q8_0.gguf'
-DISTILL_LORA = 'ltx-2.3-22b-distilled-lora-384-1.1.safetensors'   # 22B distilled LoRA — shared by both dev lanes
-
-# LTX: pre-distilled checkpoint, distilled VAEs/connectors, no LoRA (already single-stage). 768x512 proven (00016).
-ltx_t2v = build(LTX_DIT,
-                'ltx-2.3-22b-distilled_audio_vae.safetensors', 'ltx-2.3-22b-distilled_video_vae.safetensors',
-                'ltx-2.3-22b-distilled_embeddings_connectors.safetensors', 768, 512)
-# Uncensored dev lanes (both LTX-2.3-22B-dev) -> dev VAEs/connectors + the shared distill LoRA,
-# single-stage 8-step cfg=1, 1280x720. Two lanes so Sulphur and 10Eros can be compared directly.
-sul_t2v  = build(SUL_DIT,
-                 'ltx-2.3-22b-dev_audio_vae.safetensors', 'ltx-2.3-22b-dev_video_vae.safetensors',
-                 'ltx-2.3-22b-dev_embeddings_connectors.safetensors', 1280, 720, lora=DISTILL_LORA)
-eros_t2v = build(EROS_DIT,
-                 'ltx-2.3-22b-dev_audio_vae.safetensors', 'ltx-2.3-22b-dev_video_vae.safetensors',
-                 'ltx-2.3-22b-dev_embeddings_connectors.safetensors', 1280, 720, lora=DISTILL_LORA)
 WF = {
-    "ltx-t2v": ltx_t2v,
-    "ltx-i2v": i2v_insert(ltx_t2v, 768),
-    "sulphur-t2v": sul_t2v,
-    "sulphur-i2v": i2v_insert(sul_t2v, 1280),
-    "10eros-t2v": eros_t2v,
-    "10eros-i2v": i2v_insert(eros_t2v, 1280),
+    **ltx_workflows.build_workflows(),   # ltx/sulphur/10eros × t2v+i2v
     # Image lane: Ideogram-4 fp8 (DualModelGuider, native nodes). Single-device GPU0,
     # coexists with the director on GPU0 at <=1024^2 (2048^2 would OOM — capped in pipe).
     "image": json.load(open(IMAGE_TEMPLATE)),
@@ -109,7 +85,7 @@ PIPE = r'''
 """
 title: Studio (text/image -> video · image · music)
 author: club-3090
-description: Type a rough idea — the studio director (qwen) crafts it and generates. Video: LTX (video+audio) or Sulphur/10Eros (uncensored, text->video or attach an image, with optional voiceover) or Wan2.2 (uncensored, text->video). Image: HiDream-O1 (top quality), Ideogram-4 (design/logo/photo/text), Chroma (uncensored), Z-Image (uncensored, fast), or Krea 2 (aesthetic). Music: ACE-Step (songs + instrumentals). SFX: Stable Audio (sound effects + ambient). Voice: Step-Audio-EditX (premium cloned voice + emotion/style). Refine anytime by just saying what to change.
+description: Type a rough idea — the studio director (qwen) crafts it and generates. Production: type a brief and the 4B director plans + renders a whole short film (keyframes → video → narration → music → assembly into one MP4) — pick the stack (video/keyframe model, continuity, music) in the lane's ⚙️ valves or leave it on Auto. Video: LTX (video+audio) or Sulphur/10Eros (uncensored, text->video or attach an image, with optional voiceover) or Wan2.2 (uncensored, text->video). Image: HiDream-O1 (top quality), Ideogram-4 (design/logo/photo/text), Chroma (uncensored), Z-Image (uncensored, fast), or Krea 2 (aesthetic). Music: ACE-Step (songs + instrumentals). SFX: Stable Audio (sound effects + ambient). Voice: Step-Audio-EditX (premium cloned voice + emotion/style). Refine anytime by just saying what to change.
 required_open_webui_version: 0.5.0
 version: 0.14.0
 """
@@ -146,6 +122,10 @@ import json, time, base64, re, math, urllib.request, urllib.parse, urllib.error,
 from pydantic import BaseModel, Field
 
 WORKFLOWS = json.loads(r"""__WF_JSON__""")
+
+# ── conversation-intent classifiers (injected from services/studio/director_intent.py) ──
+__INTENT_SRC__
+# ── end injected intent classifiers ──
 
 class Pipe:
     class Valves(BaseModel):
@@ -187,11 +167,24 @@ class Pipe:
         voice_url: str = Field(default="http://host.docker.internal:8193", description="Studio premium-voice service (Step-Audio-EditX, isolated container, transformers 4.53.3). Zero-shot clone + emotion/style editing. GPU — bring up on demand (docker compose -f services/studio/step-voice/docker-compose.yml up -d). If unreachable, the voice lane errors.")
         voice_reference: str = Field(default="Narrator.wav", description="Default reference voice the lane clones — a bundled sample name (Narrator.wav / Narrator-UK.wav / Pirates.wav) or an absolute path inside the service. Replace with your own 10–30 s clean clip to clone your voice.")
         hide_unavailable_lanes: bool = Field(default=True, description="Only list lanes whose backend is currently reachable — ComfyUI (:8188) for every media lane, the voice service (:8193) for the voice lane. When the ai-studio scene is down, the Studio lanes drop out of the OWUI model picker instead of listing-but-erroring. Set false to always list all lanes regardless of backend state.")
+        # ── Production lane (the Director: brief → planned → finished film) ──────
+        production_url: str = Field(default="http://host.docker.internal:8195", description="Studio Production service (the host-side wrapper around the 4B director + executor). The 🎬 Production lane is a thin client over it; gated by /produce/health. Bring it up on the host: python3 -m services.studio.production.server")
+        production_timeout_s: int = Field(default=1800, description="Min wait for a production to finish; the lane auto-extends this by the shot count (~3.5 min/shot) so a long film doesn't time out. Polls progress until done / error / this budget.")
+        production_shots: int = Field(default=0, description="Shot count. 0 (default) = SIZE it from the brief's stated duration (~5s/shot, e.g. “1 minute” → ~12 shots), else 4 when no length is given. Set >0 to force an exact count.")
+        # Two-level UX: leave these 'auto' for the visible default stack (Wan · Chroma ·
+        # storyboard), or PIN one to override. The director plans shot content within the
+        # chosen stack — it never silently picks the video/image model.
+        production_video_lane: str = Field(default="auto", description="Video model for every shot — ALL render in the production executor. 'auto' = wan (832×480, no native audio). ltx = LTX-2.3 base (768×512, 24fps). sulphur / 10eros = uncensored LTX-2.3 dev fine-tunes (1280×720). LTX-family clips carry native audio, but the film's soundtrack is the narration + music layer.")
+        production_keyframe_lane: str = Field(default="auto", description="Image model for continuity keyframes (tiers). 'auto' = chroma (conservative default). chroma/zimage = fast everyday (zimage = fastest, 8-step turbo); hidream = quality / hero frames (slow ~1 min/kf, native 2560×1440 — but Wan downscales to 832×480, so reserve it for hero frames, not everyday iteration); krea = aesthetic / stylized. (Ideogram is a title-card/design lane, not a continuity keyframe lane.)")
+        production_continuity: str = Field(default="storyboard", description="storyboard (per-shot keyframes + shared style bible, DEFAULT) · hero (one shared keyframe) · chain (i2v from prev frame) · none (independent t2v).")
+        production_music: bool = Field(default=True, description="Add an ACE-Step music bed under the film. Off = narration + visuals only.")
 
     # Lane catalog — (id, picker label, backend that must be live to serve it).
     #   "comfy" → ComfyUI (:8188), gates every image/video/music/SFX lane.
     #   "voice" → Step-Audio-EditX (:8193), an on-demand service, gates the voice lane.
+    #   "production" → the Production service (:8195), gates the Director lane.
     _LANES = [
+        ("production", "\U0001F3AC Studio · Production (Director · brief → finished film)",         "production"),
         ("ltx",     "\U0001F3AC Studio · Video (LTX-2.3 · +synced audio · text or image)",        "comfy"),
         ("sulphur", "\U0001F513 Studio · Video (Sulphur · uncensored · text or image)",           "comfy"),
         ("10eros",  "\U0001F513 Studio · Video (10Eros · uncensored · text or image)",            "comfy"),
@@ -232,6 +225,7 @@ class Pipe:
         self._live_cache = {
             "comfy": self._alive(self.valves.comfyui_url, "/system_stats"),
             "voice": self._alive(self.valves.voice_url, "/"),
+            "production": self._alive(self.valves.production_url, "/produce/health"),
         }
         self._live_ts = now
         return self._live_cache
@@ -352,6 +346,11 @@ class Pipe:
         "Output ONLY the final sound prompt — no preamble, no quotes."
     )
 
+    # The 🎬 Production lane's conversational voice (greetings, "what options?", nudging toward a
+    # brief). The behavioral spec is the editable source of truth in director/AGENTS.md — the build
+    # bakes its body in here (the pipe runs in-container and can't read the repo at runtime).
+    DIRECTOR_PRODUCER_SYS = json.loads(r"""__DIRECTOR_MD__""")[0]
+
     # HiDream-O1 takes rich NATURAL-LANGUAGE prompts (Qwen3-VL text understanding). The Dev-2604
     # build runs CFG-off (no negative prompt), so everything must live in the positive description.
     DIRECTOR_HIDREAM_SYS = (
@@ -469,6 +468,42 @@ class Pipe:
         if t[:5].upper() == "CHAT:":
             return t[5:].strip() or "Tell me what you'd like to create and I'll generate it."
         return None
+
+    def _produce_reply(self, user_msg, plan_ctx=""):
+        """Natural studio-director chat for the 🎬 Production lane — greetings + questions like
+        'what other options do we have?' get a real answer, not a canned re-dump. Returns plain
+        prose; raises on director error so the caller can fall back to a static line."""
+        u = ("Current plan: " + plan_ctx + "\n\n" if plan_ctx else "") + "User: " + user_msg
+        body = json.dumps({"model": self.valves.chat_model,
+                           "messages": [{"role": "system", "content": self.DIRECTOR_PRODUCER_SYS},
+                                        {"role": "user", "content": u}],
+                           "max_tokens": 220, "temperature": 0.7,
+                           "chat_template_kwargs": {"enable_thinking": False}}).encode()
+        req = urllib.request.Request(self.valves.chat_url + "/chat/completions", data=body,
+                                     headers={"Content-Type": "application/json"})
+        return json.load(urllib.request.urlopen(req, timeout=120))["choices"][0]["message"]["content"].strip()
+
+    def _classify(self, turns, plan_ctx=""):
+        """Batch-2 LLM intent controller (blocking; call via run_in_executor).
+
+        Reads the whole conversation and returns a validated decision dict
+        {intent, brief, stack_patch, confirm, reply}, or None on any failure (→ the caller
+        falls back to the Batch-1 keyword heuristics). build_controller_system /
+        parse_controller_json / normalize_decision are injected from director_intent.py."""
+        convo = "\n".join("User: " + t for t in turns[-10:])
+        u = (("Current plan: " + plan_ctx + "\n\n") if plan_ctx else "") + "Conversation:\n" + convo
+        body = json.dumps({"model": self.valves.chat_model,
+                           "messages": [{"role": "system", "content": build_controller_system()},
+                                        {"role": "user", "content": u}],
+                           "max_tokens": 320, "temperature": 0.0,   # deterministic intent across turns
+                           "chat_template_kwargs": {"enable_thinking": False}}).encode()
+        try:
+            req = urllib.request.Request(self.valves.chat_url + "/chat/completions", data=body,
+                                         headers={"Content-Type": "application/json"})
+            raw = json.load(urllib.request.urlopen(req, timeout=45))["choices"][0]["message"]["content"]
+            return normalize_decision(parse_controller_json(raw))
+        except Exception:
+            return None   # director unreachable / bad JSON → caller uses the keyword floor
 
     # ── long-clip (>15s) via the orchestrator: chain ~10s segments → one combined video ──
     def _target_seconds(self, text):
@@ -749,6 +784,269 @@ class Pipe:
         if ("### Task:" in _lastu or "### Chat History:" in _lastu or "### Guidelines:" in _lastu
                 or "<chat_history>" in _lastu or "autocompletion" in _lastu.lower()):
             return ""   # OWUI internal task prompt, not a user generation request — do not render
+
+        # ── PRODUCTION LANE (the Director: brief → planned → finished film) ─────────────────────────
+        # plan-then-execute (NOT a live tool-loop): POST the brief + the operator-chosen stack to the
+        # Production service (:8195), then poll job progress and stream it. The 4B plans a
+        # ProductionPlanV1 and a deterministic executor runs keyframes → video → narration → music →
+        # assembly into one MP4. The stack (video/keyframe model, continuity, music) is chosen in the
+        # lane's ⚙️ valves — Auto by default, overridable — and never silently picked by the director.
+        if "production" in model:
+            loop = asyncio.get_event_loop()
+            # QUALIFY → CONFIRM → BUILD. The conversation is the state: gather the user turns,
+            # resolve a plan, PROPOSE it (models · length→shots · est. time), and only build once
+            # the user says "go". Never fire a render straight off a brief (or a greeting).
+            users = []
+            for m in body.get("messages", []):
+                if m.get("role") == "user":
+                    c = m.get("content")
+                    t = (" ".join(p.get("text", "") for p in c if isinstance(p, dict) and p.get("type") == "text").strip()
+                         if isinstance(c, list) else (c or "").strip())
+                    if t:
+                        users.append(t)
+            last = users[-1] if users else ""
+            _help = ("\U0001F3AC Tell me what film to make — a one-line brief like "
+                     "“a 1-minute documentary on the history of Pakistan” or “a 15s noir detective short”. "
+                     "I'll size it, show you the plan (models · length · render time), and build it once "
+                     "you say **go**.")
+            if not last:
+                return _help
+
+            # intent classifiers are injected at module level from director_intent.py (stdlib-only,
+            # unit-tested offline; the bake keeps the deployed pipe and the tests in sync). Thin
+            # local aliases keep the rest of this method unchanged.
+            _is_confirm = is_confirm
+            _is_greeting = is_greeting
+            _is_question = is_question
+            def _overrides(t):
+                tl = t.lower(); words = set(re.findall(r"[a-z0-9\-]+", tl)); o = {}
+                for k in ("10eros", "sulphur", "ltx", "wan"):
+                    if k in words:
+                        o["video_lane"] = k; break
+                for k, v in (("hidream", "hidream"), ("z-image", "zimage"), ("zimage", "zimage"),
+                             ("chroma", "chroma"), ("krea", "krea")):
+                    if k in words:
+                        o["keyframe_lane"] = v; break
+                for cc in ("storyboard", "hero", "chain"):
+                    if cc in words:
+                        o["continuity"] = cc
+                if "no continuity" in tl or "independent" in words:
+                    o["continuity"] = "none"
+                if "no music" in tl or "without music" in tl:
+                    o["music"] = False
+                if "no narration" in tl or "no voice" in tl or "no voiceover" in tl:
+                    o["narration"] = False
+                # web research toggle (documentary grounding) — opt-in; "dig"/"search"/"research"
+                if ("research" in words or "dig" in words or "search" in words
+                        or "look it up" in tl or "find facts" in tl):
+                    o["research"] = True
+                if ("no research" in tl or "without research" in tl or "don't search" in tl
+                        or "skip research" in tl or "no search" in tl):
+                    o["research"] = False
+                s = self._target_seconds(t)
+                if s:
+                    o["seconds"] = s
+                return o
+            def _pure_override(t):
+                return bool(_overrides(t)) and len(t.split()) <= 5
+
+            # ── FLOOR (Batch 1): deterministic keyword heuristics — the fallback when the LLM is down.
+            # A GENERATION REQUEST ("can you make a 30s noir short?") counts as a brief even though
+            # it's question-shaped (Codex F1, 2026-06-29).
+            brief_kw = pick_brief(users, _pure_override)
+            ov = {}
+            for t in users:
+                ov.update(_overrides(t))         # accumulate explicit tweaks across the convo (later wins)
+            confirm_kw = _is_confirm(last)
+
+            # ── CONTROLLER (Batch 2): the 4B reads the WHOLE conversation and returns a structured
+            # decision {intent, brief, stack_patch(lanes), confirm, reply}. It REFINES the floor —
+            # a mid-chat brief change ("actually make it a bookstore promo"), a compound confirm
+            # ("go with ltx"), a natural question — and FALLS BACK to the floor on any failure. A
+            # render starts only when the decision says confirm AND the latest turn carries a real
+            # confirm word (has_confirm_word) — never on the LLM's say-so alone (Codex F1/F2/F3).
+            _pshots = max(1, math.ceil(ov["seconds"] / 5.0)) if ov.get("seconds") else 0
+            _prelim_ctx = "film so far: %s; video=%s%s" % (
+                brief_kw or "(none described yet)",
+                ov.get("video_lane") or (self.valves.production_video_lane or "auto"),
+                (", ~%d shots" % _pshots) if _pshots else "")
+            _decision = await loop.run_in_executor(None, self._classify, users, _prelim_ctx)
+            if _decision:
+                # The LLM is the DRIVER — trust its read of the conversation (brief, intent, reply).
+                # The keyword floor is NOT consulted for the brief; it only supplies the explicit
+                # stack toggles the user typed ("use ltx", "no music", "research") the LLM might miss.
+                # Brief extraction is the LLM's job — that's what the controller prompt is for.
+                brief = _decision["brief"]
+                intent = _decision["intent"]
+                llm_reply = _decision["reply"]
+                for _k, _v in _decision["stack_patch"].items():
+                    ov.setdefault(_k, _v)        # explicit keyword toggles win; the LLM fills gaps
+                # render is irreversible → fire on a BARE confirm ("go", "ok do it") or an
+                # LLM-confirmed compound ("go with ltx"), ALWAYS gated by a real go-word (safety latch).
+                confirmed = confirm_kw or (_decision["confirm"] and has_confirm_word(last))
+            else:
+                # LLM unreachable → minimal keyword fallback (the 4B planner is down too, so this
+                # mostly keeps the lane honest until the director is back — it never guesses a brief
+                # from a confirm phrase).
+                brief = brief_kw
+                confirmed = confirm_kw
+                intent = ("confirm" if confirm_kw
+                          else "question" if (_is_question(last) and last != brief_kw and not _overrides(last))
+                          else "stack" if (last == brief_kw or _overrides(last)) else "smalltalk")
+                llm_reply = None
+
+            video = ov.get("video_lane") or (self.valves.production_video_lane or "auto")
+            keyf = ov.get("keyframe_lane") or (self.valves.production_keyframe_lane or "auto")
+            cont = ov.get("continuity") or (self.valves.production_continuity or "auto")
+            music = ov.get("music", bool(self.valves.production_music))
+            narr = ov.get("narration", True)
+            secs = ov.get("seconds") or 0
+            if secs:
+                shots = max(1, min(24, math.ceil(secs / 5.0)))  # ~5s/shot, capped ~2 min. ceil (NOT
+                #   round) — must match production.planner.derive_shots so the proposal == what /produce builds.
+            elif int(self.valves.production_shots or 0) > 0:
+                shots = int(self.valves.production_shots)
+            else:
+                shots = 4                                       # no stated length → a short default
+            est_lo, est_hi = int(round(shots * 2.5)), int(round(shots * 3)) + 3
+            research = bool(ov.get("research", False))   # documentary web-research, opt-in
+            is_doc = looks_documentary(brief)            # offer research only for factual briefs
+
+            # the plan proposal card (shown when there's a new / changed plan to confirm)
+            _audio_txt = ("narration + music" if (narr and music) else "narration only" if narr
+                          else "music only" if music else "silent")
+            _plan_ctx = ("video=%s, keyframes=%s, continuity=%s, audio=%s, ~%d shots"
+                         % (video, keyf, cont, _audio_txt, shots))
+            def _proposal():
+                _vl = {"auto": "Wan2.2 (auto)", "wan": "Wan2.2", "ltx": "LTX-2.3",
+                       "sulphur": "Sulphur (uncensored)", "10eros": "10Eros (uncensored)"}.get(video, video)
+                _kl = {"auto": "Chroma (auto)", "chroma": "Chroma", "zimage": "Z-Image",
+                       "krea": "Krea 2", "hidream": "HiDream-O1"}.get(keyf, keyf)
+                _audio = ("narration" if narr else "no narration") + " + " + ("music" if music else "no music")
+                _len = ("~%ds → %d shots" % (int(secs), shots)) if secs else \
+                       ("%d shots (~%ds — say a length like “1 minute” to size it)" % (shots, shots * 5))
+                _research_row = ("| \U0001F50E research | **on** — real web facts ground the script |\n"
+                                 if (is_doc and research) else "")
+                _research_offer = ("\n\n\U0001F50E _This looks like a documentary — reply **research** to "
+                                   "ground the shots in real web facts (recommended for accuracy), or just "
+                                   "**go** to use what I already know._" if (is_doc and not research) else "")
+                return (
+                    "\U0001F3AC **Plan — " + brief + "**\n\n"
+                    "| | |\n|---|---|\n"
+                    "| \U0001F3A5 video | **" + _vl + "** |\n"
+                    "| \U0001F5BC️ keyframes | **" + _kl + "** |\n"
+                    "| \U0001F39E️ continuity | **" + str(cont) + "**  ·  \U0001F50A audio **" + _audio + "** |\n"
+                    "| ⏱️ length | **" + _len + "** |\n"
+                    + _research_row +
+                    "| ⚙️ est. render | **~" + str(est_lo) + "–" + str(est_hi) + " min** on 1× 3090 |\n\n"
+                    "Reply **go** to start — or tell me what to change: _“use LTX” · “sulphur” · "
+                    "“30 seconds” · “no music” · “hidream keyframes” · “hero continuity”_."
+                    + _research_offer +
+                    "\n\n_(Video: Wan2.2 · LTX-2.3 · Sulphur · 10Eros — all render. LTX-family lanes "
+                    "use their own resolution; the film's audio is the narration + music layer.)_"
+                )
+
+            async def _chat(msg, ctx):
+                await status("", True)
+                try:
+                    return "\U0001F3AC " + await loop.run_in_executor(None, self._produce_reply, msg, ctx)
+                except Exception:
+                    return None   # director unreachable
+
+            # route the resolved turn → ONE action (tested: director_intent.decide_action).
+            action = decide_action(brief, confirmed, intent)
+            if action == "need_brief":
+                return ("Nothing to start yet — give me a one-line brief first, e.g. "
+                        "“a 1-minute documentary on the history of Pakistan”.")
+            if action == "chat":
+                # the LLM's own reply when it has one, else a fresh director chat call; the static
+                # fallback is the plan card (if we have a brief) or the help line.
+                return llm_reply or (await _chat(last, _plan_ctx if brief else "")) or \
+                    (_proposal() if brief else _help)
+            if action == "proposal":
+                await status("", True)
+                return _proposal()
+            # action == "build" → fall through to the resolved-plan build below
+
+            # CONFIRMED + have a brief → build with the resolved plan
+            await status("\U0001F3AC Starting “" + brief + "” — " + str(shots) + " shots, ~" +
+                         str(est_lo) + "–" + str(est_hi) + " min…")
+            base_prod = self.valves.production_url.rstrip("/")
+            payload = {"brief": brief, "shots": shots, "video_lane": video, "keyframe_lane": keyf,
+                       "continuity": cont, "music": music, "narration": narr, "research": research}
+
+            def _prod_post():
+                req = urllib.request.Request(base_prod + "/produce", data=json.dumps(payload).encode(),
+                                             headers={"Content-Type": "application/json"})
+                try:
+                    return 200, json.load(urllib.request.urlopen(req, timeout=30))
+                except urllib.error.HTTPError as e:
+                    try:
+                        return e.code, json.load(e)
+                    except Exception:
+                        return e.code, {"error": "HTTP " + str(e.code)}
+
+            await status("\U0001F3AC Director planning the production…")
+            try:
+                code, resp = await loop.run_in_executor(None, _prod_post)
+            except Exception as e:
+                await status("Failed", True)
+                return ("⚠️ Could not reach the Production service at " + base_prod +
+                        " — bring it up on the host: `python3 -m services.studio.production.server`\n\n" + str(e))
+            if code == 409:
+                await status("Busy", True)
+                return "⏳ A production is already running (one film at a time). Try again when it finishes."
+            if code != 200:
+                await status("Rejected", True)
+                rt = resp.get("renders_today") or {}
+                extra = ("\n\nRenders today — video: " + ", ".join(rt.get("video", [])) +
+                         " · keyframes: " + ", ".join(rt.get("keyframe", []))) if rt else ""
+                return "⚠️ " + str(resp.get("error", "stack rejected")) + extra
+            job_id = resp.get("job_id", "")
+            st = resp.get("stack", {})
+            stack_line = ("**Stack** — video: `" + str(st.get("video_lane")) + "` · keyframes: `" +
+                          str(st.get("keyframe_lane")) + "` · continuity: `" + str(st.get("continuity")) +
+                          "` · " + ("music on" if st.get("music") else "no music"))
+            deadline = time.time() + max(int(self.valves.production_timeout_s), shots * 210 + 300)
+            last_phase = ""
+            job = {}
+            while time.time() < deadline:
+                await asyncio.sleep(5)
+
+                def _prod_get():
+                    try:
+                        return json.load(urllib.request.urlopen(base_prod + "/job/" + job_id, timeout=30))
+                    except Exception:
+                        return {}
+
+                job = await loop.run_in_executor(None, _prod_get)
+                phase = job.get("phase", "")
+                pct = int(round(float(job.get("frac", 0.0)) * 100))
+                title = job.get("title") or "…"
+                if phase and phase != last_phase:
+                    await status("\U0001F3AC " + title + " — " + phase + " (" + str(pct) + "%)")
+                    last_phase = phase
+                if job.get("status") in ("done", "error"):
+                    break
+            if job.get("status") == "error":
+                await status("Failed", True)
+                return "⚠️ Production failed: " + str(job.get("error", "unknown error")) + "\n\n" + stack_line
+            if job.get("status") != "done":
+                await status("Timed out", True)
+                return ("⏱️ Production didn't finish within " + str(self.valves.production_timeout_s) +
+                        "s — it may still be rendering. Check the gallery: " +
+                        self.valves.browser_base.rstrip("/") + "/\n\n" + stack_line)
+            await status("Done", True)
+            base = self.valves.browser_base.rstrip("/")
+            gurl = base + "/" + str(job.get("gallery_url", "")).lstrip("/")
+            title = job.get("title") or "Production"
+            return ("**\U0001F3AC Studio · Production — " + title + "**\n\n" + stack_line + "\n\n"
+                    "<video src=\"" + gurl + "\" controls width=\"640\"></video>\n\n"
+                    "\U0001F3AC **[Open / download the film](" + gurl + ")**\n\n"
+                    "_The 4B director planned it, then the executor ran keyframes → video → narration "
+                    "→ music → assembly. Want changes? Adjust the stack in ⚙️ valves and send "
+                    "the brief again._ _(Browse all media: " + base + "/ )_")
+
         if "music" in model:
             lane = "music"
         elif "sfx" in model:
@@ -1166,7 +1464,7 @@ class Pipe:
                 "_Want changes? Just say what to tweak — e.g. “more moody”, “make it night”, "
                 "“slower camera”, or “voiceover: …” — and I’ll re-craft from this and regenerate._ "
                 "_(Browse all media: " + base + "/ )_")
-'''.replace('__WF_JSON__', WF_JSON)
+'''.replace('__WF_JSON__', WF_JSON).replace('__DIRECTOR_MD__', DIRECTOR_MD).replace('__INTENT_SRC__', INTENT_SRC)
 
 open(OUT_PATH, 'w').write(PIPE)
 print("wrote %s (%d bytes; %d workflows (video: ltx/sulphur/10eros x t2v+i2v + wan · image x5: ideogram/chroma/hidream/zimage/krea · music · sfx) + narration + voice service)" % (OUT_PATH, len(PIPE), len(WF)))

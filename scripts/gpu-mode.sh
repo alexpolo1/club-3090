@@ -5,10 +5,17 @@
 
 set -e
 
-# club-3090 is the canonical repo (qwen36-dual-3090 + /opt/ai/compose/<svc>
-# both deprecated 2026-05-10 — supporting services moved into services/).
-CLUB3090_DIR="/opt/ai/github/club-3090"
+# Repo root: auto-detected from this script's real location (resolving the
+# /usr/local/bin/gpu-mode symlink on the reference rig), so the script is portable to
+# any clone. Override with CLUB3090_DIR=... if needed.
+CLUB3090_DIR="${CLUB3090_DIR:-$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)}"
 COMPOSE_BASE="$CLUB3090_DIR/services"
+# ComfyUI/studio paths derive from MODEL_DIR (see services/comfyui/comfyui-paths.sh) so the
+# ai-studio scene's compose mounts + missing-model check match wherever the user keeps models.
+if [ -f "$COMPOSE_BASE/comfyui/comfyui-paths.sh" ]; then
+    # shellcheck disable=SC1091
+    . "$COMPOSE_BASE/comfyui/comfyui-paths.sh"
+fi
 # Post-PR-A (<quant>/ layer): dual composes live under <topology>/<quant>/.
 # Point each var at the quant dir so `compose_at` cd's into it — mount-safe,
 # the same invocation switch.sh uses (project dir = compose-file dir).
@@ -40,6 +47,12 @@ YELLOW='\033[1;33m'
 RED='\033[0;31m'
 CYAN='\033[0;36m'
 NC='\033[0m' # No Color
+
+# LAN IP for the URLs printed by the mode banners below — via the shared c3_lan_ip helper
+# (prefers LAN over docker bridges; LANIP=-overridable), so it can't drift from setup-ai-
+# studio.sh. Falls back to 'localhost' so a fresh clone never prints the rig's IP (#504).
+LANIP="${LANIP:-$(c3_lan_ip 2>/dev/null || true)}"
+LANIP="${LANIP:-localhost}"
 
 # Standard supporting services living under $CLUB3090_DIR/services.
 # Ollama removed 2026-06-22 (dropped from serving 2026-05-10 — Qwen/Gemma route
@@ -171,6 +184,9 @@ stop_gemma_12b() {
 # GPU-bound — mutex with all vLLM / SGLang / llama-server LLM serving.
 start_comfyui() {
     printf "  ${GREEN}▲${NC} Starting comfyui..."
+    # Pin COMFYUI_ROOT into repo-root .env so the compose's `--env-file` mounts the SAME tree the
+    # downloads went into (not the /mnt default) on any rig whose MODEL_DIR isn't /mnt — #510/#530.
+    type c3_persist_comfy_root >/dev/null 2>&1 && c3_persist_comfy_root || true
     compose_at "$COMPOSE_BASE/comfyui" "up -d" && echo "done" || echo "failed"
 }
 stop_comfyui() {
@@ -224,6 +240,27 @@ stop_studio_director() {
 # director uses no GPU, so it STAYS UP across scenes — the always-on uncensored model in OWUI.
 _director_evict_if_gpu() {
     [ "$(_director_device)" != "cpu" ] && stop_studio_director
+}
+# `docker compose down` returns before CUDA actually releases the GPU memory, so the
+# next model scene can boot into not-yet-freed VRAM and hit vLLM's free-memory check
+# (club-3090 #535: ai-studio → gemma). Poll until total used-VRAM stops falling (or a
+# timeout) so the incoming model sees the freed memory.
+wait_gpu_vram_settle() {
+    command -v nvidia-smi >/dev/null 2>&1 || return 0
+    local timeout="${1:-20}" prev="" cur stable=0 waited=0 noted=0
+    while [ "$waited" -lt "$timeout" ]; do
+        cur=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | awk '{s+=$1} END{print s+0}')
+        [ -z "$cur" ] && return 0
+        if [ -n "$prev" ] && [ "$cur" -ge "$prev" ]; then
+            stable=$((stable+1)); [ "$stable" -ge 2 ] && { [ "$noted" = 1 ] && echo "done"; return 0; }
+        else
+            if [ "$noted" = 0 ] && [ -n "$prev" ]; then printf "  ${YELLOW}◔${NC} waiting for the previous scene's GPU VRAM to release..."; noted=1; fi
+            stable=0
+        fi
+        prev="$cur"; sleep 1; waited=$((waited+1))
+    done
+    [ "$noted" = 1 ] && echo "timeout"
+    return 0
 }
 start_studio_orchestrator() {
     printf "  ${GREEN}▲${NC} Starting studio-orchestrator (:8190, long-clip chaining)..."
@@ -474,7 +511,7 @@ mode_chat() {
     start_service searxng
     start_studio_director
     echo ""
-    echo -e "${GREEN}Chat mode active.${NC} Open WebUI: http://192.168.86.33:8080"
+    echo -e "${GREEN}Chat mode active.${NC} Open WebUI: http://$LANIP:8080"
     echo -e "${YELLOW}Director placement: $(_director_device) (change in c3 Settings · Director placement).${NC}"
     echo -e "${YELLOW}Plug in catalog models: bash scripts/switch.sh --owui <variant>  (registers it into OWUI here).${NC}"
 }
@@ -494,13 +531,14 @@ mode_27b() {
     stop_27b_dual_dflash
     stop_27b_dual_dflash_noviz
     stop_27b_dual_turbo
+    wait_gpu_vram_settle     # let the torn-down scene's VRAM release before TP=2 boots (#535 follow-up)
     start_27b_dual_mtp
     start_service litellm
     start_service qdrant
     start_service openwebui
     start_service searxng
     echo ""
-    echo -e "${GREEN}27B dual-card MTP mode active.${NC} API: http://192.168.86.33:8010"
+    echo -e "${GREEN}27B dual-card MTP mode active.${NC} API: http://$LANIP:8010"
     echo -e "${YELLOW}Per-stream: 68 narr / 89 code TPS short, 36 TPS @ 100K, 28 TPS @ 200K warm.${NC}"
     echo -e "${YELLOW}2 concurrent streams. KV pool 168K, max concurrency 2.36× at full 262K.${NC}"
     echo -e "${YELLOW}Vision + tools + thinking + 262K ctx all working. Boot ~3-4 min.${NC}"
@@ -520,13 +558,14 @@ mode_35b_a3b() {
     stop_step_voice
     _director_evict_if_gpu
     stop_diffusiongemma
+    wait_gpu_vram_settle     # let the torn-down scene's VRAM release before TP=2 boots (#535 follow-up)
     start_35b_a3b_dual
     start_service litellm
     start_service qdrant
     start_service openwebui
     start_service searxng
     echo ""
-    echo -e "${GREEN}35B-A3B dual-card mode active.${NC} API: http://192.168.86.33:8051"
+    echo -e "${GREEN}35B-A3B dual-card mode active.${NC} API: http://$LANIP:8051"
     echo -e "${YELLOW}MoE: 3B active / 35B total — ~178/174 TPS, 262K ctx, vision. Boot ~3-4 min.${NC}"
     echo -e "${YELLOW}Tail: sudo docker logs -f vllm-qwen36-35b-a3b-dual${NC}"
 }
@@ -545,13 +584,14 @@ mode_gemma_12b() {
     stop_step_voice
     _director_evict_if_gpu
     stop_diffusiongemma
+    wait_gpu_vram_settle     # single-card boot can still land in another scene's residue (#535 follow-up)
     start_gemma_12b
     start_service litellm
     start_service qdrant
     start_service openwebui
     start_service searxng
     echo ""
-    echo -e "${GREEN}Gemma 4 12B mode active.${NC} API: http://192.168.86.33:8038"
+    echo -e "${GREEN}Gemma 4 12B mode active.${NC} API: http://$LANIP:8038"
     echo -e "${YELLOW}gemma4_unified arch-preview image (EPHEMERAL tag — pin a digest before prod). Single card; the other GPU is free.${NC}"
     echo -e "${YELLOW}Tail: sudo docker logs -f vllm-gemma-4-12b-int8-mtp${NC}"
 }
@@ -573,13 +613,14 @@ mode_gemma_int8() {
     stop_step_voice
     _director_evict_if_gpu
     stop_gemma_int8          # clean re-switch; the dflash/awq gemma scenes were pruned
+    wait_gpu_vram_settle     # let the torn-down scene's VRAM release before TP=2 gemma boots (#535)
     start_gemma_int8
     start_service litellm
     start_service qdrant
     start_service openwebui
     start_service searxng
     echo ""
-    echo -e "${GREEN}Gemma 4 31B INT8 PTH mode active.${NC} API: http://192.168.86.33:8032"
+    echo -e "${GREEN}Gemma 4 31B INT8 PTH mode active.${NC} API: http://$LANIP:8032"
     echo -e "${YELLOW}Tail: sudo docker logs -f vllm-gemma-4-31b-mtp-int8${NC}"
 }
 mode_deckard() {
@@ -593,6 +634,7 @@ mode_deckard() {
     stop_comfyui
     stop_step_voice
     _director_evict_if_gpu
+    wait_gpu_vram_settle     # 31 GB GGUF layer-splits both cards — don't boot into residue (#535 follow-up)
     start_deckard
     start_service litellm
     start_service qdrant
@@ -605,7 +647,7 @@ mode_deckard() {
         bash "$CLUB3090_DIR/scripts/lib/owui-register.sh" 8199 || true
     fi
     echo ""
-    echo -e "${GREEN}Deckard-40B mode active.${NC} API: http://192.168.86.33:8199  (model: deckard-40b)"
+    echo -e "${GREEN}Deckard-40B mode active.${NC} API: http://$LANIP:8199  (model: deckard-40b)"
     echo -e "${YELLOW}MTP n=2: ~36 narr / 46 code TPS · 128K ctx @ q8_0 KV · uncensored, text-only.${NC}"
     echo -e "${YELLOW}First boot ~1-2 min (31 GB GGUF load + 128K KV alloc across both cards).${NC}"
     echo -e "${YELLOW}Tail: sudo docker logs -f llama-cpp-deckard-40b${NC}"
@@ -675,6 +717,7 @@ mode_ai_studio() {
     stop_35b_a3b_dual
     stop_all_gemma
     stop_diffusiongemma
+    wait_gpu_vram_settle     # ComfyUI checkpoints load into the just-freed cards (#535 follow-up)
     start_comfyui
     start_studio_director
     start_studio_gallery
@@ -688,9 +731,9 @@ mode_ai_studio() {
     start_service searxng
     echo ""
     echo -e "${GREEN}AI-studio mode active.${NC} — one scene; pick the lane in Open WebUI."
-    echo -e "  Open WebUI:  http://192.168.86.33:8080   (image · video · music · SFX · voice lanes)"
-    echo -e "  Gallery:     http://192.168.86.33:8189   (all generated media; survives ComfyUI down)"
-    echo -e "  ComfyUI:     http://192.168.86.33:8188   (full node graph / control)"
+    echo -e "  Open WebUI:  http://$LANIP:8080   (image · video · music · SFX · voice lanes)"
+    echo -e "  Gallery:     http://$LANIP:8189   (all generated media; survives ComfyUI down)"
+    echo -e "  ComfyUI:     http://$LANIP:8188   (full node graph / control)"
     echo -e "${YELLOW}First ComfyUI boot can take a few min (clones + node deps). Video DiT splits across both 3090s (DisTorch); image/audio lanes run on GPU0 beside the director.${NC}"
     echo -e "${YELLOW}GPU-mutex with the dual-card LLMs. Premium voice (step-audio-editx) is on-demand on GPU1 — mutually exclusive with an active video render.${NC}"
     echo -e "${YELLOW}Tail: sudo docker logs -f comfyui${NC}"
@@ -723,21 +766,21 @@ stop_estate() {
 }
 
 # --- GPU power-cap controls -------------------------------------------------
-# The rig normally runs both 3090s capped at 230W (quieter / cooler — see the
+# The rig normally runs both 3090s capped at 250W (quieter / cooler — see the
 # systemd unit below). The cap suppresses benchmark TPS, so maintainers need a
 # quick way to uncap to the hardware default for a true-TPS bench, then re-cap.
 #
-# `nvidia-power-cap.service` is the single source of truth for the 230W value
+# `nvidia-power-cap.service` is the single source of truth for the 250W value
 # AND re-applies it on every boot (Type=oneshot, RemainAfterExit=yes, enabled).
 # So `power-cap on` *restarts* that unit — `restart` (not `start`) is required:
 # the unit is already `active` from boot, and `systemctl start` on an
 # already-active RemainAfterExit oneshot is a no-op (it won't re-run ExecStart,
 # so the cap wouldn't actually re-apply after a `power-cap off`). `restart`
-# stops it (clearing RemainAfterExit) then re-runs both `-pl 230` ExecStart
+# stops it (clearing RemainAfterExit) then re-runs both `-pl 250` ExecStart
 # lines. `power-cap off` reads each card's Default Power Limit from nvidia-smi
 # (370W on GPU 0, 420W on GPU 1 here — they differ, so we never hardcode) and
 # applies it. `off` is session-scoped: a reboot OR a driver reload re-applies
-# 230W via the service. We never disable the service.
+# 250W via the service. We never disable the service.
 POWER_CAP_SERVICE="nvidia-power-cap.service"
 
 # Print per-GPU enforced / default / min / max power limits (one row per card).
@@ -772,7 +815,7 @@ mode_powercap() {
     # A numeric action = an explicit CUSTOM wattage applied to both cards (the
     # serve-cockpit power-cap menu's "custom" option).  Validated against each
     # card's [min,max] range; session-scoped like `off` (the boot service still
-    # re-applies 230W on reboot/reload).
+    # re-applies 250W on reboot/reload).
     if [[ "$action" =~ ^[0-9]+$ ]]; then
         echo -e "${CYAN}═══ Setting custom GPU power cap (${action}W) ═══${NC}"
         local cidx cmin cmax crc=0 capplied=0
@@ -798,24 +841,24 @@ mode_powercap() {
             exit 1
         fi
         echo -e "${GREEN}Custom cap ${action}W applied.${NC} ${YELLOW}Session-scoped — a reboot or driver"
-        echo -e "reload re-applies 230W via ${POWER_CAP_SERVICE}.${NC}"
+        echo -e "reload re-applies 250W via ${POWER_CAP_SERVICE}.${NC}"
         powercap_echo_enforced
         [ "$crc" -eq 0 ] || exit 1
         return
     fi
     case "$action" in
         on)
-            echo -e "${CYAN}═══ Re-applying GPU power cap (230W) ═══${NC}"
-            echo "Restarting ${POWER_CAP_SERVICE} (the boot-time 230W enforcer)."
+            echo -e "${CYAN}═══ Re-applying GPU power cap (250W) ═══${NC}"
+            echo "Restarting ${POWER_CAP_SERVICE} (the boot-time 250W enforcer)."
             # restart, not start — the unit is already active from boot, so
             # `start` is a no-op on a RemainAfterExit oneshot (won't re-run -pl).
             if sudo systemctl restart "$POWER_CAP_SERVICE" 2>/dev/null; then
                 echo -e "${GREEN}Power cap re-applied via systemd.${NC}"
             else
-                # Fallback: service missing/disabled — apply 230W directly.
-                echo -e "${YELLOW}systemctl restart failed; falling back to direct nvidia-smi -pl 230.${NC}" >&2
-                if ! { sudo nvidia-smi -i 0 -pl 230 && sudo nvidia-smi -i 1 -pl 230; }; then
-                    echo -e "${RED}✗ Failed to set 230W cap.${NC} Check sudo + driver state with: nvidia-smi -q -d POWER" >&2
+                # Fallback: service missing/disabled — apply 250W directly.
+                echo -e "${YELLOW}systemctl restart failed; falling back to direct nvidia-smi -pl 250.${NC}" >&2
+                if ! { sudo nvidia-smi -i 0 -pl 250 && sudo nvidia-smi -i 1 -pl 250; }; then
+                    echo -e "${RED}✗ Failed to set 250W cap.${NC} Check sudo + driver state with: nvidia-smi -q -d POWER" >&2
                     exit 1
                 fi
             fi
@@ -844,7 +887,7 @@ mode_powercap() {
                 exit 1
             fi
             echo -e "${GREEN}Uncapped to default.${NC} ${YELLOW}Session-scoped — a reboot or driver"
-            echo -e "reload re-applies 230W via ${POWER_CAP_SERVICE}. Run 'gpu-mode power-cap on' to re-cap now.${NC}"
+            echo -e "reload re-applies 250W via ${POWER_CAP_SERVICE}. Run 'gpu-mode power-cap on' to re-cap now.${NC}"
             powercap_echo_enforced
             [ "$rc" -eq 0 ] || exit 1
             ;;
@@ -870,6 +913,18 @@ mode_off() {
     stop_step_voice
     stop_studio_director     # full off stops even a CPU/always-on director
     stop_estate
+    # CATCH-ALL: the enumerated stop_* lists above cover the gpu-mode SCENES,
+    # but a catalog-launched engine (switch.sh <slug>, e.g. vllm/minimal) isn't
+    # in any of them — and 'off' promises "ALL services".  Stop every remaining
+    # engine-prefixed container so the next scene never boots into held VRAM
+    # (#535 class; caught live 2026-07-04 when off left vllm-qwen36-27b-minimal
+    # serving and the 27b TP=2 scene booted into its residue).
+    _stragglers=$(docker ps --format '{{.Names}}' 2>/dev/null \
+        | grep -E '^(vllm-|llama-cpp-|ik-llama-|sglang-|beellama-)' || true)
+    if [ -n "$_stragglers" ]; then
+        echo -e "  ${YELLOW}▼${NC} Stopping catalog-launched engine(s): $(echo "$_stragglers" | tr '\n' ' ')"
+        echo "$_stragglers" | xargs -r docker stop >/dev/null 2>&1 || true
+    fi
     for svc in "${SERVICES[@]}"; do
         stop_service "$svc"
     done
@@ -909,7 +964,7 @@ gemma12b	models	Gemma 4 12B AutoRound INT8 + bf16 KV + MTP n=2 (gemma4_unified a
 deckard	models	Qwen3.6-40B-Deckard Q6_K + MTP n=2 + q8_0 KV + 128K (llama.cpp, dual)	llama-cpp-deckard-40b,litellm,qdrant,openwebui,searxng	8199,8080,4000	both
 ai-studio	studio	image · video · audio · voice — ComfyUI both GPUs + qwen director + sidecars + Open WebUI (pick the lane in OWUI)	comfyui,studio-director,studio-gallery,studio-orchestrator,studio-image-shim,studio-tts,studio-step-voice,openwebui,litellm,qdrant,searxng	8188,8090,8189,8190,8191,8192,8193,8080,4000,6333	both
 off	ops	Stop all services	all-stopped		none
-power-cap	ops	GPU power-cap controls (on/off/status; both 3090s, 230W default cap)			both
+power-cap	ops	GPU power-cap controls (on/off/status; both 3090s, 250W default cap)			both
 prune	ops	docker image prune -a (safe — only unreferenced images)			none
 prune-all	ops	+ build cache (keep 5 GB) + dangling networks (volumes safe)			none
 TSV
@@ -990,10 +1045,10 @@ usage() {
     echo "  off                Stop all services"
     echo "  status             Show running services, GPU, RAM, disk, Docker disk"
     echo ""
-    echo "  GPU power cap (both 3090s; normally capped at 230W for quiet/cool operation):"
-    echo "  power-cap on       Re-apply the 230W cap (via nvidia-power-cap.service)"
+    echo "  GPU power cap (both 3090s; normally capped at 250W for quiet/cool operation):"
+    echo "  power-cap on       Re-apply the 250W cap (via nvidia-power-cap.service)"
     echo "  power-cap off      Uncap to hardware default for a true-TPS bench"
-    echo "                     (session-scoped — a reboot / driver reload re-caps at 230W)"
+    echo "                     (session-scoped — a reboot / driver reload re-caps at 250W)"
     echo "  power-cap <WATTS>  Apply a custom cap to both cards (e.g. 'power-cap 280';"
     echo "                     validated against each card's [min,max]; session-scoped)"
     echo "  power-cap status   Show per-GPU enforced / default / min / max power limits"

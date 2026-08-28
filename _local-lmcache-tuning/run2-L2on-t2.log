@@ -1,0 +1,35 @@
+[queue] run 1 (L2 on, thresh 8.0) exited 07:07:09
+LMCache L1 retention probe -> http://localhost:8017   model=qwen3.6-27b
+  sessions=8  target_tokens/session~=48000  warm_threshold=2.0s  kv=131KB/tok
+
+Building calibrated haystacks (one /tokenize probe each)...
+
+Round 1 - cold insert (fills L1):
+  session  1: cold TTFT    2.52s  (prompt_tokens=48173)
+  session  2: cold TTFT    1.87s  (prompt_tokens=48141)
+  session  3: cold TTFT    0.73s  (prompt_tokens=49197)
+  session  4: cold TTFT    1.28s  (prompt_tokens=46422)
+  session  5: cold TTFT    0.88s  (prompt_tokens=49274)
+  session  6: cold TTFT    2.39s  (prompt_tokens=50187)
+  session  7: cold TTFT    1.43s  (prompt_tokens=48045)
+  session  8: cold TTFT    2.23s  (prompt_tokens=46967)
+
+  inserted ~386406 tokens ~= 50.6 GB of L1
+  capacity lines: L1=30 -> ~229K tok (~30 GB), L1=60 -> ~458K tok (~60 GB)
+
+Round 2 - retention read (same prefixes; warm = retained):
+  session  1: TTFT    2.12s  COLD  evicted / re-prefill
+  session  2: TTFT    1.91s  WARM  retained
+  session  3: TTFT    0.75s  WARM  retained
+  session  4: TTFT    1.28s  WARM  retained
+  session  5: TTFT    0.90s  WARM  retained
+  session  6: TTFT    2.39s  COLD  evicted / re-prefill
+  session  7: TTFT    1.44s  WARM  retained
+  session  8: TTFT    2.23s  COLD  evicted / re-prefill
+
+  retained warm: 5/8
+
+  FAIL - 3 session(s) evicted. Working set exceeded the live L1,
+         or L1 is smaller than expected. Check LMCACHE_L1_GB and that
+         shm_size >= L1 (else the MP connector falls back to slow pickle).
+[queue] rerun (thresh 2.0) exited 07:07:38 rc=0

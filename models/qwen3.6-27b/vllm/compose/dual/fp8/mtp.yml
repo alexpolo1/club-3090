@@ -3,25 +3,22 @@
 #   Model:     Qwen3.6-27B FP8 (near-lossless 8-bit; embedded mtp.fc head)
 #   Topology:  Dual 3090 (TP=2, NVLink auto-detected via NVLINK_MODE)
 #   Drafter:   MTP n=3 (built-in — the fp8 checkpoint embeds the mtp.* head)
-#   KV:        int8_per_token_head (1 byte/token, 8-bit near-lossless — higher KV fidelity than
-#              the fast tier's fp8_e5m2, and keeps the full 262K at TP=2 unlike bf16 KV)
+#   KV:        fp8 → e4m3 (1 byte/token; runs at scale=1.0 — checkpoint is weight-only —
+#              → FlashInfer backend → flat decode at depth). NOT fp8_e5m2 — see "NOT enabled" note.
 #   Vision:    yes
-#   Max ctx:   262K — int8-PTH KV keeps the full ctx at TP=2 (KV pool 295K tok, 1.13× concurrency:
-#              constrained on 2 cards, comfortable on the 4-card multi-max). Validation proxy for
+#   Max ctx:   262K — fp8 KV keeps the full ctx at TP=2. Validation proxy for
 #              the TP=4 multi-max (vllm/qwen-27b-multi-max, same config).
 #   Genesis:   none — intentionally Genesis-free
-#   Status:    🧪 Experimental
-#   Quality:   110/150 (det 65/75 · sandbox 45/75) (--full, same harness 2026-06-07). 8-pack A/B
-#                same day: fast 109 · balanced 105 · max 110 — a TIE (det 64/64/65; within ±5-7
-#                noise). FP8 (8-bit) + int8-PTH KV are NOT a behavioral-quality win over the
-#                AutoRound-int4 fast tier on the short-ctx 8-pack — the differentiation is KV
-#                fidelity (long-ctx NIAH A/B is the open follow-up). Slowest of the three
-#                (~56 TPS decode vs fast ~89) with the smallest KV pool (1.13×).
+#   Status:    ✅ Production
+#   Quality:   109/150 (--full, thinking-off, 2026-07-06, jesse #594) — TIES int8-PTH's 107/150
+#              (+2, within noise). Quality-neutral despite scale=1.0: `calculate_kv_scales` is
+#              disabled on Qwen3-Next hybrid (GDN recurrent state → unreliable warmup scales),
+#              so 1.0 is the only fp8 KV; e4m3's exponent range tolerates it. NIAH also ties → 240K.
 #   Best for:  max-accuracy Qwen on 2 cards, and the validation proxy for the 4-card
-#                vllm/qwen-27b-multi-max — FP8 + int8-PTH KV at full 262K ⭐
+#                vllm/qwen-27b-multi-max — FP8 + fp8 KV at full 262K ⭐
 # ---------------------------------------------------------------------------
 # Dual RTX 3090 — Qwen3.6-27B FP8 "max accuracy" tier (vllm/qwen-27b-dual-max).
-# FP8 weights + MTP n=3 + int8-PTH KV + vision. The validation proxy for the 4-card
+# FP8 weights + MTP n=3 + fp8 KV + vision. The validation proxy for the 4-card
 # vllm/qwen-27b-multi-max (same config @ TP=4). NOTE: some prose below is inherited from the
 # AutoRound "fast" template — the at-a-glance block above is authoritative for this variant.
 #
@@ -30,17 +27,30 @@
 #   - max_num_seqs=2 → 2 concurrent agents at full 262K context (KV pool 2.36×)
 #   - max_model_len=262144 → model's natural max, no rope_scaling needed
 #   - vision + tools + MTP n=3 + recall — everything on, no compromises
-#   - Measured (re-bench 2026-04-28 on club-3090 substrate, dev205 + Genesis v7.51-stable):
-#     69.05 narr (CV 2.3%) / 88.58 code (CV 3.4%) TPS single-stream, AL 3.4, VRAM 23.6 GB/card
+#   - Measured (v0.24.0 stable, 2026-06-30, 2× 3090 caps 370/420 W — BENCHMARKS.md + disc #515):
+#     decode 83.1 narr / 108.2 code TPS single-stream, TTFT 158/167 ms, ~21.4 GB/card.
+#     (Older 2026-04-28 dev205/Genesis-v7.51 probe read ~56/69 — superseded.)
+#     NOTE: the decode 83/108 above is the int8-PTH short-prompt bench. With fp8/e4m3 KV
+#     (#594): decode stays flat at depth (114→115 @35K, 2.3× int8-PTH), 8-pack 109/150. See BENCHMARKS.md.
 #
 # What's intentionally NOT enabled:
-#   - TurboQuant KV — sidesteps vllm#40831 entirely. fp8_e5m2 is plenty for
-#     262K across two cards. For 4-stream concurrency at 262K, switch to
+#   - int8-PTH KV — switched to fp8 (e4m3) KV. Why: int8-PTH is confined to the TRITON_ATTN
+#     backend, whose single-stream decode craters with context (measured 130.8 → 50.7 TPS @ 35K);
+#     fp8/e4m3 KV routes to FlashInfer → decode stays flat (~114 → 115 @ 35K, ≈2.3×) at ~2× prefill
+#     and equal NIAH recall to 240K + 8-pack quality tie (109 vs 107) (jesse, #594). ⚠️ Must be `fp8`
+#     (= e4m3, runs at scale=1.0 — the checkpoint is weight-only, and `calculate_kv_scales` is disabled
+#     on Qwen3-Next hybrid: GDN recurrent state → unreliable warmup scales, so 1.0 is the only fp8 KV).
+#     NOT `fp8_e5m2` — scale-free and hard-rejected with FP8 checkpoints
+#     (`ValueError: fp8_e5m2 kv-cache is not supported with fp8 checkpoints`). Don't "simplify" to e5m2.
+#     Trade vs int8-PTH: ~14% slower short-ctx (<5K) + tighter VRAM margin (509 MB free @ deepest soak
+#     fill, 0 MiB growth / 100% retention / p50 125.5 — soak-continuous PASS 2026-07-06).
+#     For 4-stream concurrency at 262K, switch to
 #     dual/turbo.yml (which uses TurboQuant KV + Genesis P65).
 #
 # Dependencies:
 #   - 2× RTX 3090 (Ampere SM 8.6), PCIe-only (no NVLink — works fine)
-#   - vLLM STABLE v0.21.0 image (pulled from Docker Hub) — no source overlays
+#   - vLLM STABLE image (v0.24.0, from the `vllm-stable` engine profile — the version lives
+#     in install.spec, #254; the launcher injects it over the compose default) — no source overlays
 #     required (validated 2026-05-25: marlin-pad / PR-35936 / PR-41800 all
 #     unnecessary on a current vLLM; AutoRound INT4 TP=2 + MTP + vision boot clean).
 #
@@ -73,7 +83,7 @@ services:
     # means no patch overlays are anchored here, so we ride stable releases.
     # Bump the tag to a newer stable after a verify-stress + soak gate.
     # Override with VLLM_IMAGE=... if you need a specific build.
-    image: ${VLLM_IMAGE:-vllm/vllm-openai:v0.22.0}
+    image: ${VLLM_IMAGE:-vllm/vllm-openai:v0.24.0}
     container_name: "${ESTATE_CONTAINER:-vllm-qwen36-27b-dual-max}"
     restart: ${CLUB3090_RESTART:-unless-stopped}
     ports:
@@ -100,6 +110,12 @@ services:
       - ../../../../../../scripts/detect_nvlink.sh:/etc/club3090/detect_nvlink.sh:ro
     environment:
       - NVIDIA_VISIBLE_DEVICES=${ESTATE_GPUS:-${NVIDIA_VISIBLE_DEVICES:-all}}
+      # CUDA-level GPU mask — the runtime-agnostic half of GPU selection
+      # (#610): launch.sh --gpus exports GPU UUIDs here. CDI runtimes (NixOS,
+      # nvidia-ctk cdi) IGNORE NVIDIA_VISIBLE_DEVICES, so this mask is what
+      # actually pins cards there; on the classic runtime the UUID form is
+      # renumbering-proof. Unset → absent (no masking).
+      - CUDA_VISIBLE_DEVICES
       - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
       - HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-${OFFLINE:-0}}
       - TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE:-${OFFLINE:-0}}
@@ -110,6 +126,14 @@ services:
       - VLLM_NO_USAGE_STATS=1
       - VLLM_USE_FLASHINFER_SAMPLER=1
       - OMP_NUM_THREADS=1
+      # DeepGEMM (vLLM's fp8-GEMM path) is built for Hopper (sm_90) + datacenter
+      # Blackwell (sm_100/103). Consumer Blackwell (5090 / PRO 6000 / GB10,
+      # sm_120/121) has no recipe and hard-fails "recipe not found" at boot
+      # (disc #571). Pass-through: switch.sh/launch.sh auto-inject
+      # VLLM_USE_DEEP_GEMM=0 on those cards; if you run raw `docker compose` on a
+      # consumer Blackwell card, set it yourself (VLLM_USE_DEEP_GEMM=0). Unset =
+      # vLLM's arch default (DeepGEMM stays on where it works).
+      - VLLM_USE_DEEP_GEMM
       # expandable_segments:True crashes boot on some setups (likely cuMemMap path).
       # Known: JusefPol on NVLink (PR #31), WSL2 single-card 3090 Ti.
       # Override via .env: PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False
@@ -143,7 +167,8 @@ services:
       - --model
       - /root/.cache/huggingface/qwen3.6-27b-fp8
       - --served-model-name
-      - qwen3.6-27b-fp8
+      - qwen3.6-27b
+      - qwen3.6-27b-autoround
       - --quantization
       - fp8
       - --dtype
@@ -161,7 +186,7 @@ services:
       - --max-num-batched-tokens
       - "8192"
       - --kv-cache-dtype
-      - "${KV_CACHE_DTYPE:-int8_per_token_head}"
+      - "${KV_CACHE_DTYPE:-fp8}"
       - --trust-remote-code
       # froggeric chat-template override (see volumes block + docs/UPSTREAM.md)
       - --chat-template
